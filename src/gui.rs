@@ -6,7 +6,7 @@ use crate::{
     config::{
         self, AppConfig, ExecutionMode, Language, ReasoningEffort, ReasoningTransport, ToolConfig,
     },
-    i18n, llm,
+    i18n, jobs, llm,
 };
 
 pub struct Llm2McpApp {
@@ -14,6 +14,7 @@ pub struct Llm2McpApp {
     status: String,
     api_key_visible: bool,
     clients: Vec<ClientStatus>,
+    jobs: Vec<jobs::JobRecord>,
 }
 
 impl Llm2McpApp {
@@ -25,11 +26,16 @@ impl Llm2McpApp {
             status: ready,
             api_key_visible: false,
             clients: clients::statuses(),
+            jobs: jobs::list_recent(40).unwrap_or_default(),
         }
     }
 
     fn refresh_clients(&mut self) {
         self.clients = clients::statuses();
+    }
+
+    fn refresh_jobs(&mut self) {
+        self.jobs = jobs::list_recent(40).unwrap_or_default();
     }
 
     fn save(&mut self) {
@@ -75,6 +81,17 @@ fn execution_label(mode: ExecutionMode, language: Language, text: &i18n::Texts) 
     }
 }
 
+fn format_duration(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
 fn tool_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -113,6 +130,18 @@ fn tool_row(
         );
         ui.label(text.max_output_tokens);
     });
+    if let Some(return_tokens) = &mut tool.primary_return_tokens {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(return_tokens)
+                    .range(128..=8_000)
+                    .speed(64),
+            );
+            ui.label("tokens");
+        });
+    } else {
+        ui.label(text.full_artifact);
+    }
     ui.end_row();
 }
 
@@ -200,13 +229,14 @@ impl eframe::App for Llm2McpApp {
                 ui.heading(text.per_tool_reasoning);
                 ui.label(text.per_tool_hint);
                 egui::Grid::new("tool_grid")
-                    .num_columns(4)
+                    .num_columns(5)
                     .spacing([14.0, 8.0])
                     .show(ui, |ui| {
                         ui.strong(text.tool);
                         ui.strong(text.reasoning);
                         ui.strong(text.execution);
                         ui.strong(text.output_budget);
+                        ui.strong(text.return_budget);
                         ui.end_row();
                         tool_row(
                             ui,
@@ -260,17 +290,23 @@ impl eframe::App for Llm2McpApp {
             ui.group(|ui| {
                 ui.heading(text.context_limits);
                 ui.horizontal(|ui| {
-                    ui.label(text.max_source_chars);
+                    ui.label(text.max_source_tokens);
                     ui.add(
-                        egui::DragValue::new(&mut self.config.max_source_chars)
-                            .range(10_000..=2_000_000),
+                        egui::DragValue::new(&mut self.config.max_source_tokens)
+                            .range(2_500..=500_000),
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label(text.max_chars_per_file);
+                    ui.label(text.max_tokens_per_file);
                     ui.add(
-                        egui::DragValue::new(&mut self.config.max_file_chars)
-                            .range(5_000..=500_000),
+                        egui::DragValue::new(&mut self.config.max_file_tokens).range(500..=200_000),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(text.discovery_index_tokens);
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.discovery_index_tokens)
+                            .range(1_000..=50_000),
                     );
                 });
                 ui.horizontal(|ui| {
@@ -285,6 +321,67 @@ impl eframe::App for Llm2McpApp {
                     );
                 });
             });
+
+            ui.add_space(10.0);
+            egui::CollapsingHeader::new(text.job_history)
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(text.job_history_hint);
+                        if ui.small_button(text.refresh).clicked() {
+                            self.refresh_jobs();
+                        }
+                    });
+                    if self.jobs.is_empty() {
+                        ui.small(text.no_jobs);
+                    } else {
+                        let job_rows = self.jobs.clone();
+                        egui::ScrollArea::vertical()
+                            .id_salt("job_history_scroll")
+                            .max_height(240.0)
+                            .show(ui, |ui| {
+                                for job in job_rows {
+                                    let duration = format_duration(jobs::display_duration_ms(&job));
+                                    let heading = format!(
+                                        "{} · {} · {} · {duration}",
+                                        jobs::state_name(job.state),
+                                        job.tool,
+                                        job.stage
+                                    );
+                                    ui.collapsing(heading, |ui| {
+                                        ui.small(format!("job_id: {}", job.id));
+                                        ui.small(format!("workspace: {}", job.workspace.display()));
+                                        ui.small(format!(
+                                            "{}: {} · {}: prompt={} / completion={}",
+                                            text.llm_calls,
+                                            job.llm_calls,
+                                            text.token_usage,
+                                            job.prompt_tokens,
+                                            job.completion_tokens
+                                        ));
+                                        ui.small(format!(
+                                            "cache: symbol hit/miss={}/{} · evidence hit/miss={}/{}",
+                                            job.symbol_index_hits,
+                                            job.symbol_index_misses,
+                                            job.evidence_cache_hits,
+                                            job.evidence_cache_misses
+                                        ));
+                                        ui.small(format!("{}: {duration}", text.duration));
+                                        ui.small(format!("created: {}", job.created_at));
+                                        if let Some(diagnostics) = &job.last_llm_diagnostics {
+                                            ui.small(format!("LLM: {diagnostics}"));
+                                        }
+                                        if let Some(error) = &job.error {
+                                            ui.label(error);
+                                        }
+                                        if let Some(hint) = &job.error_hint {
+                                            ui.small(format!("{}: {hint}", text.diagnostic_hint));
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                });
 
             ui.add_space(10.0);
             ui.group(|ui| {

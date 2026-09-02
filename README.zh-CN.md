@@ -24,6 +24,8 @@ LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也�
 
 ## 支持的 AI 编码智能体
 
+点击 **“安装 / 更新”** 时，LLM2MCP 会先把当前程序刷新到稳定的用户级可执行文件路径，再让目标编码智能体注册这个稳定路径。这样 MCP 配置不会继续指向 `target/debug/...` 等可能在重新构建或升级后消失的开发路径。对于 LLM2MCP 直接修改的 JSON/TOML 客户端配置，写入前会保留 `*.llm2mcp.bak` 备份，并通过临时文件 + 原子替换更新配置。
+
 ### Cursor
 
 LLM2MCP 会合并用户级 `~/.cursor/mcp.json`，Cursor 通过 `${workspaceFolder}` 把当前工作区传给 LLM2MCP。
@@ -66,13 +68,13 @@ LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
 
 | Tool | 适合场景 | 必填参数 | 可选参数 | 默认思考强度 | 默认执行方式 |
 | --- | --- | --- | --- | --- | --- |
-| `analyze` | 根因分析、架构分析、大文件/目录分析 | `task` | `paths` | Medium | Auto |
-| `plan` | 独立制定实现计划、提供第二意见 | `task` | `paths` | XHigh | Auto |
+| `analyze` | 根因分析、架构分析、大文件/目录分析 | `task` | `paths`, `include`, `exclude` | Medium | Auto |
+| `plan` | 独立制定实现计划、提供第二意见 | `task` | `paths`, `include`, `exclude` | XHigh | Auto |
 | `review_diff` | 不让主模型先读取完整 diff 的代码复审 | 无 | `task`, `base_ref` | Medium | Sync |
-| `document_repo` | 分块扫描代码仓库并通过 Map→Reduce 生成有依据的项目文档 | 无 | `document_type`, `paths`, `audience`, `language` | Medium | Async |
+| `document_repo` | 分块扫描代码仓库并通过 Map→Reduce 生成有依据的项目文档 | 无 | `document_type`, `paths`, `include`, `exclude`, `audience`, `language` | Medium | Async |
 | `update_docs` | 根据 Git 变更增量更新现有 README/docs，避免重新扫描整个仓库 | 无 | `base_ref`, `target_ref`, `docs`, `language` | XHigh | Async |
 
-每个主要工具都可以在 GUI 中单独配置 `Off / Low / Medium / XHigh` 思考强度、`Sync / Auto / Async` 执行方式，以及最大输出 token 数。
+每个主要工具都可以在 GUI 中单独配置 `Off / Low / Medium / XHigh` 思考强度、`Sync / Auto / Async` 执行方式，以及副模型最大输出 token 数。`analyze`、`plan`、`review_diff` 另外提供独立的 **回传主模型** budget：副模型内部可以使用更大的输出预算充分分析，但 LLM2MCP 会在本地把结构化结果压缩后再送入主编码智能体上下文。默认分别为 `analyze=800`、`plan=1200`、`review_diff=1000` tokens；文档工具则返回完整产物。输入上下文也按 token 估算控制：GUI 分别提供整体源码、单文件和轻量发现索引的 token budget。该估算器保持 Provider 无关，不假装能够精确复刻所有 OpenAI-compatible 模型的 tokenizer，但比固定字符数更适合中英文混合代码。
 
 三个 Job 工具始终是快速、只读调用：
 
@@ -87,7 +89,13 @@ LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
 参数：
 
 - `task` — 必填。说明要分析什么，以及需要回答哪些问题。
-- `paths` — 可选。workspace 相对路径组成的文件/目录数组。如果为空或省略，LLM2MCP 只会读取 README、常见 manifest 等项目概览文件，而不会递归发送整个仓库。
+- `paths` — 可选。workspace 相对路径组成的文件/目录数组。目录、多路径或空数组会先进行轻量仓库发现，再读取真正相关的源码；单个显式文件会直接读取，避免额外发现调用。
+- `include` — 可选 glob 数组，例如 `src/**/*.rs`，只有匹配的源码候选会进入发现/读取。
+- `exclude` — 可选 glob 数组，例如 `tests/**` 或 `*.generated.ts`，排除规则优先于 include。
+
+发现阶段会在本机生成受 token 上限约束的“文件路径 + symbol + 精确行范围”索引，并优先使用本地 lexical/symbol scoring。匹配足够明确时直接选中相关 symbol，完全跳过额外的发现 LLM；只有语义模糊时才使用一次 Low reasoning 的短请求对轻量索引 rerank。第二阶段优先只读取被选中的 symbol 行范围，并带少量文件头/import 上下文和真实行号，而不是整个文件。模型虚构的路径或行范围因为无法匹配本地候选索引会被丢弃。
+
+文件/symbol 索引现在会跨 Job 持久化。LLM2MCP 在本机应用数据目录保存按 workspace 隔离的 **Repository Symbol Index**，先用文件大小 + 纳秒级 mtime 快速判断是否未变化；未变化文件直接复用已有 SHA-256 和 symbol ranges，不再重新读取源码正文和解析声明，只有新增/变化文件才重新读取、内容哈希和解析。被实际选中的源码证据另存为 **Evidence Cache**，key 包含文件内容 SHA-256 + 精确行段，因此连续 `analyze → plan` 或重复分析可以直接复用相同 symbol/prelude 片段；源码一旦变化会自然生成新 key，同时选中的旧行范围还会再次对当前 symbol index 校验，不会静默复用过时证据。缓存仅保存在 LLM2MCP 本机数据目录，不作为历史正文回传主模型；Job status/历史会显示 Symbol Index 和 Evidence Cache 的 hit/miss 数量，便于确认优化是否生效。
 
 推荐给主编码智能体的提示词：
 
@@ -107,7 +115,7 @@ LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
 }
 ```
 
-返回结果会尽量压缩成工程报告，包括：结论、关键证据、根因/风险、建议动作，以及主编码智能体下一步应该读取的文件。
+副模型返回结构化分析后，LLM2MCP 不再额外调用一次 LLM 做总结，而是在本地按 **回传主模型** budget 裁剪、去掉低优先级内容。结果最前面优先放经过本地校验的 `READ_NEXT`，例如 `src/jobs.rs:400-445 — fn spawn_worker(...)`，让主编码智能体只读取真正相关的几十行，而不是整个文件。
 
 ### `plan`
 
@@ -116,7 +124,9 @@ LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
 参数：
 
 - `task` — 必填。说明要实现的功能、修复、迁移或重构目标。
-- `paths` — 可选。需要规划时参考的 workspace 相对文件/目录。
+- `paths` — 可选。需要规划时参考的 workspace 相对文件/目录。目录、多路径或空数组与 `analyze` 一样走“本地 scoring → 必要时 LLM rerank → symbol/line-range 深度读取”的路径。
+- `include` — 可选 include glob。
+- `exclude` — 可选 exclude glob，排除规则优先。
 
 推荐提示词：
 
@@ -174,6 +184,8 @@ LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
 
 - `document_type` — 可选。支持 `overview`、`architecture`、`modules`、`api`、`developer`、`deployment`、`full`，默认 `overview`。
 - `paths` — 可选。workspace 相对文件/目录。为空表示扫描整个仓库。
+- `include` — 可选。限制仓库扫描范围的 include glob。
+- `exclude` — 可选。扫描时应用的 exclude glob，优先于 include。
 - `audience` — 可选。目标读者，例如 `developer`、`new_contributor`、`operator`，默认 `developer`。
 - `language` — 可选。`auto`、`english`、`simplified_chinese`，默认 `auto`。
 
@@ -278,7 +290,7 @@ job_result(job_id)
 
 LLM2MCP 会先把 Job 写入本机应用数据目录，再返回 job handle。真正的工作由独立 `llm2mcp job-worker` 子进程执行，因此原来的 MCP stdio 进程即使退出、超时或重新启动，Job 状态和最终结果仍然可以恢复。
 
-Linux 下也专门处理了“运行中的 MCP 进程对应二进制被原地重新构建/升级”的情况。例如开发时执行 `cargo build` 后，旧 Cursor MCP 进程的 `current_exe()` 可能变成 `target/debug/llm2mcp (deleted)`；新版 LLM2MCP 会检测该情况并通过 `/proc/self/exe` 启动同版本 worker，避免 `No such file or directory`。但 LLM2MCP 本身升级后仍建议重启/刷新一次 MCP 连接，让 Host 加载新版 server。
+编码智能体集成现在统一指向稳定的用户级可执行文件，而不是临时开发构建路径，因此正常安装后的后台 worker 不再依赖 `target/debug/...`，可以直接规避这类重建后路径失效问题。Linux 仍保留 `/proc/self/exe` 作为开发期或特殊原地更新场景的后备路径：如果已经运行的 MCP 进程发现原始可执行文件路径被删除，仍可通过当前进程镜像启动同版本 worker。LLM2MCP 本身升级后仍建议重启/刷新一次 MCP 连接，让 Host 加载新版 server。
 
 如果 MCP Host 使用 `2026-07-28` 协议并显式声明支持 `io.modelcontextprotocol/tasks`，LLM2MCP 会优先返回标准 `resultType: "task"` handle；Host 可以使用 `tasks/get` 轮询，完成后会直接得到原工具的最终结果。对于尚未支持 Tasks 的 Host，`job_status / job_result / job_cancel` 继续作为通用兼容路径。
 
@@ -293,7 +305,7 @@ completed
 
 `job_cancel` / `tasks/cancel` 是协作式取消：LLM2MCP 会在阶段切换和不同 LLM 调用之间检查取消状态；如果某个 HTTP LLM 请求已经在执行，它可能会先完成该请求，再响应取消。
 
-Job 默认保留 7 天，LLM2MCP 启动时会顺带清理过期的 Job 状态和日志文件。
+Job 默认保留 7 天，LLM2MCP 启动时会顺带清理过期的 Job 状态和日志文件。持久化 Job 还会累计总耗时、LLM 调用次数、Provider 返回的 prompt/completion token 用量、最后一次 LLM diagnostics，并针对常见鉴权失败、限流、连接失败、timeout、reasoning 输出预算耗尽和过滤后无源码等问题给出诊断建议。GUI 增加了可刷新的最近 Job 历史面板，但不会为了历史记录额外保存一份源码正文。
 
 作为第二层保险，安装到支持配置的编码智能体时，LLM2MCP 会尝试设置更宽松的 MCP tool timeout。但 **Async Job 才是解决 Host 硬超时的主要机制**，尤其适用于无法可靠调整 timeout 的 Host。
 
@@ -360,6 +372,12 @@ Reasoning 参数支持四种发送方式：
 
 ```bash
 cargo run
+```
+
+如果只需要刷新稳定的用户级可执行文件并打印其路径：
+
+```bash
+cargo run -- install
 ```
 
 然后：

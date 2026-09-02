@@ -73,25 +73,6 @@ fn client(config: &AppConfig) -> Result<Client> {
         .context("failed to build HTTP client")
 }
 
-pub fn chat(
-    config: &AppConfig,
-    system: &str,
-    user: &str,
-    effort: ReasoningEffort,
-    max_output_tokens: u32,
-) -> Result<String> {
-    let response = chat_detailed(config, system, user, effort, max_output_tokens)?;
-    response
-        .final_text()
-        .map(|value| value.trim().to_owned())
-        .with_context(|| {
-            format!(
-                "LLM returned no final message content ({})",
-                response.diagnostics()
-            )
-        })
-}
-
 pub fn chat_detailed(
     config: &AppConfig,
     system: &str,

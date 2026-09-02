@@ -7,7 +7,7 @@ use std::{
     process::{Command, Output},
 };
 
-use crate::cursor;
+use crate::{cursor, install, safe_fs};
 use toml_edit::{DocumentMut, value};
 
 const SERVER_NAME: &str = "llm2mcp";
@@ -112,10 +112,12 @@ fn cli_status(kind: ClientKind, command: &str, args: &[&str]) -> ClientStatus {
 }
 
 pub fn install(kind: ClientKind) -> Result<String> {
+    let stable_exe = install::ensure_stable_install()?;
+    let exe = stable_exe.to_string_lossy().into_owned();
     match kind {
-        ClientKind::Cursor => cursor::install().map(|path| path.display().to_string()),
+        ClientKind::Cursor => cursor::install(&stable_exe)
+            .map(|path| format!("{}; binary={}", path.display(), stable_exe.display())),
         ClientKind::ClaudeCode => {
-            let exe = current_exe_string()?;
             run_cli(
                 "claude",
                 &[
@@ -132,25 +134,32 @@ pub fn install(kind: ClientKind) -> Result<String> {
             let note = configure_claude_timeout()
                 .map(|_| "tool timeout=30m".to_owned())
                 .unwrap_or_else(|error| format!("timeout patch skipped: {error}"));
-            Ok(format!("Claude Code user MCP; {note}"))
+            Ok(format!(
+                "Claude Code user MCP; binary={}; {note}",
+                stable_exe.display()
+            ))
         }
         ClientKind::Codex => {
-            let exe = current_exe_string()?;
             run_cli("codex", &["mcp", "add", SERVER_NAME, "--", &exe, "mcp"])?;
             let note = configure_toml_timeout(&codex_config_path()?, CODEX_TOOL_TIMEOUT_SEC)
                 .map(|_| "tool_timeout_sec=1800".to_owned())
                 .unwrap_or_else(|error| format!("timeout patch skipped: {error}"));
-            Ok(format!("Codex user MCP; {note}"))
+            Ok(format!(
+                "Codex user MCP; binary={}; {note}",
+                stable_exe.display()
+            ))
         }
         ClientKind::GrokBuild => {
-            let exe = current_exe_string()?;
             run_cli("grok", &["mcp", "add", SERVER_NAME, "--", &exe, "mcp"])?;
             let note = configure_toml_timeout(&grok_config_path()?, GROK_TOOL_TIMEOUT_SEC)
                 .map(|_| "tool_timeout_sec=6000".to_owned())
                 .unwrap_or_else(|error| format!("timeout patch skipped: {error}"));
-            Ok(format!("Grok Build user MCP; {note}"))
+            Ok(format!(
+                "Grok Build user MCP; binary={}; {note}",
+                stable_exe.display()
+            ))
         }
-        ClientKind::Pi => install_pi(),
+        ClientKind::Pi => install_pi(&stable_exe),
     }
 }
 
@@ -171,13 +180,6 @@ pub fn remove(kind: ClientKind) -> Result<String> {
         }
         ClientKind::Pi => remove_pi(),
     }
-}
-
-fn current_exe_string() -> Result<String> {
-    Ok(env::current_exe()
-        .context("cannot resolve current executable")?
-        .to_string_lossy()
-        .into_owned())
 }
 
 fn run_cli(command: &str, args: &[&str]) -> Result<Output> {
@@ -209,7 +211,7 @@ fn pi_is_installed() -> Result<bool> {
     Ok(value.pointer("/mcpServers/llm2mcp").is_some())
 }
 
-fn install_pi() -> Result<String> {
+fn install_pi(executable: &Path) -> Result<String> {
     if find_executable("pi").is_none() {
         bail!("pi executable was not found in PATH");
     }
@@ -219,7 +221,7 @@ fn install_pi() -> Result<String> {
     let _ = run_cli("pi", &["install", "npm:pi-mcp-extension"])?;
 
     let path = pi_config_path()?;
-    merge_json_server(&path, false)?;
+    merge_json_server(&path, false, executable)?;
     Ok(path.display().to_string())
 }
 
@@ -232,11 +234,11 @@ fn remove_pi() -> Result<String> {
     if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
         servers.remove(SERVER_NAME);
     }
-    fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    safe_fs::atomic_write_with_backup(&path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok(path.display().to_string())
 }
 
-fn merge_json_server(path: &Path, include_type: bool) -> Result<()> {
+fn merge_json_server(path: &Path, include_type: bool, executable: &Path) -> Result<()> {
     let mut root = if path.exists() {
         serde_json::from_str::<Value>(&fs::read_to_string(path)?)
             .with_context(|| format!("invalid JSON in {}", path.display()))?
@@ -252,9 +254,8 @@ fn merge_json_server(path: &Path, include_type: bool) -> Result<()> {
         .as_object_mut()
         .context("mcpServers must be an object")?;
 
-    let exe = current_exe_string()?;
     let mut entry = json!({
-        "command": exe,
+        "command": executable.to_string_lossy(),
         "args": ["mcp"]
     });
     if include_type {
@@ -262,10 +263,7 @@ fn merge_json_server(path: &Path, include_type: bool) -> Result<()> {
     }
     servers.insert(SERVER_NAME.to_owned(), entry);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(&root)?)?;
+    safe_fs::atomic_write_with_backup(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok(())
 }
 
@@ -306,7 +304,7 @@ fn configure_claude_timeout() -> Result<()> {
         "request_timeout_ms".to_owned(),
         json!(CLAUDE_TOOL_TIMEOUT_MS),
     );
-    fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    safe_fs::atomic_write_with_backup(&path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok(())
 }
 
@@ -323,7 +321,7 @@ fn configure_toml_timeout(path: &Path, seconds: f64) -> Result<()> {
         );
     }
     document["mcp_servers"][SERVER_NAME]["tool_timeout_sec"] = value(seconds);
-    fs::write(path, document.to_string())?;
+    safe_fs::atomic_write_with_backup(path, document.to_string().as_bytes())?;
     Ok(())
 }
 

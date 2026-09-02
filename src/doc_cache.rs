@@ -113,6 +113,8 @@ mod tests {
             body: body.to_owned(),
             included_files: vec!["src/main.rs".to_owned()],
             truncated: false,
+            evidence_cache_hits: 0,
+            evidence_cache_misses: 0,
         }
     }
 

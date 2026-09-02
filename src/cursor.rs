@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use directories::BaseDirs;
 use serde_json::{Map, Value, json};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use crate::safe_fs;
 
 pub fn cursor_config_path() -> Result<PathBuf> {
     let base = BaseDirs::new().context("cannot resolve home directory")?;
@@ -18,7 +23,7 @@ pub fn is_installed() -> Result<bool> {
     Ok(value.pointer("/mcpServers/llm2mcp").is_some())
 }
 
-pub fn install() -> Result<PathBuf> {
+pub fn install(executable: &Path) -> Result<PathBuf> {
     let path = cursor_config_path()?;
     let mut root = if path.exists() {
         serde_json::from_str::<Value>(&fs::read_to_string(&path)?)
@@ -35,20 +40,16 @@ pub fn install() -> Result<PathBuf> {
         .as_object_mut()
         .context("mcpServers must be an object")?;
 
-    let exe = std::env::current_exe().context("cannot resolve current executable")?;
     servers.insert(
         "llm2mcp".to_owned(),
         json!({
             "type": "stdio",
-            "command": exe.to_string_lossy(),
+            "command": executable.to_string_lossy(),
             "args": ["mcp", "--workspace", "${workspaceFolder}"]
         }),
     );
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    safe_fs::atomic_write_with_backup(&path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok(path)
 }
 
@@ -61,6 +62,6 @@ pub fn remove() -> Result<PathBuf> {
     if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
         servers.remove("llm2mcp");
     }
-    fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    safe_fs::atomic_write_with_backup(&path, serde_json::to_string_pretty(&root)?.as_bytes())?;
     Ok(path)
 }

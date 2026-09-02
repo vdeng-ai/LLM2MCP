@@ -39,6 +39,8 @@
 - [x] `io.modelcontextprotocol/tasks` Tasks Extension：task handle / `tasks/get` / `tasks/update` / `tasks/cancel`
 - [x] Tasks capability per-request 校验和 legacy fallback
 - [x] Codex / Claude Code / Grok Build 安装时尝试配置更长 MCP tool timeout
+- [x] AI 编码智能体安装统一使用稳定的用户级 LLM2MCP 可执行文件，避免开发构建路径失效
+- [x] 直接修改的客户端 JSON/TOML 配置支持 `*.llm2mcp.bak` 备份、权限保留与安全替换
 - [x] English README / 中文 README 双语文档
 - [ ] Cursor GUI 实机验证 MCP 发现与工具调用
 - [ ] Codex / Claude Code / Grok Build 实机 MCP 验证
@@ -48,16 +50,22 @@
 
 ## 0.2 — 上下文选择优化
 
-- `analyze/plan` 两阶段代码发现：先根据 manifest / symbol 信息选择关键文件，再进行深度分析
-- 更准确的 token 预算，而不是仅按字符数限制
-- 支持 include / exclude glob
-- 工具返回文件证据和建议读取范围
+- [x] `analyze/plan` 两阶段代码发现：先根据轻量文件 / symbol 索引选择关键文件，再进行深度分析
+- [x] Discovery 优先使用本地 lexical/symbol scoring；匹配明确时跳过额外 LLM rerank
+- [x] 深度上下文从文件级进一步收敛到 symbol + 精确 line range，并只携带少量文件头/import 上下文
+- [x] 输入上下文使用 token 估算预算，替代仅按字符数截断
+- [x] `analyze / plan / document_repo` 支持 include / exclude glob
+- [x] `analyze / plan / review_diff` 分离副模型输出预算与主模型回传预算，结果在本地结构化压缩
+- [x] `analyze / plan` 返回经过候选索引校验的 `file:symbol:line-range` read-next 证据；虚构范围不会回传
+- [x] 持久化 Repository Symbol Index：按 workspace + 文件 size/mtime 增量复用，变化文件自动重新哈希/解析
+- [x] 持久化 Evidence Cache：按文件内容 SHA-256 + 精确 symbol 行段复用本地源码证据，源码变化自动失效
+- [x] Job 历史/status 暴露 Symbol Index / Evidence Cache hit/miss 统计
 - 可配置 system prompt 模板
 - 支持更多通用 MCP Host 的自动检测与配置模板导出
 
 ## 0.3 — 通用性与可观测性
 
-- Job 历史 GUI：查看 stage、耗时、结果、失败原因和清理状态
+- [x] Job 历史 GUI：查看 stage、耗时、LLM 调用/token 统计和失败诊断
 - 支持用户配置 Job TTL / polling interval / 清理策略
 - 更强的取消：允许主动中断正在执行的 HTTP LLM 请求
 - 可选 Tasks `notifications/tasks` / subscriptions UX（当前 polling 已满足可靠性需求）
@@ -65,9 +73,9 @@
 - Job 数量明显增长后评估 SQLite；当前文件状态 + 跨进程锁保持简单部署
 - 多 LLM profile
 - `/models` 模型下拉刷新
-- 请求耗时 / 输入输出 token 统计
+- [x] 后台 Job 请求耗时 / 输入输出 token / LLM 调用次数统计
 - 本地调用历史（默认不保存源码正文）
-- 更完善的错误诊断
+- [x] 常见 API 鉴权、限流、连接、超时、reasoning 输出耗尽等错误诊断提示
 - Provider preset：LiteLLM / llama.cpp / vLLM / Ollama
 - 客户端适配插件化，降低新增 Coding Agent 的修改范围
 

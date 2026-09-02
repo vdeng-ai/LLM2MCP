@@ -4,9 +4,12 @@ mod cursor;
 mod doc_cache;
 mod gui;
 mod i18n;
+mod install;
 mod jobs;
 mod llm;
 mod mcp;
+mod repo_cache;
+mod safe_fs;
 mod workspace;
 
 use anyhow::Result;
@@ -31,6 +34,8 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Install/update a stable per-user LLM2MCP executable and print its path.
+    Install,
     /// Internal durable background worker for asynchronous MCP jobs.
     #[command(hide = true)]
     JobWorker {
@@ -45,6 +50,10 @@ fn main() -> Result<()> {
         Some(Command::Mcp { workspace }) => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
             mcp::run(&workspace)
+        }
+        Some(Command::Install) => {
+            println!("{}", install::ensure_stable_install()?.display());
+            Ok(())
         }
         Some(Command::JobWorker { job_id }) => mcp::run_job_worker(&job_id),
         None => run_gui(),

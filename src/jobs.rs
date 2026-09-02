@@ -43,6 +43,26 @@ pub struct JobRecord {
     pub poll_interval_ms: u64,
     pub result: Option<Value>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub llm_calls: u64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub last_llm_diagnostics: Option<String>,
+    #[serde(default)]
+    pub error_hint: Option<String>,
+    #[serde(default)]
+    pub symbol_index_hits: u64,
+    #[serde(default)]
+    pub symbol_index_misses: u64,
+    #[serde(default)]
+    pub evidence_cache_hits: u64,
+    #[serde(default)]
+    pub evidence_cache_misses: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +86,45 @@ impl Reporter {
             }
         })?;
         self.check_cancelled()
+    }
+
+    pub fn record_llm_attempt(&self) -> Result<()> {
+        update_record(&self.job_id, |record| {
+            record.llm_calls = record.llm_calls.saturating_add(1);
+        })
+    }
+
+    pub fn record_llm_usage(
+        &self,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        diagnostics: &str,
+    ) -> Result<()> {
+        update_record(&self.job_id, |record| {
+            record.prompt_tokens = record
+                .prompt_tokens
+                .saturating_add(prompt_tokens.unwrap_or_default());
+            record.completion_tokens = record
+                .completion_tokens
+                .saturating_add(completion_tokens.unwrap_or_default());
+            record.last_llm_diagnostics = Some(diagnostics.to_owned());
+        })
+    }
+
+    pub fn record_cache_usage(
+        &self,
+        symbol_hits: u64,
+        symbol_misses: u64,
+        evidence_hits: u64,
+        evidence_misses: u64,
+    ) -> Result<()> {
+        update_record(&self.job_id, |record| {
+            record.symbol_index_hits = record.symbol_index_hits.saturating_add(symbol_hits);
+            record.symbol_index_misses = record.symbol_index_misses.saturating_add(symbol_misses);
+            record.evidence_cache_hits = record.evidence_cache_hits.saturating_add(evidence_hits);
+            record.evidence_cache_misses =
+                record.evidence_cache_misses.saturating_add(evidence_misses);
+        })
     }
 
     pub fn check_cancelled(&self) -> Result<()> {
@@ -99,6 +158,16 @@ pub fn create(tool: &str, workspace: &Path, args: Value) -> Result<JobRecord> {
         poll_interval_ms: POLL_INTERVAL_MS,
         result: None,
         error: None,
+        duration_ms: None,
+        llm_calls: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        last_llm_diagnostics: None,
+        error_hint: None,
+        symbol_index_hits: 0,
+        symbol_index_misses: 0,
+        evidence_cache_hits: 0,
+        evidence_cache_misses: 0,
     };
     save(&record)?;
 
@@ -152,12 +221,17 @@ pub fn complete(job_id: &str, result: Value) -> Result<()> {
             record.state = JobState::Cancelled;
             record.stage = "cancelled".to_owned();
             record.result = None;
+            record.error = None;
+            record.error_hint = None;
+            record.duration_ms = Some(elapsed_ms(record));
             return;
         }
         record.state = JobState::Completed;
         record.stage = "completed".to_owned();
         record.result = Some(result);
         record.error = None;
+        record.error_hint = None;
+        record.duration_ms = Some(elapsed_ms(record));
         if record.total > 0 {
             record.progress = record.total;
         }
@@ -170,12 +244,16 @@ pub fn fail(job_id: &str, message: &str) -> Result<()> {
             record.state = JobState::Cancelled;
             record.stage = "cancelled".to_owned();
             record.error = None;
+            record.error_hint = None;
+            record.duration_ms = Some(elapsed_ms(record));
         } else {
             record.state = JobState::Failed;
             if !record.stage.ends_with("_failed") {
                 record.stage = "failed".to_owned();
             }
             record.error = Some(message.to_owned());
+            record.error_hint = diagnostic_hint(message);
+            record.duration_ms = Some(elapsed_ms(record));
         }
     })
 }
@@ -196,6 +274,8 @@ pub fn mark_cancelled(job_id: &str) -> Result<()> {
         record.stage = "cancelled".to_owned();
         record.result = None;
         record.error = None;
+        record.error_hint = None;
+        record.duration_ms = Some(elapsed_ms(record));
     })
 }
 
@@ -246,7 +326,17 @@ pub fn fallback_status_result(record: &JobRecord) -> Value {
             "created_at": record.created_at,
             "updated_at": record.updated_at,
             "poll_after_ms": record.poll_interval_ms,
-            "error": record.error
+            "duration_ms": display_duration_ms(record),
+            "llm_calls": record.llm_calls,
+            "prompt_tokens": record.prompt_tokens,
+            "completion_tokens": record.completion_tokens,
+            "last_llm_diagnostics": record.last_llm_diagnostics,
+            "symbol_index_hits": record.symbol_index_hits,
+            "symbol_index_misses": record.symbol_index_misses,
+            "evidence_cache_hits": record.evidence_cache_hits,
+            "evidence_cache_misses": record.evidence_cache_misses,
+            "error": record.error,
+            "error_hint": record.error_hint
         },
         "isError": false
     })
@@ -303,7 +393,17 @@ pub fn task_get_result(record: &JobRecord) -> Value {
                 "stage": record.stage,
                 "progress": record.progress,
                 "total": record.total,
-                "cancelRequested": record.cancel_requested
+                "cancelRequested": record.cancel_requested,
+                "durationMs": display_duration_ms(record),
+                "llmCalls": record.llm_calls,
+                "promptTokens": record.prompt_tokens,
+                "completionTokens": record.completion_tokens,
+                "lastLlmDiagnostics": record.last_llm_diagnostics,
+                "symbolIndexHits": record.symbol_index_hits,
+                "symbolIndexMisses": record.symbol_index_misses,
+                "evidenceCacheHits": record.evidence_cache_hits,
+                "evidenceCacheMisses": record.evidence_cache_misses,
+                "errorHint": record.error_hint
             }
         }
     });
@@ -328,6 +428,30 @@ pub fn task_get_result(record: &JobRecord) -> Value {
         }
     }
     value
+}
+
+pub fn list_recent(limit: usize) -> Result<Vec<JobRecord>> {
+    let dir = jobs_dir()?;
+    if !dir.exists() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(record) = serde_json::from_str::<JobRecord>(&text) {
+            records.push(record);
+        }
+    }
+    records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    records.truncate(limit);
+    Ok(records)
 }
 
 pub fn cleanup_expired() -> Result<usize> {
@@ -507,7 +631,41 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
     u64::try_from(millis).ok()
 }
 
-fn state_name(state: JobState) -> &'static str {
+fn elapsed_ms(record: &JobRecord) -> u64 {
+    let created = parse_rfc3339_millis(&record.created_at).unwrap_or_else(unix_millis);
+    unix_millis().saturating_sub(created)
+}
+
+pub fn display_duration_ms(record: &JobRecord) -> u64 {
+    record.duration_ms.unwrap_or_else(|| elapsed_ms(record))
+}
+
+pub fn diagnostic_hint(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    let hint = if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
+        "Check the configured API key and provider authorization."
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        "The LLM endpoint is rate-limiting requests; reduce concurrency or retry later."
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "The LLM request timed out; increase the configured timeout or use Async execution for long tasks."
+    } else if lower.contains("failed to connect") || lower.contains("connection refused") {
+        "The configured LLM endpoint is unreachable; verify Base URL, network access, and whether the model server is running."
+    } else if lower.contains("no final message content")
+        || lower.contains("finish_reason=length")
+        || lower.contains("completion_tokens") && lower.contains("reasoning")
+    {
+        "The model likely exhausted its output budget in reasoning; increase max output tokens or lower reasoning effort."
+    } else if lower.contains("no readable source files") {
+        "No files matched the requested paths/include/exclude filters after gitignore and secret filtering."
+    } else if lower.contains("no such file or directory") && lower.contains("worker") {
+        "Refresh the stable LLM2MCP installation and restart the MCP host before retrying the background job."
+    } else {
+        return None;
+    };
+    Some(hint.to_owned())
+}
+
+pub fn state_name(state: JobState) -> &'static str {
     match state {
         JobState::Working => "working",
         JobState::Completed => "completed",
@@ -546,9 +704,34 @@ mod tests {
             poll_interval_ms: POLL_INTERVAL_MS,
             result: None,
             error: None,
+            duration_ms: None,
+            llm_calls: 2,
+            prompt_tokens: 1200,
+            completion_tokens: 300,
+            last_llm_diagnostics: Some("finish_reason=stop".to_owned()),
+            error_hint: None,
+            symbol_index_hits: 4,
+            symbol_index_misses: 1,
+            evidence_cache_hits: 3,
+            evidence_cache_misses: 2,
         };
         let value = task_get_result(&record);
         assert_eq!(value["status"], "working");
         assert_eq!(value["_meta"]["io.llm2mcp/progress"]["progress"], 2);
+        assert_eq!(value["_meta"]["io.llm2mcp/progress"]["promptTokens"], 1200);
+    }
+
+    #[test]
+    fn diagnostics_cover_common_provider_failures() {
+        assert!(
+            diagnostic_hint("LLM API HTTP 429: rate limit")
+                .expect("429 hint")
+                .contains("rate-limiting")
+        );
+        assert!(
+            diagnostic_hint("failed to connect to LLM API")
+                .expect("connect hint")
+                .contains("unreachable")
+        );
     }
 }

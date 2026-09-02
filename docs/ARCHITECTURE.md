@@ -33,9 +33,10 @@ AI 编码智能体主模型
 
 ## 进程模型
 
-同一个二进制有三种运行模式：
+同一个二进制有四种运行模式：
 
 - `llm2mcp`：启动 GUI，用于配置 API、语言、工具 reasoning/execution 和编码智能体集成。
+- `llm2mcp install`：把当前版本刷新到稳定的用户级可执行文件路径并打印该路径。
 - `llm2mcp mcp [--workspace <path>]`：编码智能体自动拉起的 stdio MCP 子进程。
 - `llm2mcp job-worker --job-id <id>`：内部隐藏模式，负责执行已经持久化的后台 Job。它由 MCP 进程自动启动，不需要用户手工运行。
 
@@ -73,7 +74,7 @@ MCP Host 可结束本次调用甚至重启 MCP process
 
 ## 客户端适配层
 
-客户端差异只存在于“如何注册 MCP”，MCP server 本身保持统一：
+客户端差异只存在于“如何注册 MCP”，MCP server 本身保持统一。执行“安装 / 更新”时会先刷新稳定的用户级 LLM2MCP 可执行文件，再让客户端配置指向该稳定路径，而不是开发目录里的临时构建产物：
 
 - Cursor：直接合并 `~/.cursor/mcp.json`。
 - Claude Code：调用官方 `claude mcp add/remove`。
@@ -82,7 +83,7 @@ MCP Host 可结束本次调用甚至重启 MCP process
 - Pi：安装 MCP extension 后维护 `~/.pi/agent/mcp.json`。
 - 其他客户端：使用标准 `llm2mcp mcp` stdio 启动命令。
 
-这种设计避免把项目绑定到某一个 IDE/Agent。
+对于 LLM2MCP 自己修改的 JSON/TOML 客户端配置，旧文件先复制为 `*.llm2mcp.bak`，新内容通过同目录临时文件写入并原子替换，降低配置中途损坏的风险。这种设计既避免把项目绑定到某一个 IDE/Agent，也避免正常安装后后台 worker 因 `target/debug/...` 被重新构建替换而失去可执行路径。
 
 安装器还会把 Host timeout 当作第二层保险：
 
@@ -114,6 +115,27 @@ Linux / Windows / macOS 启动 GUI 时会尝试加载系统 CJK 字体作为 egu
 
 注意：用户主动选择用于分析的源码会发送到其配置的 LLM API。
 
+## 上下文发现、过滤与 token 预算
+
+`analyze` / `plan` 对目录、多路径、空 `paths` 或明显较大的单文件不再直接顺序读取大量正文，而是采用两阶段发现：
+
+1. 本地按 workspace sandbox、`.gitignore`、secret 规则和可选 `include` / `exclude` glob 枚举候选文本文件。
+2. 对候选文件建立带精确 `start_line/end_line` 的轻量 symbol index，覆盖函数、结构体、类、接口、类型、Markdown 标题等声明；Discovery Index 有独立 token 上限。
+3. 先用本地 lexical/symbol scoring 对 task 与 path/symbol label 做相关性排序。匹配足够强时直接选中最多 12 个 symbol/file，完全跳过额外 LLM discovery。
+4. 只有本地评分不够确定时，才使用 Low reasoning 的短 LLM 调用对 Discovery Index rerank；返回的路径和行范围必须逐项精确匹配本地候选，模型虚构内容会被丢弃。
+5. 深度阶段优先只读取被选中的 symbol range，并在源码中附真实行号、少量前后文以及最多约 30 行文件头/import context；只有没有合适 symbol 时才回退到整文件读取。
+6. 最终 `analyze` / `plan` 请求只接收这批收敛后的上下文。
+
+Discovery 的文件/symbol 解析结果不会每个 Job 从零开始。LLM2MCP 在本机应用数据目录维护版本化的 **Repository Symbol Index**：按 canonical workspace 分桶，记录每个候选文件的 `size + modified_ns`、内容 SHA-256、总行数和 symbol ranges。文件 stamp 未变化时直接复用已有 hash/ranges，避免重新读取源码正文；只有新增或变化文件才重新读取、哈希和解析，再通过跨进程文件锁合并进索引。
+
+深度读取还有独立的 **Evidence Cache**。缓存 key 由版本、workspace、相对路径、文件内容 SHA-256 和精确证据段（prelude 或 symbol/context 行范围）组成。相同代码在连续 `analyze → plan` 或重复任务中可以直接复用格式化好的带行号证据；源码变化后内容哈希改变，旧证据自然失效。真正使用缓存前仍会用当前 symbol index 验证选中 range，避免 source 在 Discovery 与深度读取之间变化时继续使用旧范围。缓存目录/文件在 Unix 下分别收紧为 `0700/0600`，只保存在本机，不作为额外源码历史回传 MCP Host。
+
+较小的单个显式文件仍直接深度读取，避免为简单任务增加发现调用。`document_repo` 不做 symbol 选择，但同样支持 `include` / `exclude` glob 来约束 Repository Map 的扫描范围。
+
+源码、单文件、Discovery Index 和 Git diff 的主要上下文限制现在使用 token 估算，而不是仅比较字符数。估算器对 ASCII 标识符按近似子词长度计数，对 CJK 和标点按更细粒度计数；它不是 Provider tokenizer 的逐 token 精确复刻，但对中英文混合代码比固定字符上限更接近真实模型上下文占用。旧 `max_source_chars` / `max_file_chars` 配置字段仅用于旧配置迁移，新 GUI 使用 source/file/discovery token budget。
+
+`analyze`、`plan`、`review_diff` 还将“副模型可以生成多少”和“主模型最终收到多少”拆成两个预算。副模型分别默认可使用约 4K / 6K / 4K 输出 token，返回时要求结构化 JSON；LLM2MCP 在 Rust 本地解析结论、findings、steps、risks、tests、actions 和 `read_next`，不再调用第二次 LLM 总结，然后按默认 800 / 1200 / 1000 token 的 Primary return budget 做硬上限裁剪。`read_next` 放在返回最前面，并且 `analyze/plan` 的 `path + line range` 必须能映射回本地选中的 symbol range；因此主编码智能体可以直接读取几十到几百行，而不是再次打开完整文件。文档生成工具属于最终内容产物，不做这一层压缩。
+
 ## Reasoning 适配
 
 LLM2MCP 将“工具该思考多深”和“Provider 如何接收思考参数”分开：
@@ -139,7 +161,9 @@ LLM2MCP 将“工具该思考多深”和“Provider 如何接收思考参数”
 - `document_repo` → Async
 - `update_docs` → Async
 
-Job 状态包含 tool、workspace、arguments、stage、progress、total、result/error、创建/更新时间和取消标记。默认保留 7 天。
+Job 状态包含 tool、workspace、arguments、stage、progress、total、result/error、创建/更新时间和取消标记。每次有 usage 信息的 LLM 响应还会累计 `llm_calls`、`prompt_tokens`、`completion_tokens`、最后一次 LLM diagnostics 和总耗时；`analyze/plan` 另外累计 `symbol_index_hits/misses` 与 `evidence_cache_hits/misses`，用于确认持久化缓存是否真正减少本地扫描/证据抽取。失败时根据常见 401/403、429、连接失败、timeout、reasoning 输出预算耗尽、过滤后无源码等情况附带诊断建议。默认保留 7 天。
+
+GUI 会读取最近的持久化 Job JSON，显示状态、stage、耗时、输入/输出 token、LLM 调用次数、Symbol Index / Evidence Cache 命中率、失败原因和诊断建议；Job 历史本身仍不额外保存源码正文。
 
 持久化实现遵循两个原则：
 
@@ -176,8 +200,8 @@ LLM2MCP 同时支持两条长任务路径：
 
 `document_repo` 不会简单读取仓库前 N 个字符。它采用有上限的多轮处理：
 
-1. 本地遵循 `.gitignore`、workspace sandbox 和 secret 规则枚举文本文件。
-2. 将源码按单次上下文预算分块，当前最多处理 12 个 chunk。
+1. 本地遵循 `.gitignore`、workspace sandbox、secret 规则以及可选 `include` / `exclude` glob 枚举文本文件。
+2. 将源码按 token 估算的单次上下文预算分块，当前最多处理 12 个 chunk。
 3. 每个 chunk 由辅助 LLM 使用 Low reasoning 生成约 800–1200 tokens 的 Repository Map 摘要，记录模块职责、入口、符号、数据流、API、配置、部署信息和证据路径；避免把昂贵的深度推理浪费在事实抽取阶段。
 4. Map 默认并发数为 2（GUI 可配置 1–8）。每个成功 summary 会立即写入内容寻址的 checkpoint/cache；cache key 包含 Map prompt 版本、API/model 配置、输出预算、文件路径和 chunk 内容，因此代码未变化的 chunk 可跨 Job、跨文档类型复用。
 5. Reduce 阶段只读取 manifest + Map summaries。`document_repo` 默认 Medium reasoning；若响应只有 `reasoning_content`、最终 `message.content` 为空，则自动按 `XHigh → Medium → Low` 或 `Medium → Low` 降级，只重试 Reduce，不重复 Map。

@@ -24,6 +24,8 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 
 ## Supported AI Coding Agents
 
+**Install / Update** first refreshes a stable per-user LLM2MCP executable, then registers that stable path with the selected coding agent. This prevents MCP entries from pointing at transient development/build locations that can disappear after a rebuild or upgrade. When LLM2MCP directly edits JSON/TOML client configuration, it keeps the previous file as `*.llm2mcp.bak` and replaces the config through an atomic temp-file write.
+
 ### Cursor
 
 LLM2MCP merges a user-level MCP entry into `~/.cursor/mcp.json`. Cursor passes the current workspace through `${workspaceFolder}`.
@@ -66,13 +68,13 @@ LLM2MCP exposes five primary read-only tools plus three portable background-job 
 
 | Tool | Best for | Required parameters | Optional parameters | Default reasoning | Default execution |
 | --- | --- | --- | --- | --- | --- |
-| `analyze` | Root-cause analysis, architecture analysis, large file/directory inspection | `task` | `paths` | Medium | Auto |
-| `plan` | Independent implementation planning and second opinions | `task` | `paths` | XHigh | Auto |
+| `analyze` | Root-cause analysis, architecture analysis, large file/directory inspection | `task` | `paths`, `include`, `exclude` | Medium | Auto |
+| `plan` | Independent implementation planning and second opinions | `task` | `paths`, `include`, `exclude` | XHigh | Auto |
 | `review_diff` | Reviewing tracked Git changes without loading the full diff into the primary agent | None | `task`, `base_ref` | Medium | Sync |
-| `document_repo` | Scanning a repository and generating grounded project documentation with bounded Map→Reduce passes | None | `document_type`, `paths`, `audience`, `language` | Medium | Async |
+| `document_repo` | Scanning a repository and generating grounded project documentation with bounded Map→Reduce passes | None | `document_type`, `paths`, `include`, `exclude`, `audience`, `language` | Medium | Async |
 | `update_docs` | Updating existing README/docs from Git changes without rescanning the entire repository | None | `base_ref`, `target_ref`, `docs`, `language` | XHigh | Async |
 
-Each primary tool has its own configurable reasoning level (`Off / Low / Medium / XHigh`), execution mode (`Sync / Auto / Async`), and maximum output-token budget in the GUI.
+Each primary tool has its own configurable reasoning level (`Off / Low / Medium / XHigh`), execution mode (`Sync / Auto / Async`), and secondary-LLM output-token budget in the GUI. `analyze`, `plan`, and `review_diff` also have a separate **Primary return** budget: the secondary model can use a larger internal answer budget, while LLM2MCP locally compacts the structured result before it enters the primary coding agent's context. Defaults are 800 tokens for `analyze`, 1200 for `plan`, and 1000 for `review_diff`; documentation tools return their full generated artifact. Input source limits are token-estimate based as well: the GUI separately controls the overall source budget, per-file budget, and lightweight discovery-index budget. The estimator is intentionally provider-neutral rather than pretending to be the exact tokenizer for every OpenAI-compatible model.
 
 Portable job tools are always fast and read-only:
 
@@ -87,7 +89,13 @@ Use `analyze` when the primary coding agent would otherwise need to read a large
 Parameters:
 
 - `task` — required. Describe what to investigate and what questions to answer.
-- `paths` — optional array of workspace-relative files or directories. If omitted or empty, LLM2MCP only sends project overview files such as README and common manifests instead of recursively sending the whole repository.
+- `paths` — optional array of workspace-relative files or directories. A directory, multiple paths, or an empty list triggers a lightweight repository discovery pass before deep source reads. A single explicit file skips discovery and is read directly.
+- `include` — optional glob list such as `src/**/*.rs`; only matching source candidates are considered.
+- `exclude` — optional glob list such as `tests/**` or `*.generated.ts`; exclusions win over includes.
+
+For discovery, LLM2MCP locally builds a bounded file/symbol index with exact symbol line ranges. It first tries local lexical/symbol scoring; strong matches skip the extra discovery LLM call entirely. Ambiguous tasks use a short Low-reasoning rerank over the lightweight index. Deep context then prefers the selected symbol ranges, with numbered source lines and only a small file-prelude/import window, instead of reading whole files. Paths or line ranges invented by the model are rejected because selections must match the local candidate index.
+
+The file/symbol index is persistent across jobs. LLM2MCP stores a per-workspace Repository Symbol Index in its local application-data directory and uses file size + nanosecond mtime as a fast unchanged-file stamp. Unchanged files reuse their existing SHA-256 and symbol ranges without rereading source contents; only changed/new files are re-read, content-hashed, and reparsed. Selected source evidence is cached separately by **file SHA-256 + exact line segment**, so a later `analyze` or `plan` can reuse the same symbol/prelude evidence without reopening and slicing unchanged files. Any content change produces a different evidence key, and stale selected ranges are revalidated against the current symbol index before use. Cache files stay local to LLM2MCP and are not returned to the primary coding agent as history; Job status/history exposes symbol-index and evidence-cache hit/miss counters for verification.
 
 Example agent instruction:
 
@@ -107,7 +115,7 @@ Typical tool arguments:
 }
 ```
 
-The result is structured as a compact engineering report containing conclusions, evidence, risks/root causes, recommended actions, and the next files the primary agent should inspect.
+The secondary model returns a structured analysis, and LLM2MCP compacts it locally to the configured Primary return budget without a second LLM call. Validated `READ_NEXT` entries are placed first, for example `src/jobs.rs:400-445 — fn spawn_worker(...)`, so the primary coding agent can open only the relevant range rather than ingesting the entire file.
 
 ### `plan`
 
@@ -116,7 +124,9 @@ Use `plan` before a large implementation when you want an independent plan from 
 Parameters:
 
 - `task` — required. Describe the feature, bug fix, migration, or refactor to plan.
-- `paths` — optional array of workspace-relative files or directories that should be considered.
+- `paths` — optional array of workspace-relative files or directories that should be considered. Directory/multi-path/empty requests use the same local-scoring → optional LLM rerank → symbol-range context selection path as `analyze` before deep reads.
+- `include` — optional include globs.
+- `exclude` — optional exclude globs; exclusions win over includes.
 
 Example agent instruction:
 
@@ -174,6 +184,8 @@ Parameters:
 
 - `document_type` — optional. One of `overview`, `architecture`, `modules`, `api`, `developer`, `deployment`, or `full`. Defaults to `overview`.
 - `paths` — optional workspace-relative files/directories. Empty means scan the repository.
+- `include` — optional include globs applied during the local repository scan.
+- `exclude` — optional exclude globs applied after includes.
 - `audience` — optional free-form audience such as `developer`, `new_contributor`, or `operator`. Defaults to `developer`.
 - `language` — optional. `auto`, `english`, or `simplified_chinese`. Defaults to `auto`.
 
@@ -277,7 +289,7 @@ job_result(job_id)
 
 A job is written to LLM2MCP's local application-data directory before its handle is returned. Work is then executed by an independent `llm2mcp job-worker` subprocess, so the original MCP stdio process can exit or be restarted without losing the job result.
 
-On Linux, LLM2MCP also handles an in-place rebuild/update while an MCP process is still running. If `current_exe()` resolves to a deleted executable inode (for example `target/debug/llm2mcp (deleted)` after `cargo build` replaced the development binary), the running MCP process launches its same-version worker through `/proc/self/exe` instead of failing with `No such file or directory`. After updating LLM2MCP itself, restart/reload the MCP connection once so the host uses the new server version.
+Coding-agent integrations point to the stable per-user executable rather than a transient build path, which removes the normal `target/debug/...` rebuild failure mode for background workers. Linux also keeps a `/proc/self/exe` fallback for development or unusual in-place updates where an already-running MCP process sees its original executable path as deleted. After updating LLM2MCP itself, restart/reload the MCP connection once so the host uses the new server version.
 
 For MCP hosts that opt into the `io.modelcontextprotocol/tasks` extension on protocol `2026-07-28`, LLM2MCP instead returns a standard `resultType: "task"` handle. The host can poll with `tasks/get`; the completed task contains the original tool result. The portable `job_*` tools remain available for hosts that do not support Tasks.
 
@@ -292,7 +304,7 @@ completed
 
 `job_cancel` / `tasks/cancel` are cooperative. Cancellation is checked between stages and LLM calls; an HTTP request already executing against the configured LLM may finish before cancellation takes effect.
 
-Jobs are retained for seven days by default and old job state/log files are cleaned up opportunistically when LLM2MCP starts.
+Jobs are retained for seven days by default and old job state/log files are cleaned up opportunistically when LLM2MCP starts. Durable Job records also accumulate runtime, LLM call count, prompt/completion token usage when the provider reports it, the last response diagnostics, and a targeted hint for common authentication, rate-limit, connection, timeout, output-budget, or source-filter failures. The GUI exposes the most recent Job records in a refreshable history panel without storing an additional copy of source-code bodies.
 
 As a secondary safety measure, the integration installer attempts to configure longer MCP tool timeouts where the target agent exposes such a setting. Async jobs remain the primary protection against host-side hard timeouts, especially for hosts where the timeout cannot be reliably changed.
 
@@ -358,6 +370,12 @@ Run the GUI:
 
 ```bash
 cargo run
+```
+
+To refresh only the stable per-user executable and print its path:
+
+```bash
+cargo run -- install
 ```
 
 Then:

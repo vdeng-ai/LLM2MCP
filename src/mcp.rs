@@ -27,7 +27,9 @@ Rules:
 - Identify root causes, risks, and next actions.
 - Do not claim you modified files.
 - Do not reveal hidden chain-of-thought.
-Return a compact engineering report."#;
+Return JSON only, with no Markdown or code fences, in this shape:
+{"conclusion":"...","findings":[{"severity":"high|medium|low|info","text":"...","evidence":["path:line-range or symbol"]}],"risks":["..."],"actions":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
+Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
 
 const PLAN_SYSTEM: &str = r#"You are a local software-planning specialist assisting a primary coding agent.
 Analyze the supplied repository information and produce an implementation plan.
@@ -38,11 +40,22 @@ Rules:
 - Prefer the smallest implementation that satisfies the task.
 - Identify dependencies, risks, compatibility concerns, and verification steps.
 - Do not claim changes have already been made.
-- Do not reveal hidden chain-of-thought."#;
+- Do not reveal hidden chain-of-thought.
+Return JSON only, with no Markdown or code fences, in this shape:
+{"goal":"...","steps":["..."],"risks":["..."],"tests":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
+Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
+
+const DISCOVERY_SYSTEM: &str = r#"You are selecting repository symbols for a deeper second-pass analysis by another model call.
+Use only the supplied lightweight file/symbol index. Prefer the smallest exact symbol ranges that can answer the task; use whole files only when no suitable symbol range is available.
+Return JSON only in this exact shape: {"symbols":[{"path":"relative/path","start_line":1,"end_line":20}],"files":["relative/path"]}.
+Choose at most 12 symbol ranges/files total. Copy candidate paths and line ranges exactly. Do not invent paths, line ranges, explanations, Markdown, or code fences."#;
 
 const REVIEW_SYSTEM: &str = r#"You are a local code-review specialist assisting a primary coding agent.
 Review the supplied git diff for correctness bugs, regressions, concurrency issues, resource leaks, security problems, API compatibility, and missing tests.
-Do not nitpick formatting unless it affects correctness. Do not reproduce the entire diff. Rank findings by severity and cite files/symbols when possible."#;
+Do not nitpick formatting unless it affects correctness. Do not reproduce the entire diff. Rank findings by severity and cite files/symbols when possible.
+Return JSON only, with no Markdown or code fences, in this shape:
+{"conclusion":"...","findings":[{"severity":"critical|high|medium|low","text":"...","evidence":["path or diff hunk"]}],"tests":["..."],"actions":["..."]}.
+Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
 
 const DOC_MAP_SYSTEM: &str = r#"You are mapping one chunk of a software repository for a later documentation synthesis step.
 Extract only evidence useful for accurate project documentation: responsibilities, entry points, important modules and symbols, data/control flow, APIs, configuration, persistence, integrations, build/deploy behavior, and notable constraints.
@@ -259,7 +272,9 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "task": {"type": "string", "description": "What to analyze and what questions to answer"},
-                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files or directories. Empty means project overview files only."}
+                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files or directories. Empty triggers lightweight repository discovery before deep file reads."},
+                        "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs such as src/**/*.rs"},
+                        "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs such as tests/** or *.generated.ts"}
                     },
                     "required": ["task"],
                     "additionalProperties": false
@@ -273,7 +288,9 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "task": {"type": "string"},
-                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files or directories"}
+                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files or directories. Directories use lightweight file/symbol discovery before deep reads."},
+                        "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs"},
+                        "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs"}
                     },
                     "required": ["task"],
                     "additionalProperties": false
@@ -301,6 +318,8 @@ fn tools_list() -> Value {
                     "properties": {
                         "document_type": {"type": "string", "enum": ["overview", "architecture", "modules", "api", "developer", "deployment", "full"], "default": "overview"},
                         "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional workspace-relative files/directories to document. Empty scans the repository."},
+                        "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs"},
+                        "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs"},
                         "audience": {"type": "string", "default": "developer"},
                         "language": {"type": "string", "enum": ["auto", "english", "simplified_chinese"], "default": "auto"}
                     },
@@ -393,7 +412,7 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
             Ok(text) => tool_result(text, false),
             Err(error) => {
                 eprintln!("tool {name} failed: {error:#}");
-                tool_result(format!("LLM2MCP error: {error:#}"), true)
+                tool_result(format_business_error(&error), true)
             }
         },
     )
@@ -553,6 +572,15 @@ fn tool_result(text: String, is_error: bool) -> Value {
     })
 }
 
+fn format_business_error(error: &anyhow::Error) -> String {
+    let message = format!("LLM2MCP error: {error:#}");
+    if let Some(hint) = jobs::diagnostic_hint(&message) {
+        format!("{message}\nDiagnostic hint: {hint}")
+    } else {
+        message
+    }
+}
+
 fn execute_business_inner(
     config: &AppConfig,
     root: &Path,
@@ -597,6 +625,570 @@ fn progress(reporter: Option<&Reporter>, stage: &str, done: u64, total: u64) -> 
     Ok(())
 }
 
+fn record_response(reporter: Option<&Reporter>, response: &llm::ChatResponse) -> Result<()> {
+    if let Some(reporter) = reporter {
+        reporter.record_llm_usage(
+            response.prompt_tokens,
+            response.completion_tokens,
+            &response.diagnostics(),
+        )?;
+    }
+    Ok(())
+}
+
+fn chat_detailed_with_reporter(
+    config: &AppConfig,
+    system: &str,
+    user: &str,
+    effort: ReasoningEffort,
+    max_output_tokens: u32,
+    reporter: Option<&Reporter>,
+) -> Result<llm::ChatResponse> {
+    if let Some(reporter) = reporter {
+        reporter.record_llm_attempt()?;
+    }
+    let response = llm::chat_detailed(config, system, user, effort, max_output_tokens)?;
+    record_response(reporter, &response)?;
+    Ok(response)
+}
+
+fn chat_with_reporter(
+    config: &AppConfig,
+    system: &str,
+    user: &str,
+    effort: ReasoningEffort,
+    max_output_tokens: u32,
+    reporter: Option<&Reporter>,
+) -> Result<String> {
+    let response =
+        chat_detailed_with_reporter(config, system, user, effort, max_output_tokens, reporter)?;
+    response
+        .final_text()
+        .map(|value| value.trim().to_owned())
+        .with_context(|| {
+            format!(
+                "LLM returned no final message content ({})",
+                response.diagnostics()
+            )
+        })
+}
+
+fn source_filters(args: &Value) -> (Vec<String>, Vec<String>) {
+    (
+        string_list_arg(args, "include"),
+        string_list_arg(args, "exclude"),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct DeepSelection {
+    files: Vec<String>,
+    symbols: Vec<workspace::SymbolCandidate>,
+    truncated: bool,
+    used_llm: bool,
+}
+
+impl DeepSelection {
+    fn description(&self) -> String {
+        let mut lines = self
+            .symbols
+            .iter()
+            .map(|symbol| {
+                format!(
+                    "{}:{}-{} {}",
+                    symbol.path, symbol.start_line, symbol.end_line, symbol.label
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.extend(self.files.iter().map(|path| format!("{path} (whole file)")));
+        lines.join("\n")
+    }
+}
+
+fn should_discover(root: &Path, requested: &[String]) -> bool {
+    if requested.is_empty() || requested.len() > 1 {
+        return true;
+    }
+    requested.first().is_some_and(|path| {
+        let path = root.join(path);
+        path.is_dir()
+            || path
+                .metadata()
+                .map(|metadata| metadata.len() > 80_000)
+                .unwrap_or(false)
+    })
+}
+
+fn task_keywords(task: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "into",
+        "what",
+        "why",
+        "how",
+        "find",
+        "fix",
+        "plan",
+        "analyze",
+        "review",
+        "implement",
+        "implementation",
+        "code",
+        "project",
+        "issue",
+        "problem",
+        "need",
+        "should",
+        "could",
+        "would",
+    ];
+    let mut keywords = task
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .map(str::trim)
+        .filter(|word| word.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .filter(|word| !STOP_WORDS.contains(&word.as_str()))
+        .collect::<Vec<_>>();
+    keywords.sort();
+    keywords.dedup();
+    keywords
+}
+
+fn lexical_score(keywords: &[String], text: &str, weight: u32) -> u32 {
+    let haystack = text.to_ascii_lowercase();
+    keywords
+        .iter()
+        .filter(|keyword| haystack.contains(keyword.as_str()))
+        .map(|_| weight)
+        .sum()
+}
+
+fn local_discovery_selection(
+    task: &str,
+    index: &workspace::DiscoveryIndex,
+) -> Option<(Vec<workspace::SymbolCandidate>, Vec<String>)> {
+    let keywords = task_keywords(task);
+    if keywords.is_empty() {
+        return None;
+    }
+
+    let mut symbols = index
+        .symbols
+        .iter()
+        .map(|symbol| {
+            let score = lexical_score(&keywords, &symbol.label, 8)
+                + lexical_score(&keywords, &symbol.path, 4);
+            (score, symbol.clone())
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    symbols.sort_by_key(|item| std::cmp::Reverse(item.0));
+    if let Some((top_score, _)) = symbols.first()
+        && *top_score >= 8
+    {
+        let threshold = (*top_score / 2).max(4);
+        let selected = symbols
+            .into_iter()
+            .filter(|(score, _)| *score >= threshold)
+            .take(12)
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        if !selected.is_empty() {
+            return Some((selected, Vec::new()));
+        }
+    }
+
+    let mut files = index
+        .candidate_files
+        .iter()
+        .map(|path| (lexical_score(&keywords, path, 5), path.clone()))
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    files.sort_by_key(|item| std::cmp::Reverse(item.0));
+    if let Some((top_score, _)) = files.first()
+        && *top_score >= 5
+    {
+        let selected = files
+            .into_iter()
+            .take(6)
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>();
+        return Some((Vec::new(), selected));
+    }
+    None
+}
+
+fn json_object(response: &str) -> Option<Value> {
+    let trimmed = response.trim();
+    let slice = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .and_then(|(start, end)| (start <= end).then_some(&trimmed[start..=end]))?;
+    serde_json::from_str(slice).ok()
+}
+
+fn parse_discovery_selection(
+    response: &str,
+    index: &workspace::DiscoveryIndex,
+) -> (Vec<workspace::SymbolCandidate>, Vec<String>) {
+    let Some(value) = json_object(response) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut symbols = Vec::new();
+    if let Some(items) = value.get("symbols").and_then(Value::as_array) {
+        for item in items {
+            let Some(path) = item.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(start_line) = item.get("start_line").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(end_line) = item.get("end_line").and_then(Value::as_u64) else {
+                continue;
+            };
+            let candidate = index.symbols.iter().find(|candidate| {
+                candidate.path == path
+                    && candidate.start_line == start_line as usize
+                    && candidate.end_line == end_line as usize
+            });
+            if let Some(candidate) = candidate
+                && !symbols.iter().any(|selected: &workspace::SymbolCandidate| {
+                    selected.path == candidate.path && selected.start_line == candidate.start_line
+                })
+            {
+                symbols.push(candidate.clone());
+                if symbols.len() >= 12 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let remaining = 12usize.saturating_sub(symbols.len());
+    let mut files = Vec::new();
+    if remaining > 0
+        && let Some(items) = value.get("files").and_then(Value::as_array)
+    {
+        for item in items {
+            let Some(path) = item.as_str() else {
+                continue;
+            };
+            if index
+                .candidate_files
+                .iter()
+                .any(|candidate| candidate == path)
+                && !files.iter().any(|selected| selected == path)
+                && !symbols.iter().any(|symbol| symbol.path == path)
+            {
+                files.push(path.to_owned());
+                if files.len() >= remaining {
+                    break;
+                }
+            }
+        }
+    }
+    (symbols, files)
+}
+
+fn discover_deep_context(
+    config: &AppConfig,
+    root: &Path,
+    task: &str,
+    requested: &[String],
+    include: &[String],
+    exclude: &[String],
+    reporter: Option<&Reporter>,
+) -> Result<DeepSelection> {
+    if !should_discover(root, requested) {
+        return Ok(DeepSelection {
+            files: requested.to_vec(),
+            symbols: Vec::new(),
+            truncated: false,
+            used_llm: false,
+        });
+    }
+
+    let index = workspace::discovery_index(root, requested, config, include, exclude)?;
+    if let Some(reporter) = reporter {
+        reporter.record_cache_usage(index.cache_hits as u64, index.cache_misses as u64, 0, 0)?;
+    }
+    if index.candidate_files.is_empty() {
+        bail!("no readable source files matched the requested paths/include/exclude filters");
+    }
+
+    if let Some((symbols, files)) = local_discovery_selection(task, &index) {
+        return Ok(DeepSelection {
+            files,
+            symbols,
+            truncated: index.truncated,
+            used_llm: false,
+        });
+    }
+
+    if index.candidate_files.len() <= 2 {
+        return Ok(DeepSelection {
+            files: index.candidate_files,
+            symbols: Vec::new(),
+            truncated: index.truncated,
+            used_llm: false,
+        });
+    }
+
+    let prompt = format!(
+        "TASK\n{task}\n\nCANDIDATE FILE/SYMBOL INDEX\n{}\n\nINDEX_TRUNCATED\n{}\n\nSelect the smallest exact symbol ranges/files needed for a deep second pass. Return JSON only.",
+        index.body, index.truncated
+    );
+    let selection = chat_with_reporter(
+        config,
+        DISCOVERY_SYSTEM,
+        &prompt,
+        ReasoningEffort::Low,
+        1_200,
+        reporter,
+    )?;
+    let (mut symbols, mut files) = parse_discovery_selection(&selection, &index);
+    if symbols.is_empty() && files.is_empty() {
+        files = index.candidate_files.iter().take(8).cloned().collect();
+    }
+    symbols.truncate(12);
+    let remaining = 12usize.saturating_sub(symbols.len());
+    files.truncate(remaining);
+    Ok(DeepSelection {
+        files,
+        symbols,
+        truncated: index.truncated,
+        used_llm: true,
+    })
+}
+
+fn collect_deep_selection(
+    config: &AppConfig,
+    root: &Path,
+    selection: &DeepSelection,
+    include: &[String],
+    exclude: &[String],
+) -> Result<workspace::CollectedSource> {
+    if !selection.symbols.is_empty() && selection.files.is_empty() {
+        workspace::collect_symbol_context(root, &selection.symbols, config)
+    } else {
+        let mut sources = if selection.files.is_empty() {
+            workspace::collect_symbol_context(root, &selection.symbols, config)?
+        } else {
+            workspace::collect_filtered(root, &selection.files, config, include, exclude)?
+        };
+        if !selection.symbols.is_empty() {
+            let symbol_sources =
+                workspace::collect_symbol_context(root, &selection.symbols, config)?;
+            let remaining = config
+                .max_source_tokens
+                .saturating_sub(workspace::estimate_tokens(&sources.body));
+            if remaining > 128 {
+                let (extra, clipped) = workspace::truncate_tokens(
+                    &symbol_sources.body,
+                    remaining,
+                    "\n[ADDITIONAL SYMBOL CONTEXT TRUNCATED]\n",
+                );
+                sources.body.push_str(&extra);
+                sources.truncated |= clipped || symbol_sources.truncated;
+                sources.evidence_cache_hits = sources
+                    .evidence_cache_hits
+                    .saturating_add(symbol_sources.evidence_cache_hits);
+                sources.evidence_cache_misses = sources
+                    .evidence_cache_misses
+                    .saturating_add(symbol_sources.evidence_cache_misses);
+                for path in symbol_sources.included_files {
+                    if !sources.included_files.contains(&path) {
+                        sources.included_files.push(path);
+                    }
+                }
+            }
+        }
+        Ok(sources)
+    }
+}
+
+fn validated_read_next(value: &Value, selection: Option<&DeepSelection>) -> Vec<String> {
+    let Some(selection) = selection else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    if let Some(items) = value.get("read_next").and_then(Value::as_array) {
+        for item in items {
+            let Some(path) = item.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let lines = item
+                .get("lines")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let parsed_lines = lines.split_once('-').and_then(|(start, end)| {
+                Some((
+                    start.trim().parse::<usize>().ok()?,
+                    end.trim().parse::<usize>().ok()?,
+                ))
+            });
+            let Some((start_line, end_line)) = parsed_lines else {
+                continue;
+            };
+            let Some(candidate) = selection.symbols.iter().find(|candidate| {
+                candidate.path == path
+                    && candidate.start_line == start_line
+                    && candidate.end_line == end_line
+            }) else {
+                continue;
+            };
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let suffix = reason
+                .map(|value| format!(" — {value}"))
+                .unwrap_or_default();
+            output.push(format!(
+                "- {}:{}-{} — {}{}",
+                candidate.path, candidate.start_line, candidate.end_line, candidate.label, suffix
+            ));
+            if output.len() >= 6 {
+                break;
+            }
+        }
+    }
+
+    if output.is_empty() {
+        output.extend(selection.symbols.iter().take(6).map(|candidate| {
+            format!(
+                "- {}:{}-{} — {}",
+                candidate.path, candidate.start_line, candidate.end_line, candidate.label
+            )
+        }));
+    }
+    if output.is_empty() {
+        output.extend(
+            selection
+                .files
+                .iter()
+                .take(4)
+                .map(|path| format!("- {path}")),
+        );
+    }
+    output
+}
+
+fn render_value_list(value: &Value, key: &str, max_items: usize) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(max_items)
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(format!("- {}", text.trim())),
+                    Value::Object(object) => {
+                        let text = object
+                            .get("text")
+                            .or_else(|| object.get("description"))
+                            .and_then(Value::as_str)?;
+                        let severity = object
+                            .get("severity")
+                            .and_then(Value::as_str)
+                            .map(|value| format!("[{value}] "))
+                            .unwrap_or_default();
+                        let evidence = object
+                            .get("evidence")
+                            .and_then(Value::as_array)
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .take(3)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .filter(|value| !value.is_empty())
+                            .map(|value| format!(" ({value})"))
+                            .unwrap_or_default();
+                        Some(format!("- {severity}{}{evidence}", text.trim()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSelection>) -> String {
+    let budget = max_tokens.max(128) as usize;
+    let Some(value) = json_object(raw) else {
+        let mut fallback = String::new();
+        let read_next = selection
+            .map(|selection| {
+                let placeholder = json!({});
+                validated_read_next(&placeholder, Some(selection))
+            })
+            .unwrap_or_default();
+        if !read_next.is_empty() {
+            fallback.push_str("READ_NEXT\n");
+            fallback.push_str(&read_next.join("\n"));
+            fallback.push_str("\n\nRESULT\n");
+        }
+        fallback.push_str(raw.trim());
+        return workspace::truncate_tokens_strict(
+            &fallback,
+            budget,
+            "\n[PRIMARY RESULT TRUNCATED]\n",
+        );
+    };
+
+    let mut output = String::new();
+    let read_next = validated_read_next(&value, selection);
+    if !read_next.is_empty() {
+        output.push_str("READ_NEXT\n");
+        output.push_str(&read_next.join("\n"));
+        output.push_str("\n\n");
+    }
+
+    for (key, heading) in [("conclusion", "CONCLUSION"), ("goal", "GOAL")] {
+        if let Some(text) = value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            output.push_str(heading);
+            output.push('\n');
+            output.push_str(text.trim());
+            output.push_str("\n\n");
+        }
+    }
+
+    for (key, heading, max_items) in [
+        ("findings", "FINDINGS", 8usize),
+        ("steps", "STEPS", 10),
+        ("actions", "ACTIONS", 6),
+        ("risks", "RISKS", 5),
+        ("tests", "TESTS", 6),
+    ] {
+        let lines = render_value_list(&value, key, max_items);
+        if !lines.is_empty() {
+            output.push_str(heading);
+            output.push('\n');
+            output.push_str(&lines.join("\n"));
+            output.push_str("\n\n");
+        }
+    }
+
+    if output.trim().is_empty() {
+        output.push_str(raw.trim());
+    }
+    workspace::truncate_tokens_strict(&output, budget, "\n[PRIMARY RESULT TRUNCATED]\n")
+}
+
 fn analyze(
     config: &AppConfig,
     root: &Path,
@@ -604,26 +1196,51 @@ fn analyze(
     tool: &ToolConfig,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    progress(reporter, "collecting context", 0, 2)?;
+    progress(reporter, "building discovery index", 0, 3)?;
     let task = task_arg(args)?;
-    let sources = workspace::collect(root, &paths_arg(args), config)?;
-    progress(reporter, "analyzing", 1, 2)?;
+    let requested = paths_arg(args);
+    let (include, exclude) = source_filters(args);
+    let selection =
+        discover_deep_context(config, root, task, &requested, &include, &exclude, reporter)?;
+    progress(reporter, "collecting selected context", 1, 3)?;
+    let sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
+    if let Some(reporter) = reporter {
+        reporter.record_cache_usage(
+            0,
+            0,
+            sources.evidence_cache_hits as u64,
+            sources.evidence_cache_misses as u64,
+        )?;
+    }
+    if sources.included_files.is_empty() {
+        bail!("no readable source files found after discovery and filtering");
+    }
+    progress(reporter, "analyzing", 2, 3)?;
     let prompt = format!(
-        "TASK\n{task}\n\nREPOSITORY MANIFEST\n{}\n\nFILES INCLUDED\n{}\n\nSOURCE MATERIAL\n{}\n\nSOURCE_TRUNCATED\n{}\n\nReturn: 1) executive conclusion, 2) key evidence, 3) root causes/risks, 4) recommended actions, 5) files the primary agent should inspect next.",
+        "TASK\n{task}\n\nREPOSITORY MANIFEST\n{}\n\nDISCOVERY_SELECTED_CONTEXT\n{}\n\nDISCOVERY_USED_LLM\n{}\n\nDISCOVERY_INDEX_TRUNCATED\n{}\n\nFILES INCLUDED\n{}\n\nESTIMATED_SOURCE_TOKENS\n{}\n\nSOURCE MATERIAL\n{}\n\nSOURCE_TRUNCATED\n{}\n\nReturn the JSON shape required by the system prompt. For read_next, copy only exact path/symbol/line ranges shown in DISCOVERY_SELECTED_CONTEXT.",
         sources.manifest,
+        selection.description(),
+        selection.used_llm,
+        selection.truncated,
         sources.included_files.join("\n"),
+        workspace::estimate_tokens(&sources.body),
         sources.body,
         sources.truncated,
     );
-    let result = llm::chat(
+    let result = chat_with_reporter(
         config,
         ANALYZE_SYSTEM,
         &prompt,
         tool.reasoning,
         tool.max_output_tokens,
+        reporter,
     )?;
-    progress(reporter, "finishing", 2, 2)?;
-    Ok(result)
+    progress(reporter, "finishing", 3, 3)?;
+    Ok(compact_primary_result(
+        &result,
+        tool.primary_return_or(800),
+        Some(&selection),
+    ))
 }
 
 fn plan(
@@ -633,26 +1250,51 @@ fn plan(
     tool: &ToolConfig,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    progress(reporter, "collecting context", 0, 2)?;
+    progress(reporter, "building discovery index", 0, 3)?;
     let task = task_arg(args)?;
-    let sources = workspace::collect(root, &paths_arg(args), config)?;
-    progress(reporter, "planning", 1, 2)?;
+    let requested = paths_arg(args);
+    let (include, exclude) = source_filters(args);
+    let selection =
+        discover_deep_context(config, root, task, &requested, &include, &exclude, reporter)?;
+    progress(reporter, "collecting selected context", 1, 3)?;
+    let sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
+    if let Some(reporter) = reporter {
+        reporter.record_cache_usage(
+            0,
+            0,
+            sources.evidence_cache_hits as u64,
+            sources.evidence_cache_misses as u64,
+        )?;
+    }
+    if sources.included_files.is_empty() {
+        bail!("no readable source files found after discovery and filtering");
+    }
+    progress(reporter, "planning", 2, 3)?;
     let prompt = format!(
-        "TASK\n{task}\n\nREPOSITORY MANIFEST\n{}\n\nFILES INCLUDED\n{}\n\nSOURCE MATERIAL\n{}\n\nSOURCE_TRUNCATED\n{}\n\nProduce: goal/constraints, proposed implementation, files/modules to change, ordered steps, risks, and tests.",
+        "TASK\n{task}\n\nREPOSITORY MANIFEST\n{}\n\nDISCOVERY_SELECTED_CONTEXT\n{}\n\nDISCOVERY_USED_LLM\n{}\n\nDISCOVERY_INDEX_TRUNCATED\n{}\n\nFILES INCLUDED\n{}\n\nESTIMATED_SOURCE_TOKENS\n{}\n\nSOURCE MATERIAL\n{}\n\nSOURCE_TRUNCATED\n{}\n\nReturn the JSON shape required by the system prompt. For read_next, copy only exact path/symbol/line ranges shown in DISCOVERY_SELECTED_CONTEXT.",
         sources.manifest,
+        selection.description(),
+        selection.used_llm,
+        selection.truncated,
         sources.included_files.join("\n"),
+        workspace::estimate_tokens(&sources.body),
         sources.body,
         sources.truncated,
     );
-    let result = llm::chat(
+    let result = chat_with_reporter(
         config,
         PLAN_SYSTEM,
         &prompt,
         tool.reasoning,
         tool.max_output_tokens,
+        reporter,
     )?;
-    progress(reporter, "finishing", 2, 2)?;
-    Ok(result)
+    progress(reporter, "finishing", 3, 3)?;
+    Ok(compact_primary_result(
+        &result,
+        tool.primary_return_or(1_200),
+        Some(&selection),
+    ))
 }
 
 fn review_diff(
@@ -671,7 +1313,7 @@ fn review_diff(
         .get("base_ref")
         .and_then(Value::as_str)
         .unwrap_or("HEAD");
-    let (status, diff, truncated) = workspace::git_diff(root, base_ref, config.max_source_chars)?;
+    let (status, diff, truncated) = workspace::git_diff(root, base_ref, config.max_source_tokens)?;
     if diff.trim().is_empty() {
         return Ok("No tracked git diff found for review.".to_owned());
     }
@@ -679,15 +1321,20 @@ fn review_diff(
     let prompt = format!(
         "REVIEW TASK\n{task}\n\nGIT STATUS\n{status}\n\nDIFF AGAINST\n{base_ref}\n\nDIFF\n{diff}\n\nDIFF_TRUNCATED\n{truncated}\n\nReturn critical/high/medium findings, missing tests, and recommended fixes.",
     );
-    let result = llm::chat(
+    let result = chat_with_reporter(
         config,
         REVIEW_SYSTEM,
         &prompt,
         tool.reasoning,
         tool.max_output_tokens,
+        reporter,
     )?;
     progress(reporter, "finishing", 2, 2)?;
-    Ok(result)
+    Ok(compact_primary_result(
+        &result,
+        tool.primary_return_or(1_000),
+        None,
+    ))
 }
 
 fn string_list_arg(args: &Value, name: &str) -> Vec<String> {
@@ -738,6 +1385,7 @@ fn map_repository_chunk(
     index: usize,
     total_chunks: usize,
     map_tokens: u32,
+    reporter: Option<&Reporter>,
 ) -> Result<String> {
     let prompt = format!(
         "CHUNK {}/{}\n\nFILES\n{}\n\nSOURCE\n{}\n\nExtract repository-map evidence for later documentation synthesis. Focus on responsibilities, entry points, important symbols, flows, APIs, configuration, build/deploy behavior, integrations, and constraints. Cite file paths and symbols. Keep the result concise; this summary will be combined with other chunks later.\n",
@@ -746,12 +1394,13 @@ fn map_repository_chunk(
         chunk.included_files.join("\n"),
         chunk.body,
     );
-    llm::chat(
+    chat_with_reporter(
         config,
         DOC_MAP_SYSTEM,
         &prompt,
         ReasoningEffort::Low,
         map_tokens,
+        reporter,
     )
 }
 
@@ -776,7 +1425,7 @@ fn document_repo(
     reporter: Option<&Reporter>,
 ) -> Result<String> {
     const MAX_CHUNKS: usize = 12;
-    const MAX_CHUNK_CHARS: usize = 160_000;
+    const MAX_CHUNK_TOKENS: usize = 40_000;
 
     progress(reporter, "scanning repository", 0, 1)?;
     let document_type = enum_arg(
@@ -805,12 +1454,15 @@ fn document_repo(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("developer");
     let paths = paths_arg(args);
-    let chunks = workspace::collect_chunks(
+    let (include, exclude) = source_filters(args);
+    let chunks = workspace::collect_chunks_filtered(
         root,
         &paths,
         config,
-        config.max_source_chars.min(MAX_CHUNK_CHARS),
+        config.max_source_tokens.min(MAX_CHUNK_TOKENS),
         MAX_CHUNKS,
+        &include,
+        &exclude,
     )?;
     if chunks.is_empty() {
         bail!("no readable source files found for documentation");
@@ -881,8 +1533,14 @@ fn document_repo(
                         total_chunks,
                         chunk.included_files.len()
                     );
-                    let summary =
-                        map_repository_chunk(config, chunk, index, total_chunks, map_tokens)?;
+                    let summary = map_repository_chunk(
+                        config,
+                        chunk,
+                        index,
+                        total_chunks,
+                        map_tokens,
+                        reporter,
+                    )?;
                     if let Err(error) = doc_cache::store_summary(&key, &summary) {
                         eprintln!(
                             "LLM2MCP map checkpoint write failed for chunk {}: {error:#}",
@@ -955,12 +1613,13 @@ fn document_repo(
                 "{base_prompt}\n\nSYNTHESIS RETRY DIRECTIVE\nThe previous synthesis attempt exhausted or failed to produce final message content. Do not perform extended reasoning. Use the existing repository-map evidence and emit the requested final Markdown immediately."
             )
         };
-        let response = llm::chat_detailed(
+        let response = chat_detailed_with_reporter(
             config,
             DOC_REDUCE_SYSTEM,
             &prompt,
             effort,
             tool.max_output_tokens,
+            reporter,
         )?;
         if let Some(content) = response.final_text() {
             progress(reporter, "finishing", total_steps, total_steps)?;
@@ -1012,14 +1671,14 @@ fn update_docs(
         .and_then(Value::as_str)
         .unwrap_or("WORKTREE");
 
-    let per_side_chars = (config.max_source_chars / 2).max(10_000);
+    let per_side_tokens = (config.max_source_tokens / 2).max(2_500);
     let (diff, diff_truncated, comparison) = if target_ref.eq_ignore_ascii_case("WORKTREE") {
-        let (_status, diff, truncated) = workspace::git_diff(root, base_ref, per_side_chars)
+        let (_status, diff, truncated) = workspace::git_diff(root, base_ref, per_side_tokens)
             .context("update_docs requires a Git repository with a valid base_ref")?;
         (diff, truncated, format!("{base_ref} -> WORKTREE"))
     } else {
         let (diff, truncated) =
-            workspace::git_diff_refs(root, base_ref, target_ref, per_side_chars)
+            workspace::git_diff_refs(root, base_ref, target_ref, per_side_tokens)
                 .context("update_docs requires a Git repository with valid base_ref/target_ref")?;
         (diff, truncated, format!("{base_ref} -> {target_ref}"))
     };
@@ -1041,7 +1700,7 @@ fn update_docs(
         None
     } else {
         let mut docs_config = config.clone();
-        docs_config.max_source_chars = per_side_chars;
+        docs_config.max_source_tokens = per_side_tokens;
         Some(workspace::collect(root, &doc_paths, &docs_config)?)
     };
 
@@ -1059,12 +1718,13 @@ fn update_docs(
     let prompt = format!(
         "COMPARISON\n{comparison}\n\nOUTPUT LANGUAGE\n{language}\n\nCODE DIFF\n{diff}\n\nDIFF_TRUNCATED\n{diff_truncated}\n\nEXISTING DOCUMENTS\n{doc_list}\n\nDOCUMENT CONTENT\n{doc_body}\n\nDOCS_TRUNCATED\n{docs_truncated}\n\nDetermine which documents are affected by the code changes. Return complete replacement Markdown only for documents that actually need changes. If a new document is clearly required, use a docs/*.md path and explain it through the document content itself.",
     );
-    let result = llm::chat(
+    let result = chat_with_reporter(
         config,
         UPDATE_DOCS_SYSTEM,
         &prompt,
         tool.reasoning,
         tool.max_output_tokens,
+        reporter,
     )?;
     progress(reporter, "finishing", 3, 3)?;
     Ok(result)
@@ -1115,6 +1775,128 @@ mod tests {
         let missing = tasks_get(Some(&json!({"taskId": "job_test"})))
             .expect_err("tasks/get must reject a client that did not opt into Tasks");
         assert_eq!(missing.code, -32003);
+    }
+
+    #[test]
+    fn discovery_selection_accepts_only_known_candidate_ranges_and_paths() {
+        let index = workspace::DiscoveryIndex {
+            body: String::new(),
+            candidate_files: vec![
+                "src/main.rs".to_owned(),
+                "src/workspace.rs".to_owned(),
+                "README.md".to_owned(),
+            ],
+            symbols: vec![workspace::SymbolCandidate {
+                path: "src/workspace.rs".to_owned(),
+                label: "pub fn collect_symbol_context(...)".to_owned(),
+                start_line: 10,
+                end_line: 40,
+            }],
+            truncated: false,
+            cache_hits: 0,
+            cache_misses: 0,
+        };
+        let response = r#"```json
+{"symbols":[{"path":"src/workspace.rs","start_line":10,"end_line":40},{"path":"invented.rs","start_line":1,"end_line":2}],"files":["src/main.rs","invented.rs"]}
+```"#;
+        let (symbols, files) = parse_discovery_selection(response, &index);
+        assert_eq!(symbols, index.symbols);
+        assert_eq!(files, vec!["src/main.rs".to_owned()]);
+    }
+
+    #[test]
+    fn local_discovery_scoring_prefers_matching_symbol_without_rerank() {
+        let index = workspace::DiscoveryIndex {
+            body: String::new(),
+            candidate_files: vec!["src/jobs.rs".to_owned(), "src/gui.rs".to_owned()],
+            symbols: vec![
+                workspace::SymbolCandidate {
+                    path: "src/jobs.rs".to_owned(),
+                    label: "fn spawn_worker(job_id: &str)".to_owned(),
+                    start_line: 400,
+                    end_line: 445,
+                },
+                workspace::SymbolCandidate {
+                    path: "src/gui.rs".to_owned(),
+                    label: "fn format_duration(ms: u64)".to_owned(),
+                    start_line: 80,
+                    end_line: 95,
+                },
+            ],
+            truncated: false,
+            cache_hits: 0,
+            cache_misses: 0,
+        };
+        let (symbols, files) = local_discovery_selection(
+            "diagnose spawn_worker worker executable startup failure",
+            &index,
+        )
+        .expect("strong lexical match should avoid LLM rerank");
+        assert!(files.is_empty());
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].path, "src/jobs.rs");
+    }
+
+    #[test]
+    fn compact_primary_result_keeps_valid_read_range_and_respects_budget() {
+        let selection = DeepSelection {
+            files: Vec::new(),
+            symbols: vec![workspace::SymbolCandidate {
+                path: "src/jobs.rs".to_owned(),
+                label: "fn spawn_worker(job_id: &str)".to_owned(),
+                start_line: 400,
+                end_line: 445,
+            }],
+            truncated: false,
+            used_llm: false,
+        };
+        let raw = json!({
+            "conclusion": "The worker launch path is the relevant failure boundary.",
+            "findings": [{
+                "severity": "high",
+                "text": "The configured executable path can disappear after replacement.",
+                "evidence": ["src/jobs.rs:400-445"]
+            }],
+            "actions": ["Use the stable executable path."],
+            "read_next": [{
+                "path": "src/jobs.rs",
+                "symbol": "fn spawn_worker(job_id: &str)",
+                "lines": "400-445",
+                "reason": "Contains worker process creation."
+            }]
+        })
+        .to_string();
+        let result = compact_primary_result(&raw, 128, Some(&selection));
+        assert!(result.contains("READ_NEXT"));
+        assert!(result.contains("src/jobs.rs:400-445"));
+        assert!(workspace::estimate_tokens(&result) <= 128);
+    }
+
+    #[test]
+    fn compact_primary_result_rejects_invented_read_range() {
+        let selection = DeepSelection {
+            files: Vec::new(),
+            symbols: vec![workspace::SymbolCandidate {
+                path: "src/jobs.rs".to_owned(),
+                label: "fn spawn_worker(job_id: &str)".to_owned(),
+                start_line: 400,
+                end_line: 445,
+            }],
+            truncated: false,
+            used_llm: false,
+        };
+        let raw = json!({
+            "conclusion": "Check the worker launcher.",
+            "read_next": [{
+                "path": "src/jobs.rs",
+                "lines": "1-9999",
+                "reason": "invented"
+            }]
+        })
+        .to_string();
+        let result = compact_primary_result(&raw, 120, Some(&selection));
+        assert!(result.contains("src/jobs.rs:400-445"));
+        assert!(!result.contains("1-9999"));
     }
 
     #[test]
