@@ -1,0 +1,23 @@
+[package]
+name = "llm2mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Turn any OpenAI-compatible LLM into a local MCP sidecar for AI coding agents"
+license = "MIT"
+repository = "https://github.com/vdeng-ai/LLM2MCP"
+keywords = ["mcp", "cursor", "llm", "openai", "code-analysis"]
+categories = ["development-tools"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+fs2 = "0.4"
+ignore = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+toml_edit = "0.23"
