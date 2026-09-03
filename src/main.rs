@@ -12,6 +12,7 @@ mod llm;
 mod mcp;
 mod repo_cache;
 mod safe_fs;
+mod updater;
 mod workspace;
 
 use anyhow::Result;

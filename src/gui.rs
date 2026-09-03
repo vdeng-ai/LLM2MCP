@@ -1,12 +1,12 @@
 use eframe::egui;
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::mpsc};
 
 use crate::{
     clients::{self, ClientKind, ClientStatus},
     config::{
         self, AppConfig, ExecutionMode, Language, ReasoningEffort, ReasoningTransport, ToolConfig,
     },
-    i18n, install, jobs, llm,
+    i18n, install, jobs, llm, updater,
 };
 
 const UI_ZOOM_STORAGE_KEY: &str = "llm2mcp_ui_zoom_factor";
@@ -66,6 +66,22 @@ impl AppTab {
     }
 }
 
+#[derive(Debug, Clone)]
+enum UpdateUiState {
+    Disabled,
+    Checking,
+    UpToDate,
+    Available {
+        version: String,
+        notes: Option<String>,
+    },
+    Installing,
+    Installed {
+        version: String,
+    },
+    Error(String),
+}
+
 pub struct Llm2McpApp {
     config: AppConfig,
     status: String,
@@ -75,6 +91,8 @@ pub struct Llm2McpApp {
     available_models: Vec<String>,
     ui_zoom_factor: f32,
     active_tab: AppTab,
+    update_state: UpdateUiState,
+    update_rx: Option<mpsc::Receiver<updater::UpdateEvent>>,
 }
 
 impl Llm2McpApp {
@@ -93,6 +111,12 @@ impl Llm2McpApp {
             .and_then(|storage| eframe::get_value::<u8>(storage, ACTIVE_TAB_STORAGE_KEY))
             .map(AppTab::from_index)
             .unwrap_or(AppTab::LlmApi);
+        let update_rx = updater::spawn_check();
+        let update_state = if update_rx.is_some() {
+            UpdateUiState::Checking
+        } else {
+            UpdateUiState::Disabled
+        };
         Self {
             config,
             status: ready,
@@ -102,6 +126,8 @@ impl Llm2McpApp {
             available_models: Vec::new(),
             ui_zoom_factor,
             active_tab,
+            update_state,
+            update_rx,
         }
     }
 
@@ -171,6 +197,40 @@ impl Llm2McpApp {
             Err(error) => format!("{}: {error:#}", kind.label()),
         };
         self.refresh_clients();
+    }
+
+    fn start_update_check(&mut self) {
+        if let Some(receiver) = updater::spawn_check() {
+            self.update_state = UpdateUiState::Checking;
+            self.update_rx = Some(receiver);
+        }
+    }
+
+    fn start_update_install(&mut self) {
+        if let Some(receiver) = updater::spawn_install() {
+            self.update_state = UpdateUiState::Installing;
+            self.update_rx = Some(receiver);
+        }
+    }
+
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        let event = self
+            .update_rx
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some(event) = event else {
+            return;
+        };
+        self.update_rx = None;
+        self.update_state = match event {
+            updater::UpdateEvent::UpToDate => UpdateUiState::UpToDate,
+            updater::UpdateEvent::Available { version, notes } => {
+                UpdateUiState::Available { version, notes }
+            }
+            updater::UpdateEvent::Installed { version } => UpdateUiState::Installed { version },
+            updater::UpdateEvent::Error(error) => UpdateUiState::Error(error),
+        };
+        ctx.request_repaint();
     }
 }
 
@@ -376,6 +436,43 @@ impl Llm2McpApp {
                 ui.small(text.tagline);
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let update_state = self.update_state.clone();
+                match update_state {
+                    UpdateUiState::Disabled => {}
+                    UpdateUiState::Checking => {
+                        ui.add_enabled(false, egui::Button::new(text.checking_update));
+                    }
+                    UpdateUiState::UpToDate => {
+                        if ui.small_button(text.up_to_date).clicked() {
+                            self.start_update_check();
+                        }
+                    }
+                    UpdateUiState::Available { version, notes } => {
+                        let response = ui.button(format!("{} v{version}", text.install_update_app));
+                        let clicked = response.clicked();
+                        if let Some(notes) = notes.filter(|value| !value.trim().is_empty()) {
+                            response.on_hover_text(notes);
+                        }
+                        if clicked {
+                            self.start_update_install();
+                        }
+                    }
+                    UpdateUiState::Installing => {
+                        ui.add_enabled(false, egui::Button::new(text.installing_update));
+                    }
+                    UpdateUiState::Installed { version } => {
+                        ui.label(format!("{} ({version})", text.update_installed));
+                    }
+                    UpdateUiState::Error(error) => {
+                        let response = ui.small_button(text.update_failed);
+                        let clicked = response.clicked();
+                        response.on_hover_text(error);
+                        if clicked {
+                            self.start_update_check();
+                        }
+                    }
+                }
+
                 let zoom_percent = (ui.ctx().zoom_factor() * 100.0).round() as i32;
                 ui.menu_button(format!("A {zoom_percent}%"), |ui| {
                     ui.horizontal(|ui| {
@@ -895,6 +992,7 @@ impl Llm2McpApp {
 
 impl eframe::App for Llm2McpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_update(ctx);
         self.ui_zoom_factor = ctx.zoom_factor();
         let text = *i18n::texts(self.config.language);
 

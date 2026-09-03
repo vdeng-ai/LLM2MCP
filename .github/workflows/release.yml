@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: "0.11.8"
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      UPDATER_PUBKEY: ${{ vars.LLM2MCP_UPDATER_PUBKEY }}
+      UPDATER_PRIVATE_KEY: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag and Cargo version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          expected="v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}. Expected ${expected}." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate updater signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${UPDATER_PUBKEY}" ]]; then
+            echo "Missing repository variable LLM2MCP_UPDATER_PUBKEY." >&2
+            echo "See docs/RELEASE.md for updater signing-key setup." >&2
+            exit 1
+          fi
+          if [[ -z "${UPDATER_PRIVATE_KEY}" ]]; then
+            echo "Missing repository secret LLM2MCP_UPDATER_PRIVATE_KEY." >&2
+            echo "See docs/RELEASE.md for updater signing-key setup." >&2
+            exit 1
+          fi
+
+  linux:
+    name: Linux x86_64 AppImage
+    needs: preflight
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      LLM2MCP_UPDATER_PUBKEY: ${{ vars.LLM2MCP_UPDATER_PUBKEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev pkg-config
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version "$CARGO_PACKAGER_VERSION" --locked
+
+      - name: Build AppImage
+        run: bash scripts/release/package-linux.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Windows x86_64 NSIS
+    needs: preflight
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      LLM2MCP_UPDATER_PUBKEY: ${{ vars.LLM2MCP_UPDATER_PUBKEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        shell: pwsh
+        run: cargo install cargo-packager --version $env:CARGO_PACKAGER_VERSION --locked
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: ./scripts/release/package-windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS ${{ matrix.arch }} app + DMG
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      LLM2MCP_UPDATER_PUBKEY: ${{ vars.LLM2MCP_UPDATER_PUBKEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY }}
+      CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.LLM2MCP_UPDATER_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version "$CARGO_PACKAGER_VERSION" --locked
+
+      - name: Build app bundle and DMG
+        run: bash scripts/release/package-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: [preflight, linux, windows, macos]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Validate signed updater artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            "LLM2MCP_${VERSION}_x86_64.AppImage"
+            "LLM2MCP_${VERSION}_x86_64-setup.exe"
+            "LLM2MCP_${VERSION}_aarch64.app.tar.gz"
+            "LLM2MCP_${VERSION}_x86_64.app.tar.gz"
+          )
+          for artifact in "${expected[@]}"; do
+            test -s "release-artifacts/${artifact}"
+            test -s "release-artifacts/${artifact}.sig"
+          done
+          test -s "release-artifacts/LLM2MCP_${VERSION}_aarch64.dmg"
+          test -s "release-artifacts/LLM2MCP_${VERSION}_x86_64.dmg"
+
+      - name: Generate updater manifest
+        run: |
+          python3 scripts/release/generate_update_manifest.py \
+            --artifacts-dir release-artifacts \
+            --version "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --output release-artifacts/latest.json
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+            | LC_ALL=C sort \
+            | xargs sha256sum > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-artifacts/* --clobber
+          else
+            gh release create "$TAG" release-artifacts/* \
+              --verify-tag \
+              --title "LLM2MCP $TAG" \
+              --generate-notes
+          fi

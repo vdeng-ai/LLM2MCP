@@ -395,36 +395,6 @@ Reasoning can be configured independently per tool. For example:
 - `document_repo` → Medium
 - `update_docs` → XHigh
 
-## Development
-
-Run the GUI:
-
-```bash
-cargo run
-```
-
-To refresh only the stable per-user executable and print its path:
-
-```bash
-cargo run -- install
-```
-
-Then:
-
-1. Configure the LLM API endpoint, model, and optional API key.
-2. Click **Test Connection**.
-3. Choose the target AI coding agent in the integrations section.
-4. Click **Install / Update**.
-5. Restart or refresh the coding agent's MCP list.
-
-You can also test stdio MCP directly:
-
-```bash
-llm2mcp mcp --workspace /path/to/project
-```
-
-> In stdio mode, stdout is reserved exclusively for MCP JSON-RPC. Runtime logs must go to stderr.
-
 ## Security Model
 
 LLM2MCP 0.1 is read-only by design. It does not provide arbitrary shell execution, file writes, Git commits, or pushes.
@@ -444,7 +414,7 @@ Selected source code is still sent to the LLM API you configure. Make sure that 
 
 ## Project Status
 
-LLM2MCP is currently in the `0.1.0` MVP stage. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+LLM2MCP is currently in the `0.1.0` MVP stage. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
 
 ## License
 

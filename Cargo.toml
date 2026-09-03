@@ -14,6 +14,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "6"
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
 fs2 = "0.4"
+cargo-packager-updater = "0.2.3"
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,3 +22,24 @@ serde_json = "1"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml_edit = "0.23"
+
+[package.metadata.packager]
+product-name = "LLM2MCP"
+identifier = "ai.vdeng.llm2mcp"
+authors = ["vdeng-ai"]
+publisher = "vdeng-ai"
+homepage = "https://github.com/vdeng-ai/LLM2MCP"
+category = "DeveloperTool"
+description = "Local MCP sidecar that offloads coding context to an OpenAI-compatible LLM"
+long-description = "LLM2MCP is a read-only MCP sidecar for AI coding agents. It reads selected local project context, sends that context to a configured OpenAI-compatible LLM, and returns compact analysis, debugging, planning, review, or documentation results."
+binaries = [{ path = "llm2mcp", main = true }]
+icons = ["target/release-icons/llm2mcp.png", "target/release-icons/llm2mcp.ico"]
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+languages = ["English", "SimpChinese"]
+display-language-selector = false
+installer-icon = "target/release-icons/llm2mcp.ico"
+
+[package.metadata.packager.macos]
+minimum-system-version = "12.0"

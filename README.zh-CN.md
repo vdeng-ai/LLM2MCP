@@ -397,36 +397,6 @@ Reasoning 参数支持四种发送方式：
 - `document_repo` → Medium
 - `update_docs` → XHigh
 
-## 开发运行
-
-启动 GUI：
-
-```bash
-cargo run
-```
-
-如果只需要刷新稳定的用户级可执行文件并打印其路径：
-
-```bash
-cargo run -- install
-```
-
-然后：
-
-1. 配置 LLM API 地址、模型和可选 API Key。
-2. 点击“测试连接”。
-3. 在 AI 编码智能体区域选择目标客户端。
-4. 点击“安装 / 更新”。
-5. 重启或刷新对应编码智能体的 MCP 列表。
-
-也可以直接测试 stdio MCP：
-
-```bash
-llm2mcp mcp --workspace /path/to/project
-```
-
-> stdio 模式下 stdout 只用于 MCP JSON-RPC，运行日志必须写入 stderr。
-
 ## 安全边界
 
 LLM2MCP 0.1 默认只读，不提供任意 shell、写文件、Git commit 或 push 能力。
@@ -446,7 +416,7 @@ LLM2MCP 0.1 默认只读，不提供任意 shell、写文件、Git commit 或 pu
 
 ## 项目状态
 
-当前处于 `0.1.0` MVP 阶段。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+当前处于 `0.1.0` MVP 阶段。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
 
 ## License
 

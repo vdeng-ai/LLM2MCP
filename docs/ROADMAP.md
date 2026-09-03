@@ -82,11 +82,11 @@
 ## 0.4 — 发布体验
 
 - [x] GUI 模块改为六个一级标签页，持久化原生窗口位置/大小、界面/文字缩放与最后活动标签页
-- GitHub Actions：Linux / Windows / macOS 构建
-- Windows 安装包
-- macOS app bundle / 签名说明
-- Linux AppImage 或便携二进制
-- 自动检查更新（可选）
+- [x] GitHub Actions：Linux / Windows / macOS 三平台 CI + tag 驱动 Release workflow
+- [x] Windows x86_64 NSIS 安装包
+- [x] macOS Apple Silicon / Intel `.app` updater bundle + DMG；Developer ID / notarization 配置说明见 `docs/RELEASE.md`
+- [x] Linux x86_64 AppImage
+- [x] GitHub Release `latest.json` + updater 签名 + GUI 自动检查/安装更新
 - Social Preview、截图和演示 GIF
 
 ## 明确不做（当前）
