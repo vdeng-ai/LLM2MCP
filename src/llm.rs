@@ -53,6 +53,16 @@ impl ChatResponse {
 }
 
 pub fn test_connection(config: &AppConfig) -> Result<String> {
+    let models = list_models(config)?;
+    Ok(format!(
+        "Connected: {} ({} model{})",
+        config.model,
+        models.len(),
+        if models.len() == 1 { "" } else { "s" }
+    ))
+}
+
+pub fn list_models(config: &AppConfig) -> Result<Vec<String>> {
     let client = client(config)?;
     let url = format!("{}/models", config.base_url.trim_end_matches('/'));
     let mut request = client.get(url);
@@ -60,10 +70,26 @@ pub fn test_connection(config: &AppConfig) -> Result<String> {
         request = request.bearer_auth(config.api_key.trim());
     }
     let response = request.send().context("failed to connect to LLM API")?;
-    if !response.status().is_success() {
-        bail!("LLM API returned HTTP {}", response.status());
+    let status = response.status();
+    let body = response.text().context("failed to read /models response")?;
+    if !status.is_success() {
+        bail!(
+            "LLM API HTTP {status}: {}",
+            body.chars().take(2000).collect::<String>()
+        );
     }
-    Ok(format!("Connected: {}", config.model))
+    let value: Value = serde_json::from_str(&body).context("LLM /models returned invalid JSON")?;
+    let mut models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .context("LLM /models response has no data array")?
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    Ok(models)
 }
 
 fn client(config: &AppConfig) -> Result<Client> {
@@ -81,10 +107,15 @@ pub fn chat_detailed(
     max_output_tokens: u32,
 ) -> Result<ChatResponse> {
     let client = client(config)?;
+    let effective_system = if config.system_prompt_prefix.trim().is_empty() {
+        system.to_owned()
+    } else {
+        format!("{}\n\n{}", config.system_prompt_prefix.trim(), system)
+    };
     let mut payload = json!({
         "model": config.model,
         "messages": [
-            {"role": "system", "content": system},
+            {"role": "system", "content": effective_system},
             {"role": "user", "content": user}
         ],
         "temperature": config.temperature,

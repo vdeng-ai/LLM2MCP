@@ -13,8 +13,10 @@ use std::{
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-const POLL_INTERVAL_MS: u64 = 5_000;
-const TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+#[cfg(test)]
+const DEFAULT_POLL_INTERVAL_MS: u64 = 5_000;
+#[cfg(test)]
+const DEFAULT_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,7 +138,13 @@ impl Reporter {
     }
 }
 
-pub fn create(tool: &str, workspace: &Path, args: Value) -> Result<JobRecord> {
+pub fn create(
+    tool: &str,
+    workspace: &Path,
+    args: Value,
+    ttl_hours: u64,
+    poll_interval_ms: u64,
+) -> Result<JobRecord> {
     let workspace = workspace
         .canonicalize()
         .with_context(|| format!("invalid workspace: {}", workspace.display()))?;
@@ -154,8 +162,8 @@ pub fn create(tool: &str, workspace: &Path, args: Value) -> Result<JobRecord> {
         cancel_requested: false,
         created_at: now.clone(),
         updated_at: now,
-        ttl_ms: TTL_MS,
-        poll_interval_ms: POLL_INTERVAL_MS,
+        ttl_ms: ttl_hours.clamp(1, 24 * 365).saturating_mul(60 * 60 * 1_000),
+        poll_interval_ms: poll_interval_ms.clamp(1_000, 60_000),
         result: None,
         error: None,
         duration_ms: None,
@@ -700,8 +708,8 @@ mod tests {
             cancel_requested: false,
             created_at: "2026-09-02T00:00:00Z".to_owned(),
             updated_at: "2026-09-02T00:00:01Z".to_owned(),
-            ttl_ms: TTL_MS,
-            poll_interval_ms: POLL_INTERVAL_MS,
+            ttl_ms: DEFAULT_TTL_MS,
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             result: None,
             error: None,
             duration_ms: None,

@@ -6,7 +6,7 @@ use crate::{
     config::{
         self, AppConfig, ExecutionMode, Language, ReasoningEffort, ReasoningTransport, ToolConfig,
     },
-    i18n, jobs, llm,
+    i18n, install, jobs, llm,
 };
 
 pub struct Llm2McpApp {
@@ -15,6 +15,7 @@ pub struct Llm2McpApp {
     api_key_visible: bool,
     clients: Vec<ClientStatus>,
     jobs: Vec<jobs::JobRecord>,
+    available_models: Vec<String>,
 }
 
 impl Llm2McpApp {
@@ -27,6 +28,7 @@ impl Llm2McpApp {
             api_key_visible: false,
             clients: clients::statuses(),
             jobs: jobs::list_recent(40).unwrap_or_default(),
+            available_models: Vec::new(),
         }
     }
 
@@ -36,6 +38,32 @@ impl Llm2McpApp {
 
     fn refresh_jobs(&mut self) {
         self.jobs = jobs::list_recent(40).unwrap_or_default();
+    }
+
+    fn refresh_models(&mut self) {
+        let text = i18n::texts(self.config.language);
+        match llm::list_models(&self.config) {
+            Ok(models) => {
+                self.status = format!("{}: {}", text.refresh_models, models.len());
+                self.available_models = models;
+            }
+            Err(error) => {
+                self.status = format!("{}: {error:#}", text.connection_failed);
+            }
+        }
+    }
+
+    fn generic_mcp_config(&self) -> anyhow::Result<String> {
+        let command = install::ensure_stable_install()?.display().to_string();
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "llm2mcp": {
+                    "type": "stdio",
+                    "command": command,
+                    "args": ["mcp"]
+                }
+            }
+        }))?)
     }
 
     fn save(&mut self) {
@@ -224,9 +252,52 @@ fn section_header(ui: &mut egui::Ui, title: &str, hint: Option<&str>) {
     ui.add_space(6.0);
 }
 
+fn brand_mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same((size * 0.22) as u8),
+        egui::Color32::from_rgb(10, 29, 72),
+    );
+
+    let cyan = egui::Color32::from_rgb(53, 198, 255);
+    let white = egui::Color32::from_rgb(244, 248, 255);
+    let cy = rect.center().y;
+    let left = egui::pos2(rect.left() + size * 0.28, cy);
+    let middle = egui::pos2(rect.left() + size * 0.52, cy);
+    let plug = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + size * 0.72, cy),
+        egui::vec2(size * 0.16, size * 0.30),
+    );
+
+    painter.circle_filled(left, size * 0.09, white);
+    painter.circle_stroke(left, size * 0.16, egui::Stroke::new(2.0_f32, cyan));
+    painter.line_segment([left, middle], egui::Stroke::new(2.5_f32, cyan));
+    painter.line_segment(
+        [middle, egui::pos2(middle.x - size * 0.08, cy - size * 0.07)],
+        egui::Stroke::new(2.5_f32, cyan),
+    );
+    painter.line_segment(
+        [middle, egui::pos2(middle.x - size * 0.08, cy + size * 0.07)],
+        egui::Stroke::new(2.5_f32, cyan),
+    );
+    painter.rect_filled(plug, egui::CornerRadius::same(3), white);
+    for offset in [-0.08_f32, 0.08_f32] {
+        painter.line_segment(
+            [
+                egui::pos2(plug.right(), cy + size * offset),
+                egui::pos2(plug.right() + size * 0.12, cy + size * offset),
+            ],
+            egui::Stroke::new(2.0_f32, white),
+        );
+    }
+}
+
 impl Llm2McpApp {
     fn render_header(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.horizontal(|ui| {
+            brand_mark(ui, 38.0);
             ui.vertical(|ui| {
                 ui.heading("LLM2MCP");
                 ui.small(text.tagline);
@@ -283,10 +354,28 @@ impl Llm2McpApp {
                     ui.end_row();
 
                     ui.label(text.model);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.config.model)
-                            .desired_width(field_width),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.model)
+                                .desired_width((field_width - 130.0).max(120.0)),
+                        );
+                        if !self.available_models.is_empty() {
+                            egui::ComboBox::from_id_salt("model_picker")
+                                .selected_text("▾")
+                                .show_ui(ui, |ui| {
+                                    for model in &self.available_models {
+                                        ui.selectable_value(
+                                            &mut self.config.model,
+                                            model.clone(),
+                                            model,
+                                        );
+                                    }
+                                });
+                        }
+                        if ui.small_button(text.refresh_models).clicked() {
+                            self.refresh_models();
+                        }
+                    });
                     ui.end_row();
 
                     ui.label(text.api_key);
@@ -348,6 +437,20 @@ impl Llm2McpApp {
                     ui.add(egui::DragValue::new(&mut self.config.timeout_secs).range(5..=3600));
                     ui.end_row();
 
+                    ui.label(text.job_ttl_hours);
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.job_ttl_hours).range(1..=24 * 365),
+                    );
+                    ui.end_row();
+
+                    ui.label(text.job_poll_interval_ms);
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.job_poll_interval_ms)
+                            .range(1_000..=60_000)
+                            .speed(250),
+                    );
+                    ui.end_row();
+
                     ui.label(text.document_map_concurrency);
                     ui.add(
                         egui::DragValue::new(&mut self.config.document_map_concurrency)
@@ -358,14 +461,16 @@ impl Llm2McpApp {
         });
     }
 
-    fn render_tools_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
+    fn render_tools_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts, min_height: f32) {
         ui.group(|ui| {
+            ui.set_min_height(min_height);
+            ui.set_min_width(ui.available_width());
             section_header(ui, text.per_tool_reasoning, Some(text.per_tool_hint));
-            if ui.available_width() >= 820.0 {
+            if ui.available_width() >= 560.0 {
                 egui::Grid::new("tool_grid")
                     .num_columns(5)
                     .striped(true)
-                    .spacing([18.0, 9.0])
+                    .spacing([8.0, 9.0])
                     .show(ui, |ui| {
                         ui.strong(text.tool);
                         ui.strong(text.reasoning);
@@ -473,6 +578,27 @@ impl Llm2McpApp {
         });
     }
 
+    fn render_system_prompt_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        text: &i18n::Texts,
+        min_height: f32,
+    ) {
+        ui.group(|ui| {
+            ui.set_min_height(min_height);
+            ui.set_min_width(ui.available_width());
+            section_header(ui, text.system_prompt_prefix, None);
+            ui.small(text.system_prompt_hint);
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.config.system_prompt_prefix)
+                    .hint_text(text.system_prompt_placeholder)
+                    .desired_rows(10)
+                    .desired_width(ui.available_width()),
+            );
+        });
+    }
+
     fn render_jobs_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -495,6 +621,8 @@ impl Llm2McpApp {
             egui::ScrollArea::vertical()
                 .id_salt("job_history_scroll")
                 .max_height(320.0)
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(ui, |ui| {
                     for job in job_rows {
                         let duration = format_duration(jobs::display_duration_ms(&job));
@@ -612,7 +740,20 @@ impl Llm2McpApp {
                 });
                 ui.add_space(5.0);
             }
-            ui.small(text.generic_note);
+            ui.horizontal_wrapped(|ui| {
+                ui.small(text.generic_note);
+                if ui.small_button(text.copy_generic_config).clicked() {
+                    match self.generic_mcp_config() {
+                        Ok(config) => {
+                            ui.ctx().copy_text(config);
+                            self.status = text.generic_config_copied.to_owned();
+                        }
+                        Err(error) => {
+                            self.status = format!("{}: {error:#}", text.save_failed);
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -649,7 +790,29 @@ impl eframe::App for Llm2McpApp {
                     }
 
                     ui.add_space(10.0);
-                    self.render_tools_section(ui, &text);
+                    if ui.available_width() >= 980.0 {
+                        let gap = 10.0;
+                        let available = ui.available_width();
+                        let left_width = ((available - gap) * 0.64).max(600.0);
+                        let right_width = (available - gap - left_width).max(280.0);
+                        ui.horizontal_top(|ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(left_width, 300.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.render_tools_section(ui, &text, 288.0),
+                            );
+                            ui.add_space(gap);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(right_width, 300.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.render_system_prompt_section(ui, &text, 288.0),
+                            );
+                        });
+                    } else {
+                        self.render_tools_section(ui, &text, 0.0);
+                        ui.add_space(10.0);
+                        self.render_system_prompt_section(ui, &text, 0.0);
+                    }
                     ui.add_space(10.0);
 
                     if wide {

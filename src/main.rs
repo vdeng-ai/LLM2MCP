@@ -4,8 +4,10 @@ mod cursor;
 mod doc_cache;
 mod gui;
 mod i18n;
+mod icon;
 mod install;
 mod jobs;
+mod linux_desktop;
 mod llm;
 mod mcp;
 mod repo_cache;
@@ -61,10 +63,24 @@ fn main() -> Result<()> {
 }
 
 fn run_gui() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    match install::ensure_stable_install() {
+        Ok(executable) => {
+            if let Err(error) = linux_desktop::register_user_desktop_entry(&executable) {
+                eprintln!("LLM2MCP: failed to register Linux desktop identity: {error:#}");
+            }
+        }
+        Err(error) => {
+            eprintln!("LLM2MCP: failed to refresh stable executable for desktop entry: {error:#}");
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_app_id("llm2mcp")
             .with_inner_size([1040.0, 840.0])
-            .with_min_inner_size([680.0, 620.0]),
+            .with_min_inner_size([680.0, 620.0])
+            .with_icon(icon::app_icon()),
         ..Default::default()
     };
     eframe::run_native(

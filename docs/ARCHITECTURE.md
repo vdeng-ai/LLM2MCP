@@ -45,7 +45,7 @@ AI 编码智能体主模型
 - Cursor 使用 `${workspaceFolder}` 显式传入。
 - Codex / Claude Code / Grok Build / Pi 等通用 stdio 客户端默认继承当前工作目录，LLM2MCP 直接把该目录作为 workspace。
 
-GUI 不需要常驻，也不开放任何本地 HTTP 端口。
+GUI 不需要常驻，也不开放任何本地 HTTP 端口。GUI 还提供 OpenAI-compatible `/models` 刷新、可选全局 System Prompt 前缀，以及通用 MCP JSON 配置模板复制。
 
 长任务的进程生命周期与 MCP 请求解耦：
 
@@ -161,7 +161,7 @@ LLM2MCP 将“工具该思考多深”和“Provider 如何接收思考参数”
 - `document_repo` → Async
 - `update_docs` → Async
 
-Job 状态包含 tool、workspace、arguments、stage、progress、total、result/error、创建/更新时间和取消标记。每次有 usage 信息的 LLM 响应还会累计 `llm_calls`、`prompt_tokens`、`completion_tokens`、最后一次 LLM diagnostics 和总耗时；`analyze/plan` 另外累计 `symbol_index_hits/misses` 与 `evidence_cache_hits/misses`，用于确认持久化缓存是否真正减少本地扫描/证据抽取。失败时根据常见 401/403、429、连接失败、timeout、reasoning 输出预算耗尽、过滤后无源码等情况附带诊断建议。默认保留 7 天。
+Job 状态包含 tool、workspace、arguments、stage、progress、total、result/error、创建/更新时间和取消标记。每次有 usage 信息的 LLM 响应还会累计 `llm_calls`、`prompt_tokens`、`completion_tokens`、最后一次 LLM diagnostics 和总耗时；`analyze/plan` 另外累计 `symbol_index_hits/misses` 与 `evidence_cache_hits/misses`，用于确认持久化缓存是否真正减少本地扫描/证据抽取。失败时根据常见 401/403、429、连接失败、timeout、reasoning 输出预算耗尽、过滤后无源码等情况附带诊断建议。默认保留 7 天；GUI 可调整新建 Job 的 TTL 和 Host 建议轮询间隔，已创建 Job 保留其创建时的设置。
 
 GUI 会读取最近的持久化 Job JSON，显示状态、stage、耗时、输入/输出 token、LLM 调用次数、Symbol Index / Evidence Cache 命中率、失败原因和诊断建议；Job 历史本身仍不额外保存源码正文。
 

@@ -12,7 +12,7 @@ LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也�
 
 - Windows / Linux / macOS 单二进制。
 - English / 简体中文 GUI。
-- GUI 配置 OpenAI-compatible API 地址、API Key、模型和 reasoning 参数协议。
+- GUI 配置 OpenAI-compatible API 地址、API Key、模型、reasoning 参数协议和可选全局 System Prompt 前缀，并支持刷新 OpenAI-compatible `/models` 列表。
 - 每个 MCP 工具独立设置思考强度、执行方式（`Sync / Auto / Async`）和输出预算。
 - 支持多个 AI 编码智能体，并保留通用 stdio MCP 接入方式。
 - MCP 只读访问当前工作区，并限制路径不能越界。
@@ -61,6 +61,8 @@ llm2mcp mcp
 ```bash
 llm2mcp mcp --workspace /path/to/project
 ```
+
+对于没有专用安装器的 MCP Host，GUI 可以一键复制指向稳定用户级可执行文件的 `mcpServers.llm2mcp` 通用 JSON 配置模板。
 
 ## MCP Tools 使用说明
 
@@ -305,7 +307,7 @@ completed
 
 `job_cancel` / `tasks/cancel` 是协作式取消：LLM2MCP 会在阶段切换和不同 LLM 调用之间检查取消状态；如果某个 HTTP LLM 请求已经在执行，它可能会先完成该请求，再响应取消。
 
-Job 默认保留 7 天，LLM2MCP 启动时会顺带清理过期的 Job 状态和日志文件。持久化 Job 还会累计总耗时、LLM 调用次数、Provider 返回的 prompt/completion token 用量、最后一次 LLM diagnostics，并针对常见鉴权失败、限流、连接失败、timeout、reasoning 输出预算耗尽和过滤后无源码等问题给出诊断建议。GUI 增加了可刷新的最近 Job 历史面板，但不会为了历史记录额外保存一份源码正文。
+Job 默认保留 7 天，LLM2MCP 启动时会顺带清理过期的 Job 状态和日志文件。GUI 可以调整新建 Job 使用的保留 TTL 和 Host 轮询间隔。持久化 Job 还会累计总耗时、LLM 调用次数、Provider 返回的 prompt/completion token 用量、最后一次 LLM diagnostics，并针对常见鉴权失败、限流、连接失败、timeout、reasoning 输出预算耗尽和过滤后无源码等问题给出诊断建议。GUI 增加了可刷新的最近 Job 历史面板，但不会为了历史记录额外保存一份源码正文。
 
 作为第二层保险，安装到支持配置的编码智能体时，LLM2MCP 会尝试设置更宽松的 MCP tool timeout。但 **Async Job 才是解决 Host 硬超时的主要机制**，尤其适用于无法可靠调整 timeout 的 Host。
 

@@ -400,7 +400,13 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
     let tool = tool_config(config, name)?;
     let execution = effective_execution(name, tool, root, &args);
     if execution == ExecutionMode::Async {
-        let record = jobs::create(name, root, args)?;
+        let record = jobs::create(
+            name,
+            root,
+            args,
+            config.job_ttl_hours,
+            config.job_poll_interval_ms,
+        )?;
         if client_supports_tasks(params) {
             return Ok(jobs::create_task_result(&record));
         }

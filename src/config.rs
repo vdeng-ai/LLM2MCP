@@ -3,6 +3,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
+use crate::safe_fs;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
@@ -176,8 +178,11 @@ pub struct AppConfig {
     pub api_key: String,
     pub model: String,
     pub reasoning_transport: ReasoningTransport,
+    pub system_prompt_prefix: String,
     pub temperature: f32,
     pub timeout_secs: u64,
+    pub job_ttl_hours: u64,
+    pub job_poll_interval_ms: u64,
     /// Legacy character limits kept for config-file migration only. New source
     /// collection uses the token budgets below and these fields are not re-saved.
     #[serde(skip_serializing)]
@@ -199,8 +204,11 @@ impl Default for AppConfig {
             api_key: String::new(),
             model: "qwen3.8-27b".to_owned(),
             reasoning_transport: ReasoningTransport::OpenAi,
+            system_prompt_prefix: String::new(),
             temperature: 0.2,
             timeout_secs: 900,
+            job_ttl_hours: 7 * 24,
+            job_poll_interval_ms: 5_000,
             max_source_chars: 220_000,
             max_file_chars: 60_000,
             max_source_tokens: 55_000,
@@ -255,6 +263,8 @@ pub fn load() -> Result<AppConfig> {
     } else {
         AppConfig::default()
     };
+    config.job_ttl_hours = config.job_ttl_hours.clamp(1, 24 * 365);
+    config.job_poll_interval_ms = config.job_poll_interval_ms.clamp(1_000, 60_000);
     apply_env_overrides(&mut config);
     Ok(config)
 }
@@ -282,7 +292,8 @@ pub fn save(config: &AppConfig) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let data = serde_json::to_string_pretty(config)?;
-    fs::write(&path, data).with_context(|| format!("failed to write {}", path.display()))?;
+    safe_fs::atomic_write_with_backup(&path, data.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
 
     #[cfg(unix)]
     {
@@ -305,6 +316,14 @@ mod tests {
         assert!(value.get("max_file_tokens").is_some());
         assert!(value.get("max_source_chars").is_none());
         assert!(value.get("max_file_chars").is_none());
+    }
+
+    #[test]
+    fn job_defaults_are_safe_for_durable_background_work() {
+        let config = AppConfig::default();
+        assert_eq!(config.job_ttl_hours, 168);
+        assert_eq!(config.job_poll_interval_ms, 5_000);
+        assert!(config.system_prompt_prefix.is_empty());
     }
 
     #[test]

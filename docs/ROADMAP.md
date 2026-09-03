@@ -60,23 +60,22 @@
 - [x] 持久化 Repository Symbol Index：按 workspace + 文件 size/mtime 增量复用，变化文件自动重新哈希/解析
 - [x] 持久化 Evidence Cache：按文件内容 SHA-256 + 精确 symbol 行段复用本地源码证据，源码变化自动失效
 - [x] Job 历史/status 暴露 Symbol Index / Evidence Cache hit/miss 统计
-- 可配置 system prompt 模板
-- 支持更多通用 MCP Host 的自动检测与配置模板导出
+- [x] 可配置全局 system prompt 前缀，用于在内置工具 prompt 前追加团队/项目级规则
+- [x] 通用 MCP Host 配置模板一键复制；更复杂的自动检测仍作为后续扩展
 
 ## 0.3 — 通用性与可观测性
 
 - [x] Job 历史 GUI：查看 stage、耗时、LLM 调用/token 统计和失败诊断
-- 支持用户配置 Job TTL / polling interval / 清理策略
+- [x] 支持用户配置新 Job 的 TTL / polling interval；过期清理继续沿用启动时自动清理
 - 更强的取消：允许主动中断正在执行的 HTTP LLM 请求
 - 可选 Tasks `notifications/tasks` / subscriptions UX（当前 polling 已满足可靠性需求）
 - 建立各 MCP Host 的 Tasks/timeout 支持矩阵与自动诊断
 - Job 数量明显增长后评估 SQLite；当前文件状态 + 跨进程锁保持简单部署
 - 多 LLM profile
-- `/models` 模型下拉刷新
+- [x] `/models` 模型列表刷新与 GUI 快速选择
 - [x] 后台 Job 请求耗时 / 输入输出 token / LLM 调用次数统计
 - 本地调用历史（默认不保存源码正文）
 - [x] 常见 API 鉴权、限流、连接、超时、reasoning 输出耗尽等错误诊断提示
-- Provider preset：LiteLLM / llama.cpp / vLLM / Ollama
 - 客户端适配插件化，降低新增 Coding Agent 的修改范围
 
 ## 0.4 — 发布体验

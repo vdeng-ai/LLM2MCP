@@ -12,7 +12,7 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 
 - Single binary for Windows, Linux, and macOS.
 - English and Simplified Chinese GUI.
-- Configure OpenAI-compatible API endpoint, API key, model, and reasoning transport.
+- Configure OpenAI-compatible API endpoint, API key, model, reasoning transport, and an optional global system-prompt prefix; supports refreshing the OpenAI-compatible `/models` list.
 - Configure reasoning strength, execution mode (`Sync / Auto / Async`), and output budget independently for each MCP tool.
 - Integrations for multiple AI coding agents plus a generic stdio MCP mode.
 - Read-only workspace access with path sandboxing.
@@ -61,6 +61,8 @@ You can also set it explicitly:
 ```bash
 llm2mcp mcp --workspace /path/to/project
 ```
+
+The GUI can copy a generic `mcpServers.llm2mcp` JSON template that points to the stable per-user executable, which is useful for MCP hosts without a dedicated installer.
 
 ## MCP Tools
 
@@ -304,7 +306,7 @@ completed
 
 `job_cancel` / `tasks/cancel` are cooperative. Cancellation is checked between stages and LLM calls; an HTTP request already executing against the configured LLM may finish before cancellation takes effect.
 
-Jobs are retained for seven days by default and old job state/log files are cleaned up opportunistically when LLM2MCP starts. Durable Job records also accumulate runtime, LLM call count, prompt/completion token usage when the provider reports it, the last response diagnostics, and a targeted hint for common authentication, rate-limit, connection, timeout, output-budget, or source-filter failures. The GUI exposes the most recent Job records in a refreshable history panel without storing an additional copy of source-code bodies.
+Jobs are retained for seven days by default and old job state/log files are cleaned up opportunistically when LLM2MCP starts. The GUI can change the retention TTL and host polling interval used by newly created jobs. Durable Job records also accumulate runtime, LLM call count, prompt/completion token usage when the provider reports it, the last response diagnostics, and a targeted hint for common authentication, rate-limit, connection, timeout, output-budget, or source-filter failures. The GUI exposes the most recent Job records in a refreshable history panel without storing an additional copy of source-code bodies.
 
 As a secondary safety measure, the integration installer attempts to configure longer MCP tool timeouts where the target agent exposes such a setting. Async jobs remain the primary protection against host-side hard timeouts, especially for hosts where the timeout cannot be reliably changed.
 
