@@ -80,7 +80,10 @@ fn install_from(source: &Path, target: &Path) -> Result<PathBuf> {
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))?;
     }
 
-    File::open(&temp)?.sync_all()?;
+    // On Windows, FlushFileBuffers (used by sync_all) requires a handle
+    // opened with write access. A read-only File::open works on Unix but
+    // fails with ERROR_ACCESS_DENIED on Windows CI.
+    File::options().write(true).open(&temp)?.sync_all()?;
 
     #[cfg(windows)]
     {

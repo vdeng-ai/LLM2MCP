@@ -121,6 +121,12 @@ mod tests {
         assert_eq!(icon.width, 64);
         assert_eq!(icon.height, 64);
         assert_eq!(icon.rgba.len(), 64 * 64 * 4);
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(
+            icon.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0)
+        );
     }
 }
