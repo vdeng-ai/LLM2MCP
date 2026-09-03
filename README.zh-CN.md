@@ -22,6 +22,18 @@ LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也�
 - 持久化后台 Job 让较慢的本地模型运行数分钟，也不会长期占住单次 MCP `tools/call`。
 - Host 支持时使用 MCP `2026-07-28` Tasks Extension；旧 Host 则通过通用 `job_status / job_result / job_cancel` 工具兼容。
 
+## 安装
+
+从 GitHub Releases 下载对应平台安装包。Ubuntu / Debian x86_64 用户可以直接使用原生 `.deb`：
+
+```bash
+sudo apt install ./LLM2MCP_<version>_amd64.deb
+```
+
+`.deb` 会通过系统包管理器安装应用和桌面入口。Linux 同时继续提供 AppImage 便携版；Windows 提供 NSIS 安装包；macOS 提供 Apple Silicon 和 Intel 两种 DMG。
+
+AppImage 可以在 GUI 内原地安装签名更新；`.deb` 安装版仍会检查新版本，但升级时会引导下载并安装新版 `.deb`，避免自动更新器直接覆盖由 APT/dpkg 管理的 `/usr/bin` 文件。
+
 ## 支持的 AI 编码智能体
 
 点击 **“安装 / 更新”** 时，LLM2MCP 会先把当前程序刷新到稳定的用户级可执行文件路径，再让目标编码智能体注册这个稳定路径。这样 MCP 配置不会继续指向 `target/debug/...` 等可能在重新构建或升级后消失的开发路径。对于 LLM2MCP 直接修改的 JSON/TOML 客户端配置，写入前会保留 `*.llm2mcp.bak` 备份，并通过临时文件 + 原子替换更新配置。
@@ -416,7 +428,7 @@ LLM2MCP 0.1 默认只读，不提供任意 shell、写文件、Git commit 或 pu
 
 ## 项目状态
 
-当前版本为 `0.2.0`。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
+当前版本为 `0.2.1`。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
 
 ## License
 

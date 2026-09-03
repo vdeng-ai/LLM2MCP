@@ -22,6 +22,25 @@ pub fn enabled() -> bool {
     embedded_public_key().is_some()
 }
 
+pub fn automatic_install_supported() -> bool {
+    if !enabled() {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // cargo-packager-updater can replace an AppImage in place, but it does
+        // not install Debian packages. A .deb launch normally resolves to
+        // /usr/bin/llm2mcp and must be upgraded through the package manager.
+        std::env::var_os("APPIMAGE").is_some()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 pub fn spawn_check() -> Option<mpsc::Receiver<UpdateEvent>> {
     if !enabled() {
         return None;
@@ -39,7 +58,7 @@ pub fn spawn_check() -> Option<mpsc::Receiver<UpdateEvent>> {
 }
 
 pub fn spawn_install() -> Option<mpsc::Receiver<UpdateEvent>> {
-    if !enabled() {
+    if !automatic_install_supported() {
         return None;
     }
     let (sender, receiver) = mpsc::channel();

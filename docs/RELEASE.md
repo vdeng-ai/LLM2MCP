@@ -6,7 +6,8 @@ LLM2MCP uses a tag-driven GitHub Actions release pipeline. A tag such as `v0.2.0
 
 A successful release publishes these assets to one GitHub Release:
 
-- Linux x86_64: `LLM2MCP_<version>_x86_64.AppImage`
+- Linux x86_64 portable: `LLM2MCP_<version>_x86_64.AppImage`
+- Ubuntu/Debian x86_64: `LLM2MCP_<version>_amd64.deb`
 - Windows x86_64: `LLM2MCP_<version>_x86_64-setup.exe` (NSIS, current-user install)
 - macOS Apple Silicon: `LLM2MCP_<version>_aarch64.dmg`
 - macOS Intel: `LLM2MCP_<version>_x86_64.dmg`
@@ -103,7 +104,7 @@ The `Release` workflow then performs preflight validation, builds all platform p
 `.github/workflows/release.yml` runs only for version tags and contains:
 
 - `preflight` — tag/version and updater-key validation.
-- `linux` — Ubuntu 22.04 x86_64 AppImage. Ubuntu 22.04 is intentionally used for a conservative glibc baseline.
+- `linux` — Ubuntu 22.04 x86_64 AppImage + `.deb`. Ubuntu 22.04 is intentionally used for a conservative glibc baseline, so the `.deb` is compatible with Ubuntu 24.04 while retaining support for 22.04-era glibc.
 - `windows` — Windows x86_64 NSIS installer.
 - `macos` — native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) builds, producing `.app.tar.gz` updater bundles and DMGs.
 - `publish` — validates required artifacts/signatures, builds `latest.json`, creates checksums, and creates or updates the GitHub Release.
@@ -125,7 +126,7 @@ The manifest maps the current OS/architecture to one signed updater package:
 - `macos-aarch64` → `.app.tar.gz`
 - `macos-x86_64` → `.app.tar.gz`
 
-LLM2MCP verifies the downloaded package with the embedded updater public key before installation. An available update is shown in the GUI header. After installation the UI asks the user to restart LLM2MCP.
+LLM2MCP verifies the downloaded package with the embedded updater public key before installation. An available update is shown in the GUI header. AppImage installs can replace themselves in place and then ask the user to restart LLM2MCP. Debian-package installs still check the same manifest, but the GUI links to GitHub Releases instead of replacing `/usr/bin/llm2mcp`; install the newer `.deb` with APT/dpkg so the system package database remains authoritative.
 
 ## 5. Platform trust signing
 
@@ -161,6 +162,13 @@ Linux:
 ```bash
 cargo install cargo-packager --version 0.11.8 --locked
 bash scripts/release/package-linux.sh
+```
+
+This produces both AppImage and `.deb`. On Ubuntu 24.04, inspect and dependency-check the package without installing it:
+
+```bash
+dpkg-deb --info release-artifacts/LLM2MCP_<version>_amd64.deb
+apt-get -s install ./release-artifacts/LLM2MCP_<version>_amd64.deb
 ```
 
 macOS:

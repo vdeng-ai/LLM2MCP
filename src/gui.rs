@@ -448,13 +448,24 @@ impl Llm2McpApp {
                         }
                     }
                     UpdateUiState::Available { version, notes } => {
-                        let response = ui.button(format!("{} v{version}", text.install_update_app));
-                        let clicked = response.clicked();
-                        if let Some(notes) = notes.filter(|value| !value.trim().is_empty()) {
-                            response.on_hover_text(notes);
-                        }
-                        if clicked {
-                            self.start_update_install();
+                        if updater::automatic_install_supported() {
+                            let response =
+                                ui.button(format!("{} v{version}", text.install_update_app));
+                            let clicked = response.clicked();
+                            if let Some(notes) = notes.filter(|value| !value.trim().is_empty()) {
+                                response.on_hover_text(notes);
+                            }
+                            if clicked {
+                                self.start_update_install();
+                            }
+                        } else {
+                            let response = ui.hyperlink_to(
+                                format!("{} v{version}", text.download_update_app),
+                                "https://github.com/vdeng-ai/LLM2MCP/releases/latest",
+                            );
+                            if let Some(notes) = notes.filter(|value| !value.trim().is_empty()) {
+                                response.on_hover_text(notes);
+                            }
                         }
                     }
                     UpdateUiState::Installing => {

@@ -57,7 +57,7 @@ jobs:
           fi
 
   linux:
-    name: Linux x86_64 AppImage
+    name: Linux x86_64 AppImage + DEB
     needs: preflight
     runs-on: ubuntu-22.04
     env:
@@ -81,7 +81,7 @@ jobs:
       - name: Install cargo-packager
         run: cargo install cargo-packager --version "$CARGO_PACKAGER_VERSION" --locked
 
-      - name: Build AppImage
+      - name: Build AppImage and DEB
         run: bash scripts/release/package-linux.sh
 
       - uses: actions/upload-artifact@v4
@@ -195,6 +195,8 @@ jobs:
             test -s "release-artifacts/${artifact}"
             test -s "release-artifacts/${artifact}.sig"
           done
+          test -s "release-artifacts/LLM2MCP_${VERSION}_amd64.deb"
+          test -s "release-artifacts/LLM2MCP_${VERSION}_amd64.deb.sig"
           test -s "release-artifacts/LLM2MCP_${VERSION}_aarch64.dmg"
           test -s "release-artifacts/LLM2MCP_${VERSION}_x86_64.dmg"
 

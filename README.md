@@ -22,6 +22,18 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 - Durable background jobs let slow local models run for minutes without holding a single MCP `tools/call` open.
 - Supports the MCP `2026-07-28` Tasks extension when the host opts in, with portable `job_status / job_result / job_cancel` fallback tools for older hosts.
 
+## Installation
+
+Download the package for your platform from GitHub Releases. Ubuntu/Debian x86_64 users can use the native `.deb` package:
+
+```bash
+sudo apt install ./LLM2MCP_<version>_amd64.deb
+```
+
+The `.deb` installs the application and desktop entry through the system package manager. Linux also provides an AppImage for portable use. Windows provides an NSIS installer, while macOS provides Apple Silicon and Intel DMGs.
+
+AppImage builds can install signed updates in place from the GUI. Debian-package installs can still check for updates, but upgrading is intentionally done by installing the newer `.deb` so `/usr/bin` remains managed by APT/dpkg.
+
 ## Supported AI Coding Agents
 
 **Install / Update** first refreshes a stable per-user LLM2MCP executable, then registers that stable path with the selected coding agent. This prevents MCP entries from pointing at transient development/build locations that can disappear after a rebuild or upgrade. When LLM2MCP directly edits JSON/TOML client configuration, it keeps the previous file as `*.llm2mcp.bak` and replaces the config through an atomic temp-file write.
@@ -414,7 +426,7 @@ Selected source code is still sent to the LLM API you configure. Make sure that 
 
 ## Project Status
 
-LLM2MCP is currently at version `0.2.0`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
+LLM2MCP is currently at version `0.2.1`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
 
 ## License
 

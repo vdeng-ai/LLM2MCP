@@ -1,6 +1,6 @@
 [package]
 name = "llm2mcp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Turn any OpenAI-compatible LLM into a local MCP sidecar for AI coding agents"
 license = "MIT"
@@ -34,6 +34,21 @@ description = "Local MCP sidecar that offloads coding context to an OpenAI-compa
 long-description = "LLM2MCP is a read-only MCP sidecar for AI coding agents. It reads selected local project context, sends that context to a configured OpenAI-compatible LLM, and returns compact analysis, debugging, planning, review, or documentation results."
 binaries = [{ path = "llm2mcp", main = true }]
 icons = ["target/release-icons/llm2mcp.png", "target/release-icons/llm2mcp.ico"]
+
+[package.metadata.packager.deb]
+package-name = "llm2mcp"
+section = "devel"
+priority = "optional"
+depends = [
+  "libc6 (>= 2.35)",
+  "libgcc-s1",
+  "libx11-6",
+  "libxkbcommon0",
+  "libxkbcommon-x11-0",
+  "libwayland-client0",
+  "libegl1",
+  "libgl1",
+]
 
 [package.metadata.packager.nsis]
 installer-mode = "currentUser"

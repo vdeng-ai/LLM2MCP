@@ -85,7 +85,7 @@
 - [x] GitHub Actions：Linux / Windows / macOS 三平台 CI + tag 驱动 Release workflow
 - [x] Windows x86_64 NSIS 安装包
 - [x] macOS Apple Silicon / Intel `.app` updater bundle + DMG；Developer ID / notarization 配置说明见 `docs/RELEASE.md`
-- [x] Linux x86_64 AppImage
+- [x] Linux x86_64 AppImage + Ubuntu/Debian amd64 `.deb`
 - [x] GitHub Release `latest.json` + updater 签名 + GUI 自动检查/安装更新
 - Social Preview、截图和演示 GIF
 
