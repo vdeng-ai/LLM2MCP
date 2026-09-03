@@ -50,13 +50,14 @@
 
 ## 0.2 — 上下文选择优化
 
-- [x] `analyze/plan` 两阶段代码发现：先根据轻量文件 / symbol 索引选择关键文件，再进行深度分析
+- [x] `analyze/debug_issue/plan` 两阶段代码发现：先根据轻量文件 / symbol 索引选择关键文件，再进行深度分析
 - [x] Discovery 优先使用本地 lexical/symbol scoring；匹配明确时跳过额外 LLM rerank
 - [x] 深度上下文从文件级进一步收敛到 symbol + 精确 line range，并只携带少量文件头/import 上下文
 - [x] 输入上下文使用 token 估算预算，替代仅按字符数截断
 - [x] `analyze / plan / document_repo` 支持 include / exclude glob
-- [x] `analyze / plan / review_diff` 分离副模型输出预算与主模型回传预算，结果在本地结构化压缩
-- [x] `analyze / plan` 返回经过候选索引校验的 `file:symbol:line-range` read-next 证据；虚构范围不会回传
+- [x] `analyze / debug_issue / plan / review_diff` 分离副模型输出预算与主模型回传预算，结果在本地结构化压缩
+- [x] `analyze / debug_issue / plan` 返回经过候选索引校验的 `file:symbol:line-range` read-next 证据；虚构范围不会回传
+- [x] `debug_issue` 专用故障诊断：症状/日志/预期与实际行为 + 可选近期 Git diff → 根因、执行路径、间歇性解释、验证步骤和修复区域；保持只读
 - [x] 持久化 Repository Symbol Index：按 workspace + 文件 size/mtime 增量复用，变化文件自动重新哈希/解析
 - [x] 持久化 Evidence Cache：按文件内容 SHA-256 + 精确 symbol 行段复用本地源码证据，源码变化自动失效
 - [x] Job 历史/status 暴露 Symbol Index / Evidence Cache hit/miss 统计
@@ -80,6 +81,7 @@
 
 ## 0.4 — 发布体验
 
+- [x] GUI 模块改为六个一级标签页，持久化原生窗口位置/大小、界面/文字缩放与最后活动标签页
 - GitHub Actions：Linux / Windows / macOS 构建
 - Windows 安装包
 - macOS app bundle / 签名说明

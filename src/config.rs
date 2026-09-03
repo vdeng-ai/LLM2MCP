@@ -132,6 +132,7 @@ impl ToolConfig {
 #[serde(default)]
 pub struct ToolsConfig {
     pub analyze: ToolConfig,
+    pub debug_issue: ToolConfig,
     pub plan: ToolConfig,
     pub review_diff: ToolConfig,
     pub document_repo: ToolConfig,
@@ -145,6 +146,12 @@ impl Default for ToolsConfig {
                 ReasoningEffort::Medium,
                 4_000,
                 Some(800),
+                ExecutionMode::Auto,
+            ),
+            debug_issue: ToolConfig::new(
+                ReasoningEffort::Xhigh,
+                6_000,
+                Some(1_400),
                 ExecutionMode::Auto,
             ),
             plan: ToolConfig::new(
@@ -337,6 +344,9 @@ mod tests {
         });
         let config: AppConfig = serde_json::from_value(value).expect("old config should migrate");
         assert_eq!(config.tools.document_repo.max_output_tokens, 12_000);
+        assert_eq!(config.tools.debug_issue.max_output_tokens, 6_000);
+        assert_eq!(config.tools.debug_issue.reasoning, ReasoningEffort::Xhigh);
+        assert_eq!(config.tools.debug_issue.primary_return_tokens, Some(1_400));
         assert_eq!(
             config.tools.document_repo.reasoning,
             ReasoningEffort::Medium

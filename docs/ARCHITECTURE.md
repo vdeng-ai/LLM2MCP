@@ -45,7 +45,7 @@ AI 编码智能体主模型
 - Cursor 使用 `${workspaceFolder}` 显式传入。
 - Codex / Claude Code / Grok Build / Pi 等通用 stdio 客户端默认继承当前工作目录，LLM2MCP 直接把该目录作为 workspace。
 
-GUI 不需要常驻，也不开放任何本地 HTTP 端口。GUI 还提供 OpenAI-compatible `/models` 刷新、可选全局 System Prompt 前缀，以及通用 MCP JSON 配置模板复制。
+GUI 不需要常驻，也不开放任何本地 HTTP 端口。首次启动默认使用 `1280×900` 窗口；主界面不再使用并排等高卡片，而是把 `LLM API / 上下文限制 / 工具独立思考强度 / System Prompt / Job 历史 / AI 编码智能体` 分成六个一级标签页，每次只显示当前模块。eframe persistence 保存原生窗口位置/大小，LLM2MCP 另外持久化 egui zoom factor 和最后打开的标签页，因此用户调整后的界面/文字缩放和工作位置会在下次启动恢复。GUI 还提供 OpenAI-compatible `/models` 刷新、可选全局 System Prompt 前缀，以及通用 MCP JSON 配置模板复制。
 
 长任务的进程生命周期与 MCP 请求解耦：
 
@@ -107,7 +107,7 @@ Linux / Windows / macOS 启动 GUI 时会尝试加载系统 CJK 字体作为 egu
 
 0.1 MCP 只读：
 
-- 不执行任意 shell；`review_diff` 只调用固定的 `git status` / `git diff`。
+- 不执行任意 shell；`review_diff` 以及 `debug_issue(recent_changes=true)` 只通过固定参数调用受约束的 `git status` / `git diff` 读取变更证据。
 - 请求路径 canonicalize 后必须位于当前 workspace 内。
 - symlink 解析后若越界会被拒绝。
 - 默认遵循 `.gitignore` / Git exclude。
@@ -117,24 +117,24 @@ Linux / Windows / macOS 启动 GUI 时会尝试加载系统 CJK 字体作为 egu
 
 ## 上下文发现、过滤与 token 预算
 
-`analyze` / `plan` 对目录、多路径、空 `paths` 或明显较大的单文件不再直接顺序读取大量正文，而是采用两阶段发现：
+`analyze` / `debug_issue` / `plan` 对目录、多路径、空 `paths` 或明显较大的单文件不再直接顺序读取大量正文，而是采用两阶段发现：
 
 1. 本地按 workspace sandbox、`.gitignore`、secret 规则和可选 `include` / `exclude` glob 枚举候选文本文件。
 2. 对候选文件建立带精确 `start_line/end_line` 的轻量 symbol index，覆盖函数、结构体、类、接口、类型、Markdown 标题等声明；Discovery Index 有独立 token 上限。
 3. 先用本地 lexical/symbol scoring 对 task 与 path/symbol label 做相关性排序。匹配足够强时直接选中最多 12 个 symbol/file，完全跳过额外 LLM discovery。
 4. 只有本地评分不够确定时，才使用 Low reasoning 的短 LLM 调用对 Discovery Index rerank；返回的路径和行范围必须逐项精确匹配本地候选，模型虚构内容会被丢弃。
 5. 深度阶段优先只读取被选中的 symbol range，并在源码中附真实行号、少量前后文以及最多约 30 行文件头/import context；只有没有合适 symbol 时才回退到整文件读取。
-6. 最终 `analyze` / `plan` 请求只接收这批收敛后的上下文。
+6. 最终 `analyze` / `debug_issue` / `plan` 请求只接收这批收敛后的上下文。`debug_issue` 还会把用户提供的日志/错误和可选当前 Git diff 作为额外运行时证据；源码上下文会预留一部分 token budget 给这些证据，避免总输入无界增长。
 
 Discovery 的文件/symbol 解析结果不会每个 Job 从零开始。LLM2MCP 在本机应用数据目录维护版本化的 **Repository Symbol Index**：按 canonical workspace 分桶，记录每个候选文件的 `size + modified_ns`、内容 SHA-256、总行数和 symbol ranges。文件 stamp 未变化时直接复用已有 hash/ranges，避免重新读取源码正文；只有新增或变化文件才重新读取、哈希和解析，再通过跨进程文件锁合并进索引。
 
-深度读取还有独立的 **Evidence Cache**。缓存 key 由版本、workspace、相对路径、文件内容 SHA-256 和精确证据段（prelude 或 symbol/context 行范围）组成。相同代码在连续 `analyze → plan` 或重复任务中可以直接复用格式化好的带行号证据；源码变化后内容哈希改变，旧证据自然失效。真正使用缓存前仍会用当前 symbol index 验证选中 range，避免 source 在 Discovery 与深度读取之间变化时继续使用旧范围。缓存目录/文件在 Unix 下分别收紧为 `0700/0600`，只保存在本机，不作为额外源码历史回传 MCP Host。
+深度读取还有独立的 **Evidence Cache**。缓存 key 由版本、workspace、相对路径、文件内容 SHA-256 和精确证据段（prelude 或 symbol/context 行范围）组成。相同代码在连续 `analyze → debug_issue → plan` 或重复任务中可以直接复用格式化好的带行号证据；源码变化后内容哈希改变，旧证据自然失效。真正使用缓存前仍会用当前 symbol index 验证选中 range，避免 source 在 Discovery 与深度读取之间变化时继续使用旧范围。缓存目录/文件在 Unix 下分别收紧为 `0700/0600`，只保存在本机，不作为额外源码历史回传 MCP Host。
 
 较小的单个显式文件仍直接深度读取，避免为简单任务增加发现调用。`document_repo` 不做 symbol 选择，但同样支持 `include` / `exclude` glob 来约束 Repository Map 的扫描范围。
 
 源码、单文件、Discovery Index 和 Git diff 的主要上下文限制现在使用 token 估算，而不是仅比较字符数。估算器对 ASCII 标识符按近似子词长度计数，对 CJK 和标点按更细粒度计数；它不是 Provider tokenizer 的逐 token 精确复刻，但对中英文混合代码比固定字符上限更接近真实模型上下文占用。旧 `max_source_chars` / `max_file_chars` 配置字段仅用于旧配置迁移，新 GUI 使用 source/file/discovery token budget。
 
-`analyze`、`plan`、`review_diff` 还将“副模型可以生成多少”和“主模型最终收到多少”拆成两个预算。副模型分别默认可使用约 4K / 6K / 4K 输出 token，返回时要求结构化 JSON；LLM2MCP 在 Rust 本地解析结论、findings、steps、risks、tests、actions 和 `read_next`，不再调用第二次 LLM 总结，然后按默认 800 / 1200 / 1000 token 的 Primary return budget 做硬上限裁剪。`read_next` 放在返回最前面，并且 `analyze/plan` 的 `path + line range` 必须能映射回本地选中的 symbol range；因此主编码智能体可以直接读取几十到几百行，而不是再次打开完整文件。文档生成工具属于最终内容产物，不做这一层压缩。
+`analyze`、`debug_issue`、`plan`、`review_diff` 还将“副模型可以生成多少”和“主模型最终收到多少”拆成两个预算。副模型默认输出预算分别约为 4K / 6K / 6K / 4K；LLM2MCP 在 Rust 本地解析结构化 JSON，不再调用第二次 LLM 总结，然后按默认 800 / 1400 / 1200 / 1000 token 的 Primary return budget 做硬上限裁剪。`debug_issue` 的结构额外包含 diagnosis、confidence、root cause、execution path、intermittency、alternative hypotheses、verification 和 likely fix area。`read_next` 放在返回最前面，并且 `analyze/debug_issue/plan` 的 `path + line range` 必须能映射回本地选中的 symbol range；因此主编码智能体可以直接读取几十到几百行，而不是再次打开完整文件。文档生成工具属于最终内容产物，不做这一层压缩。
 
 ## Reasoning 适配
 
@@ -156,12 +156,13 @@ LLM2MCP 将“工具该思考多深”和“Provider 如何接收思考参数”
 默认策略：
 
 - `analyze` → Auto
+- `debug_issue` → Auto（大日志、`recent_changes=true`、宽目录/多路径更倾向 Async）
 - `plan` → Auto
 - `review_diff` → Sync
 - `document_repo` → Async
 - `update_docs` → Async
 
-Job 状态包含 tool、workspace、arguments、stage、progress、total、result/error、创建/更新时间和取消标记。每次有 usage 信息的 LLM 响应还会累计 `llm_calls`、`prompt_tokens`、`completion_tokens`、最后一次 LLM diagnostics 和总耗时；`analyze/plan` 另外累计 `symbol_index_hits/misses` 与 `evidence_cache_hits/misses`，用于确认持久化缓存是否真正减少本地扫描/证据抽取。失败时根据常见 401/403、429、连接失败、timeout、reasoning 输出预算耗尽、过滤后无源码等情况附带诊断建议。默认保留 7 天；GUI 可调整新建 Job 的 TTL 和 Host 建议轮询间隔，已创建 Job 保留其创建时的设置。
+Job 状态包含 tool、workspace、arguments、stage、progress、total、result/error、创建/更新时间和取消标记。每次有 usage 信息的 LLM 响应还会累计 `llm_calls`、`prompt_tokens`、`completion_tokens`、最后一次 LLM diagnostics 和总耗时；`analyze/debug_issue/plan` 另外累计 `symbol_index_hits/misses` 与 `evidence_cache_hits/misses`，用于确认持久化缓存是否真正减少本地扫描/证据抽取。失败时根据常见 401/403、429、连接失败、timeout、reasoning 输出预算耗尽、过滤后无源码等情况附带诊断建议。默认保留 7 天；GUI 可调整新建 Job 的 TTL 和 Host 建议轮询间隔，已创建 Job 保留其创建时的设置。
 
 GUI 会读取最近的持久化 Job JSON，显示状态、stage、耗时、输入/输出 token、LLM 调用次数、Symbol Index / Evidence Cache 命中率、失败原因和诊断建议；Job 历史本身仍不额外保存源码正文。
 

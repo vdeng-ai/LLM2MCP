@@ -31,6 +31,21 @@ Return JSON only, with no Markdown or code fences, in this shape:
 {"conclusion":"...","findings":[{"severity":"high|medium|low|info","text":"...","evidence":["path:line-range or symbol"]}],"risks":["..."],"actions":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
 Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
 
+const DEBUG_SYSTEM: &str = r#"You are a local software-debugging specialist assisting a primary coding agent.
+Diagnose the reported malfunction from the supplied symptoms, logs, repository evidence, and optional recent Git changes.
+Rules:
+- Focus on why the system is failing, not on redesigning unrelated code.
+- Trace the likely execution path from symptom to failure when evidence permits.
+- Separate confirmed evidence from hypotheses and assign an explicit confidence level.
+- Explain intermittent behavior when relevant, including races, state, timing, retries, caching, environment, or nondeterminism.
+- Prefer exact file paths, symbols, and supplied line ranges.
+- Do not invent stack frames, paths, line ranges, runtime results, or commands that were not supplied.
+- Suggest verification steps and likely fix areas, but do not claim you ran commands or modified files.
+- Do not reveal hidden chain-of-thought.
+Return JSON only, with no Markdown or code fences, in this shape:
+{"diagnosis":"...","confidence":"high|medium|low","root_cause":"...","evidence":[{"severity":"high|medium|low|info","text":"...","evidence":["path:line-range, symbol, log excerpt, or diff hunk"]}],"execution_path":["..."],"intermittency":"...","alternatives":["..."],"verification":["..."],"fix_area":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
+Keep fields concise; the bridge will locally validate read_next and compact the result before returning it to the primary agent."#;
+
 const PLAN_SYSTEM: &str = r#"You are a local software-planning specialist assisting a primary coding agent.
 Analyze the supplied repository information and produce an implementation plan.
 Rules:
@@ -258,7 +273,7 @@ fn stamp_modern_server_info(request: &Value, result: &mut Value) {
 }
 
 fn server_instructions() -> &'static str {
-    "Use LLM2MCP to offload large local code analysis, planning, diff review, repository documentation, and documentation maintenance to the configured LLM. Long-running operations may return a durable background job. Prefer passing file or directory paths instead of reading large files into the primary model first."
+    "Use LLM2MCP to offload large local code analysis, issue debugging, planning, diff review, repository documentation, and documentation maintenance to the configured LLM. Long-running operations may return a durable background job. Prefer passing file or directory paths plus symptoms/logs instead of reading large files into the primary model first."
 }
 
 fn tools_list() -> Value {
@@ -277,6 +292,26 @@ fn tools_list() -> Value {
                         "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs such as tests/** or *.generated.ts"}
                     },
                     "required": ["task"],
+                    "additionalProperties": false
+                },
+                "annotations": {"readOnlyHint": true, "destructiveHint": false}
+            },
+            {
+                "name": "debug_issue",
+                "description": "Diagnose a concrete software malfunction from symptoms, optional logs, local source evidence, and optional recent Git changes. Reuses bounded symbol discovery and may run as a background job.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "issue": {"type": "string", "description": "Required symptom or malfunction description"},
+                        "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional workspace-relative files or directories to prioritize"},
+                        "logs": {"type": "string", "description": "Optional logs, stack trace, compiler/runtime error, HTTP error, console output, or other observed evidence"},
+                        "expected": {"type": "string", "description": "Optional expected behavior"},
+                        "actual": {"type": "string", "description": "Optional actual behavior, when useful to distinguish from issue"},
+                        "recent_changes": {"type": "boolean", "default": false, "description": "When true, include the current tracked Git diff against HEAD as additional debugging evidence"},
+                        "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs"},
+                        "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs"}
+                    },
+                    "required": ["issue"],
                     "additionalProperties": false
                 },
                 "annotations": {"readOnlyHint": true, "destructiveHint": false}
@@ -427,6 +462,7 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
 fn tool_config<'a>(config: &'a AppConfig, name: &str) -> Result<&'a ToolConfig> {
     match name {
         "analyze" => Ok(&config.tools.analyze),
+        "debug_issue" => Ok(&config.tools.debug_issue),
         "plan" => Ok(&config.tools.plan),
         "review_diff" => Ok(&config.tools.review_diff),
         "document_repo" => Ok(&config.tools.document_repo),
@@ -464,7 +500,22 @@ fn auto_should_async(name: &str, root: &Path, args: &Value) -> bool {
     if name == "review_diff" {
         return false;
     }
+    if name == "debug_issue"
+        && (args
+            .get("recent_changes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || args
+                .get("logs")
+                .and_then(Value::as_str)
+                .is_some_and(|logs| workspace::estimate_tokens(logs) > 3_000))
+    {
+        return true;
+    }
     let paths = paths_arg(args);
+    if name == "debug_issue" && paths.is_empty() {
+        return true;
+    }
     if paths.len() > 1 {
         return true;
     }
@@ -596,6 +647,7 @@ fn execute_business_inner(
 ) -> Result<String> {
     match name {
         "analyze" => analyze(config, root, args, &config.tools.analyze, reporter),
+        "debug_issue" => debug_issue(config, root, args, &config.tools.debug_issue, reporter),
         "plan" => plan(config, root, args, &config.tools.plan, reporter),
         "review_diff" => review_diff(config, root, args, &config.tools.review_diff, reporter),
         "document_repo" => document_repo(config, root, args, &config.tools.document_repo, reporter),
@@ -617,11 +669,22 @@ fn paths_arg(args: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn task_arg(args: &Value) -> Result<&str> {
-    args.get("task")
+fn required_string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
+    args.get(name)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .context("task is required")
+        .with_context(|| format!("{name} is required"))
+}
+
+fn optional_string_arg<'a>(args: &'a Value, name: &str) -> &'a str {
+    args.get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+}
+
+fn task_arg(args: &Value) -> Result<&str> {
+    required_string_arg(args, "task")
 }
 
 fn progress(reporter: Option<&Reporter>, stage: &str, done: u64, total: u64) -> Result<()> {
@@ -1160,7 +1223,14 @@ fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSel
         output.push_str("\n\n");
     }
 
-    for (key, heading) in [("conclusion", "CONCLUSION"), ("goal", "GOAL")] {
+    for (key, heading) in [
+        ("diagnosis", "DIAGNOSIS"),
+        ("confidence", "CONFIDENCE"),
+        ("root_cause", "ROOT CAUSE"),
+        ("intermittency", "INTERMITTENCY"),
+        ("conclusion", "CONCLUSION"),
+        ("goal", "GOAL"),
+    ] {
         if let Some(text) = value
             .get(key)
             .and_then(Value::as_str)
@@ -1174,7 +1244,12 @@ fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSel
     }
 
     for (key, heading, max_items) in [
-        ("findings", "FINDINGS", 8usize),
+        ("evidence", "EVIDENCE", 8usize),
+        ("execution_path", "EXECUTION PATH", 8),
+        ("alternatives", "ALTERNATIVE HYPOTHESES", 5),
+        ("verification", "HOW TO VERIFY", 6),
+        ("fix_area", "LIKELY FIX AREA", 6),
+        ("findings", "FINDINGS", 8),
         ("steps", "STEPS", 10),
         ("actions", "ACTIONS", 6),
         ("risks", "RISKS", 5),
@@ -1245,6 +1320,118 @@ fn analyze(
     Ok(compact_primary_result(
         &result,
         tool.primary_return_or(800),
+        Some(&selection),
+    ))
+}
+
+fn debug_issue(
+    config: &AppConfig,
+    root: &Path,
+    args: &Value,
+    tool: &ToolConfig,
+    reporter: Option<&Reporter>,
+) -> Result<String> {
+    progress(reporter, "preparing debug evidence", 0, 4)?;
+    let issue = required_string_arg(args, "issue")?;
+    let expected = optional_string_arg(args, "expected");
+    let actual = optional_string_arg(args, "actual");
+    let logs = optional_string_arg(args, "logs");
+    let recent_changes = args
+        .get("recent_changes")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let requested = paths_arg(args);
+    let (include, exclude) = source_filters(args);
+
+    // Reserve part of the configured source budget for runtime evidence so
+    // logs/diffs do not silently make debug requests much larger than normal.
+    let mut debug_context_config = config.clone();
+    debug_context_config.max_source_tokens = (config.max_source_tokens * 3 / 4).max(2_500);
+    let auxiliary_budget = config
+        .max_source_tokens
+        .saturating_sub(debug_context_config.max_source_tokens)
+        .max(1_000);
+    let logs_budget = (auxiliary_budget / 2).clamp(500, 8_000);
+    let diff_budget = auxiliary_budget
+        .saturating_sub(logs_budget)
+        .clamp(500, 12_000);
+
+    let logs_for_prompt =
+        workspace::truncate_tokens_strict(logs, logs_budget, "\n[DEBUG LOGS TRUNCATED]\n");
+    let logs_for_discovery = workspace::truncate_tokens_strict(
+        logs,
+        logs_budget.min(1_500),
+        "\n[LOGS TRUNCATED FOR DISCOVERY]\n",
+    );
+
+    let recent_change_evidence = if recent_changes {
+        match workspace::git_diff(root, "HEAD", diff_budget) {
+            Ok((status, diff, truncated)) => format!(
+                "GIT STATUS\n{status}\n\nDIFF AGAINST HEAD\n{diff}\n\nDIFF_TRUNCATED\n{truncated}"
+            ),
+            Err(error) => format!("Recent Git changes requested but unavailable: {error:#}"),
+        }
+    } else {
+        "Not requested.".to_owned()
+    };
+    let recent_changes_for_discovery = workspace::truncate_tokens_strict(
+        &recent_change_evidence,
+        1_500,
+        "\n[RECENT CHANGES TRUNCATED FOR DISCOVERY]\n",
+    );
+    let discovery_task = format!(
+        "ISSUE\n{issue}\n\nEXPECTED\n{expected}\n\nACTUAL\n{actual}\n\nOBSERVED LOGS\n{logs_for_discovery}\n\nRECENT CHANGES\n{recent_changes_for_discovery}"
+    );
+
+    progress(reporter, "building debug discovery index", 1, 4)?;
+    let selection = discover_deep_context(
+        &debug_context_config,
+        root,
+        &discovery_task,
+        &requested,
+        &include,
+        &exclude,
+        reporter,
+    )?;
+    progress(reporter, "collecting debug context", 2, 4)?;
+    let sources =
+        collect_deep_selection(&debug_context_config, root, &selection, &include, &exclude)?;
+    if let Some(reporter) = reporter {
+        reporter.record_cache_usage(
+            0,
+            0,
+            sources.evidence_cache_hits as u64,
+            sources.evidence_cache_misses as u64,
+        )?;
+    }
+    if sources.included_files.is_empty() {
+        bail!("no readable source files found after debug discovery and filtering");
+    }
+
+    progress(reporter, "diagnosing issue", 3, 4)?;
+    let prompt = format!(
+        "ISSUE\n{issue}\n\nEXPECTED BEHAVIOR\n{expected}\n\nACTUAL BEHAVIOR\n{actual}\n\nOBSERVED LOGS / STACK TRACE / ERRORS\n{logs_for_prompt}\n\nRECENT GIT CHANGES\n{recent_change_evidence}\n\nREPOSITORY MANIFEST\n{}\n\nDISCOVERY_SELECTED_CONTEXT\n{}\n\nDISCOVERY_USED_LLM\n{}\n\nDISCOVERY_INDEX_TRUNCATED\n{}\n\nFILES INCLUDED\n{}\n\nESTIMATED_SOURCE_TOKENS\n{}\n\nSOURCE MATERIAL\n{}\n\nSOURCE_TRUNCATED\n{}\n\nDiagnose the malfunction using only supplied evidence. Return the JSON shape required by the system prompt. For read_next, copy only exact path/symbol/line ranges shown in DISCOVERY_SELECTED_CONTEXT.",
+        sources.manifest,
+        selection.description(),
+        selection.used_llm,
+        selection.truncated,
+        sources.included_files.join("\n"),
+        workspace::estimate_tokens(&sources.body),
+        sources.body,
+        sources.truncated,
+    );
+    let result = chat_with_reporter(
+        config,
+        DEBUG_SYSTEM,
+        &prompt,
+        tool.reasoning,
+        tool.max_output_tokens,
+        reporter,
+    )?;
+    progress(reporter, "finishing", 4, 4)?;
+    Ok(compact_primary_result(
+        &result,
+        tool.primary_return_or(1_400),
         Some(&selection),
     ))
 }
@@ -1760,9 +1947,18 @@ mod tests {
     fn tools_list_includes_job_fallback_tools() {
         let listing = tools_list();
         let tools = listing["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         assert!(tools.iter().any(|tool| tool["name"] == "job_status"));
         assert!(tools.iter().any(|tool| tool["name"] == "document_repo"));
+        let debug = tools
+            .iter()
+            .find(|tool| tool["name"] == "debug_issue")
+            .expect("debug_issue tool");
+        assert_eq!(debug["inputSchema"]["required"], json!(["issue"]));
+        assert_eq!(
+            debug["inputSchema"]["properties"]["recent_changes"]["default"],
+            false
+        );
     }
 
     #[test]
@@ -1841,6 +2037,61 @@ mod tests {
         assert!(files.is_empty());
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].path, "src/jobs.rs");
+    }
+
+    #[test]
+    fn debug_issue_auto_mode_escalates_large_runtime_evidence() {
+        let root = Path::new(".");
+        let large_logs = "failure ".repeat(4_000);
+        assert!(auto_should_async(
+            "debug_issue",
+            root,
+            &json!({"issue": "intermittent failure", "logs": large_logs})
+        ));
+        assert!(auto_should_async(
+            "debug_issue",
+            root,
+            &json!({"issue": "regression", "recent_changes": true})
+        ));
+        assert!(auto_should_async(
+            "debug_issue",
+            root,
+            &json!({"issue": "unknown failure with no path hints"})
+        ));
+    }
+
+    #[test]
+    fn compact_debug_result_keeps_diagnosis_and_verified_read_next() {
+        let selection = DeepSelection {
+            files: Vec::new(),
+            symbols: vec![workspace::SymbolCandidate {
+                path: "src/jobs.rs".to_owned(),
+                label: "fn spawn_worker(job_id: &str)".to_owned(),
+                start_line: 400,
+                end_line: 445,
+            }],
+            truncated: false,
+            used_llm: false,
+        };
+        let raw = json!({
+            "diagnosis": "Worker startup fails because the executable path no longer exists.",
+            "confidence": "high",
+            "root_cause": "A transient executable path was replaced.",
+            "execution_path": ["tools/call -> create job -> spawn_worker -> exec failure"],
+            "verification": ["Inspect the stable worker executable path before spawning."],
+            "read_next": [{
+                "path": "src/jobs.rs",
+                "symbol": "fn spawn_worker(job_id: &str)",
+                "lines": "400-445",
+                "reason": "Worker process creation boundary."
+            }]
+        })
+        .to_string();
+        let result = compact_primary_result(&raw, 300, Some(&selection));
+        assert!(result.contains("DIAGNOSIS"));
+        assert!(result.contains("ROOT CAUSE"));
+        assert!(result.contains("HOW TO VERIFY"));
+        assert!(result.contains("src/jobs.rs:400-445"));
     }
 
     #[test]

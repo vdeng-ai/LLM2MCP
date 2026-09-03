@@ -9,6 +9,63 @@ use crate::{
     i18n, install, jobs, llm,
 };
 
+const UI_ZOOM_STORAGE_KEY: &str = "llm2mcp_ui_zoom_factor";
+const ACTIVE_TAB_STORAGE_KEY: &str = "llm2mcp_active_tab";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppTab {
+    LlmApi,
+    ContextLimits,
+    Tools,
+    SystemPrompt,
+    JobHistory,
+    CodingAgents,
+}
+
+impl AppTab {
+    const ALL: [Self; 6] = [
+        Self::LlmApi,
+        Self::ContextLimits,
+        Self::Tools,
+        Self::SystemPrompt,
+        Self::JobHistory,
+        Self::CodingAgents,
+    ];
+
+    fn index(self) -> u8 {
+        match self {
+            Self::LlmApi => 0,
+            Self::ContextLimits => 1,
+            Self::Tools => 2,
+            Self::SystemPrompt => 3,
+            Self::JobHistory => 4,
+            Self::CodingAgents => 5,
+        }
+    }
+
+    fn from_index(index: u8) -> Self {
+        match index {
+            1 => Self::ContextLimits,
+            2 => Self::Tools,
+            3 => Self::SystemPrompt,
+            4 => Self::JobHistory,
+            5 => Self::CodingAgents,
+            _ => Self::LlmApi,
+        }
+    }
+
+    fn label(self, text: &i18n::Texts) -> &'static str {
+        match self {
+            Self::LlmApi => text.llm_api,
+            Self::ContextLimits => text.context_limits,
+            Self::Tools => text.per_tool_reasoning,
+            Self::SystemPrompt => text.system_prompt_prefix,
+            Self::JobHistory => text.job_history,
+            Self::CodingAgents => text.coding_agents,
+        }
+    }
+}
+
 pub struct Llm2McpApp {
     config: AppConfig,
     status: String,
@@ -16,12 +73,26 @@ pub struct Llm2McpApp {
     clients: Vec<ClientStatus>,
     jobs: Vec<jobs::JobRecord>,
     available_models: Vec<String>,
+    ui_zoom_factor: f32,
+    active_tab: AppTab,
 }
 
 impl Llm2McpApp {
-    pub fn new() -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = config::load().unwrap_or_default();
         let ready = i18n::texts(config.language).ready.to_owned();
+        let ui_zoom_factor = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<f32>(storage, UI_ZOOM_STORAGE_KEY))
+            .filter(|value| value.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.5, 2.0);
+        cc.egui_ctx.set_zoom_factor(ui_zoom_factor);
+        let active_tab = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<u8>(storage, ACTIVE_TAB_STORAGE_KEY))
+            .map(AppTab::from_index)
+            .unwrap_or(AppTab::LlmApi);
         Self {
             config,
             status: ready,
@@ -29,6 +100,8 @@ impl Llm2McpApp {
             clients: clients::statuses(),
             jobs: jobs::list_recent(40).unwrap_or_default(),
             available_models: Vec::new(),
+            ui_zoom_factor,
+            active_tab,
         }
     }
 
@@ -303,6 +376,23 @@ impl Llm2McpApp {
                 ui.small(text.tagline);
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let zoom_percent = (ui.ctx().zoom_factor() * 100.0).round() as i32;
+                ui.menu_button(format!("A {zoom_percent}%"), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("A−").clicked() {
+                            egui::gui_zoom::zoom_out(ui.ctx());
+                            self.ui_zoom_factor = ui.ctx().zoom_factor();
+                        }
+                        if ui.button("100%").clicked() {
+                            ui.ctx().set_zoom_factor(1.0);
+                            self.ui_zoom_factor = 1.0;
+                        }
+                        if ui.button("A+").clicked() {
+                            egui::gui_zoom::zoom_in(ui.ctx());
+                            self.ui_zoom_factor = ui.ctx().zoom_factor();
+                        }
+                    });
+                });
                 egui::ComboBox::from_id_salt("language")
                     .selected_text(self.config.language.label())
                     .show_ui(ui, |ui| {
@@ -315,6 +405,7 @@ impl Llm2McpApp {
                                 )
                                 .changed()
                             {
+                                self.status = i18n::texts(language).ready.to_owned();
                                 let _ = config::save(&self.config);
                             }
                         }
@@ -338,10 +429,35 @@ impl Llm2McpApp {
         });
     }
 
+    fn render_tabs(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(2, 4))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for tab in AppTab::ALL {
+                        let selected = self.active_tab == tab;
+                        let label = egui::RichText::new(tab.label(text)).strong();
+                        if ui
+                            .add(
+                                egui::Button::new(label)
+                                    .selected(selected)
+                                    .min_size(egui::vec2(118.0, 30.0)),
+                            )
+                            .clicked()
+                        {
+                            self.active_tab = tab;
+                        }
+                    }
+                });
+            });
+    }
+
     fn render_api_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
             section_header(ui, text.llm_api, None);
-            let field_width = (ui.available_width() - 120.0).clamp(180.0, 420.0);
+            let field_width = (ui.available_width() - 140.0).clamp(240.0, 720.0);
             egui::Grid::new("llm_api_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -408,6 +524,7 @@ impl Llm2McpApp {
 
     fn render_context_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
             section_header(ui, text.context_limits, None);
             egui::Grid::new("context_limit_grid")
                 .num_columns(2)
@@ -461,16 +578,15 @@ impl Llm2McpApp {
         });
     }
 
-    fn render_tools_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts, min_height: f32) {
+    fn render_tools_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
-            ui.set_min_height(min_height);
             ui.set_min_width(ui.available_width());
             section_header(ui, text.per_tool_reasoning, Some(text.per_tool_hint));
             if ui.available_width() >= 560.0 {
                 egui::Grid::new("tool_grid")
                     .num_columns(5)
                     .striped(true)
-                    .spacing([8.0, 9.0])
+                    .spacing([20.0, 10.0])
                     .show(ui, |ui| {
                         ui.strong(text.tool);
                         ui.strong(text.reasoning);
@@ -483,6 +599,15 @@ impl Llm2McpApp {
                             text.analyze,
                             "analyze",
                             &mut self.config.tools.analyze,
+                            ExecutionMode::Auto,
+                            self.config.language,
+                            text,
+                        );
+                        tool_row(
+                            ui,
+                            text.debug_issue,
+                            "debug_issue",
+                            &mut self.config.tools.debug_issue,
                             ExecutionMode::Auto,
                             self.config.language,
                             text,
@@ -537,6 +662,16 @@ impl Llm2McpApp {
                 ui.add_space(6.0);
                 tool_card(
                     ui,
+                    text.debug_issue,
+                    "debug_issue",
+                    &mut self.config.tools.debug_issue,
+                    ExecutionMode::Auto,
+                    self.config.language,
+                    text,
+                );
+                ui.add_space(6.0);
+                tool_card(
+                    ui,
                     text.plan,
                     "plan",
                     &mut self.config.tools.plan,
@@ -578,14 +713,8 @@ impl Llm2McpApp {
         });
     }
 
-    fn render_system_prompt_section(
-        &mut self,
-        ui: &mut egui::Ui,
-        text: &i18n::Texts,
-        min_height: f32,
-    ) {
+    fn render_system_prompt_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
-            ui.set_min_height(min_height);
             ui.set_min_width(ui.available_width());
             section_header(ui, text.system_prompt_prefix, None);
             ui.small(text.system_prompt_hint);
@@ -593,7 +722,7 @@ impl Llm2McpApp {
             ui.add(
                 egui::TextEdit::multiline(&mut self.config.system_prompt_prefix)
                     .hint_text(text.system_prompt_placeholder)
-                    .desired_rows(10)
+                    .desired_rows(20)
                     .desired_width(ui.available_width()),
             );
         });
@@ -601,6 +730,7 @@ impl Llm2McpApp {
 
     fn render_jobs_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.heading(text.job_history);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -614,78 +744,78 @@ impl Llm2McpApp {
 
             if self.jobs.is_empty() {
                 ui.small(text.no_jobs);
-                return;
+            } else {
+                let job_rows = self.jobs.clone();
+                egui::ScrollArea::vertical()
+                    .id_salt("job_history_scroll")
+                    .max_height(560.0)
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        for job in job_rows {
+                            let duration = format_duration(jobs::display_duration_ms(&job));
+                            let heading = format!(
+                                "{} · {} · {} · {duration}",
+                                jobs::state_name(job.state),
+                                job.tool,
+                                job.stage
+                            );
+                            egui::CollapsingHeader::new(heading)
+                                .id_salt(&job.id)
+                                .show(ui, |ui| {
+                                    egui::Grid::new(format!("job_{}_detail", job.id))
+                                        .num_columns(2)
+                                        .spacing([10.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.small("Workspace");
+                                            ui.small(job.workspace.display().to_string());
+                                            ui.end_row();
+                                            ui.small(text.llm_calls);
+                                            ui.small(job.llm_calls.to_string());
+                                            ui.end_row();
+                                            ui.small(text.token_usage);
+                                            ui.small(format!(
+                                                "prompt {} · completion {}",
+                                                job.prompt_tokens, job.completion_tokens
+                                            ));
+                                            ui.end_row();
+                                            ui.small("Symbol Index");
+                                            ui.small(cache_ratio(
+                                                job.symbol_index_hits,
+                                                job.symbol_index_misses,
+                                            ));
+                                            ui.end_row();
+                                            ui.small("Evidence Cache");
+                                            ui.small(cache_ratio(
+                                                job.evidence_cache_hits,
+                                                job.evidence_cache_misses,
+                                            ));
+                                            ui.end_row();
+                                            ui.small(text.duration);
+                                            ui.small(&duration);
+                                            ui.end_row();
+                                        });
+                                    ui.small(format!("job_id: {}", job.id));
+                                    ui.small(format!("created: {}", job.created_at));
+                                    if let Some(diagnostics) = &job.last_llm_diagnostics {
+                                        ui.small(format!("LLM: {diagnostics}"));
+                                    }
+                                    if let Some(error) = &job.error {
+                                        ui.label(error);
+                                    }
+                                    if let Some(hint) = &job.error_hint {
+                                        ui.small(format!("{}: {hint}", text.diagnostic_hint));
+                                    }
+                                });
+                        }
+                    });
             }
-
-            let job_rows = self.jobs.clone();
-            egui::ScrollArea::vertical()
-                .id_salt("job_history_scroll")
-                .max_height(320.0)
-                .auto_shrink([false, false])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                .show(ui, |ui| {
-                    for job in job_rows {
-                        let duration = format_duration(jobs::display_duration_ms(&job));
-                        let heading = format!(
-                            "{} · {} · {} · {duration}",
-                            jobs::state_name(job.state),
-                            job.tool,
-                            job.stage
-                        );
-                        egui::CollapsingHeader::new(heading)
-                            .id_salt(&job.id)
-                            .show(ui, |ui| {
-                                egui::Grid::new(format!("job_{}_detail", job.id))
-                                    .num_columns(2)
-                                    .spacing([10.0, 4.0])
-                                    .show(ui, |ui| {
-                                        ui.small("Workspace");
-                                        ui.small(job.workspace.display().to_string());
-                                        ui.end_row();
-                                        ui.small(text.llm_calls);
-                                        ui.small(job.llm_calls.to_string());
-                                        ui.end_row();
-                                        ui.small(text.token_usage);
-                                        ui.small(format!(
-                                            "prompt {} · completion {}",
-                                            job.prompt_tokens, job.completion_tokens
-                                        ));
-                                        ui.end_row();
-                                        ui.small("Symbol Index");
-                                        ui.small(cache_ratio(
-                                            job.symbol_index_hits,
-                                            job.symbol_index_misses,
-                                        ));
-                                        ui.end_row();
-                                        ui.small("Evidence Cache");
-                                        ui.small(cache_ratio(
-                                            job.evidence_cache_hits,
-                                            job.evidence_cache_misses,
-                                        ));
-                                        ui.end_row();
-                                        ui.small(text.duration);
-                                        ui.small(&duration);
-                                        ui.end_row();
-                                    });
-                                ui.small(format!("job_id: {}", job.id));
-                                ui.small(format!("created: {}", job.created_at));
-                                if let Some(diagnostics) = &job.last_llm_diagnostics {
-                                    ui.small(format!("LLM: {diagnostics}"));
-                                }
-                                if let Some(error) = &job.error {
-                                    ui.label(error);
-                                }
-                                if let Some(hint) = &job.error_hint {
-                                    ui.small(format!("{}: {hint}", text.diagnostic_hint));
-                                }
-                            });
-                    }
-                });
         });
     }
 
     fn render_clients_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.heading(text.coding_agents);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -765,72 +895,42 @@ impl Llm2McpApp {
 
 impl eframe::App for Llm2McpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_zoom_factor = ctx.zoom_factor();
         let text = *i18n::texts(self.config.language);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_header(ui, &text);
             ui.add_space(8.0);
             ui.separator();
+            self.render_tabs(ui, &text);
+            ui.separator();
             ui.add_space(8.0);
 
+            let active_tab = self.active_tab;
             egui::ScrollArea::vertical()
-                .id_salt("main_scroll")
+                .id_salt(format!("tab_page_{}", active_tab.index()))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let wide = ui.available_width() >= 900.0;
-                    if wide {
-                        ui.columns(2, |columns| {
-                            self.render_api_section(&mut columns[0], &text);
-                            self.render_context_section(&mut columns[1], &text);
-                        });
-                    } else {
-                        self.render_api_section(ui, &text);
-                        ui.add_space(8.0);
-                        self.render_context_section(ui, &text);
+                    ui.set_min_width(ui.available_width());
+                    match active_tab {
+                        AppTab::LlmApi => self.render_api_section(ui, &text),
+                        AppTab::ContextLimits => self.render_context_section(ui, &text),
+                        AppTab::Tools => self.render_tools_section(ui, &text),
+                        AppTab::SystemPrompt => self.render_system_prompt_section(ui, &text),
+                        AppTab::JobHistory => self.render_jobs_section(ui, &text),
+                        AppTab::CodingAgents => self.render_clients_section(ui, &text),
                     }
 
-                    ui.add_space(10.0);
-                    if ui.available_width() >= 980.0 {
-                        let gap = 10.0;
-                        let available = ui.available_width();
-                        let left_width = ((available - gap) * 0.64).max(600.0);
-                        let right_width = (available - gap - left_width).max(280.0);
-                        ui.horizontal_top(|ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(left_width, 300.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.render_tools_section(ui, &text, 288.0),
-                            );
-                            ui.add_space(gap);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(right_width, 300.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.render_system_prompt_section(ui, &text, 288.0),
-                            );
-                        });
-                    } else {
-                        self.render_tools_section(ui, &text, 0.0);
-                        ui.add_space(10.0);
-                        self.render_system_prompt_section(ui, &text, 0.0);
-                    }
-                    ui.add_space(10.0);
-
-                    if wide {
-                        ui.columns(2, |columns| {
-                            self.render_jobs_section(&mut columns[0], &text);
-                            self.render_clients_section(&mut columns[1], &text);
-                        });
-                    } else {
-                        self.render_jobs_section(ui, &text);
-                        ui.add_space(10.0);
-                        self.render_clients_section(ui, &text);
-                    }
-
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     self.render_footer(ui, &text);
                     ui.add_space(8.0);
                 });
         });
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, UI_ZOOM_STORAGE_KEY, &self.ui_zoom_factor);
+        eframe::set_value(storage, ACTIVE_TAB_STORAGE_KEY, &self.active_tab.index());
     }
 }
 

@@ -11,7 +11,7 @@ LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也�
 ## 主要能力
 
 - Windows / Linux / macOS 单二进制。
-- English / 简体中文 GUI。
+- English / 简体中文 GUI，采用六个模块标签页（`LLM API / 上下文限制 / 工具独立思考强度 / System Prompt / Job 历史 / AI 编码智能体`）；原生窗口位置/大小、界面/文字缩放和上次打开的标签页都会在下次启动时恢复。
 - GUI 配置 OpenAI-compatible API 地址、API Key、模型、reasoning 参数协议和可选全局 System Prompt 前缀，并支持刷新 OpenAI-compatible `/models` 列表。
 - 每个 MCP 工具独立设置思考强度、执行方式（`Sync / Auto / Async`）和输出预算。
 - 支持多个 AI 编码智能体，并保留通用 stdio MCP 接入方式。
@@ -66,17 +66,18 @@ llm2mcp mcp --workspace /path/to/project
 
 ## MCP Tools 使用说明
 
-LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
+LLM2MCP 提供六个主要只读工具，以及三个通用后台 Job 工具：
 
 | Tool | 适合场景 | 必填参数 | 可选参数 | 默认思考强度 | 默认执行方式 |
 | --- | --- | --- | --- | --- | --- |
 | `analyze` | 根因分析、架构分析、大文件/目录分析 | `task` | `paths`, `include`, `exclude` | Medium | Auto |
+| `debug_issue` | 根据故障现象、日志、源码证据和可选近期 Git 变更定位具体问题 | `issue` | `paths`, `logs`, `expected`, `actual`, `recent_changes`, `include`, `exclude` | XHigh | Auto |
 | `plan` | 独立制定实现计划、提供第二意见 | `task` | `paths`, `include`, `exclude` | XHigh | Auto |
 | `review_diff` | 不让主模型先读取完整 diff 的代码复审 | 无 | `task`, `base_ref` | Medium | Sync |
 | `document_repo` | 分块扫描代码仓库并通过 Map→Reduce 生成有依据的项目文档 | 无 | `document_type`, `paths`, `include`, `exclude`, `audience`, `language` | Medium | Async |
 | `update_docs` | 根据 Git 变更增量更新现有 README/docs，避免重新扫描整个仓库 | 无 | `base_ref`, `target_ref`, `docs`, `language` | XHigh | Async |
 
-每个主要工具都可以在 GUI 中单独配置 `Off / Low / Medium / XHigh` 思考强度、`Sync / Auto / Async` 执行方式，以及副模型最大输出 token 数。`analyze`、`plan`、`review_diff` 另外提供独立的 **回传主模型** budget：副模型内部可以使用更大的输出预算充分分析，但 LLM2MCP 会在本地把结构化结果压缩后再送入主编码智能体上下文。默认分别为 `analyze=800`、`plan=1200`、`review_diff=1000` tokens；文档工具则返回完整产物。输入上下文也按 token 估算控制：GUI 分别提供整体源码、单文件和轻量发现索引的 token budget。该估算器保持 Provider 无关，不假装能够精确复刻所有 OpenAI-compatible 模型的 tokenizer，但比固定字符数更适合中英文混合代码。
+每个主要工具都可以在 GUI 中单独配置 `Off / Low / Medium / XHigh` 思考强度、`Sync / Auto / Async` 执行方式，以及副模型最大输出 token 数。`analyze`、`debug_issue`、`plan`、`review_diff` 另外提供独立的 **回传主模型** budget：副模型内部可以使用更大的输出预算充分分析，但 LLM2MCP 会在本地把结构化结果压缩后再送入主编码智能体上下文。默认分别为 `analyze=800`、`debug_issue=1400`、`plan=1200`、`review_diff=1000` tokens；文档工具则返回完整产物。输入上下文也按 token 估算控制：GUI 分别提供整体源码、单文件和轻量发现索引的 token budget。该估算器保持 Provider 无关，不假装能够精确复刻所有 OpenAI-compatible 模型的 tokenizer，但比固定字符数更适合中英文混合代码。
 
 三个 Job 工具始终是快速、只读调用：
 
@@ -118,6 +119,34 @@ LLM2MCP 提供五个主要只读工具，以及三个通用后台 Job 工具：
 ```
 
 副模型返回结构化分析后，LLM2MCP 不再额外调用一次 LLM 做总结，而是在本地按 **回传主模型** budget 裁剪、去掉低优先级内容。结果最前面优先放经过本地校验的 `READ_NEXT`，例如 `src/jobs.rs:400-445 — fn spawn_worker(...)`，让主编码智能体只读取真正相关的几十行，而不是整个文件。
+
+### `debug_issue`
+
+当程序已经出现明确故障，目标是回答“**为什么坏了**”时使用 `debug_issue`。它复用 `analyze` 已有的两阶段文件/symbol 发现、精确源码范围和 Evidence Cache，但返回结构专门面向 Debug：诊断结论、置信度、最可能根因、执行路径、间歇性原因、备选假设、验证方法、可能修复区域和经过本地校验的 `READ_NEXT`。
+
+参数：
+
+- `issue` — 必填。描述故障现象。
+- `paths` — 可选。优先检查的 workspace 相对文件/目录。
+- `logs` — 可选。可以传 stack trace、运行时/编译错误、HTTP 错误、浏览器 console、服务日志等观测证据。
+- `expected` / `actual` — 可选。预期行为和实际行为。
+- `recent_changes` — 可选布尔值；为 `true` 时会把当前 tracked Git diff（相对 `HEAD`）作为额外诊断证据。
+- `include` / `exclude` — 可选源码 glob。
+
+在 `Auto` 模式下，大日志、近期 Git diff 或宽范围目录会更倾向转为 Async。日志和 diff 会与源码共享配置的 source-token 预算，不会绕过上下文上限。`debug_issue` 仍然保持只读：不会执行程序、运行测试、修改文件或重启服务，只会把建议验证步骤返回给主编码智能体执行。
+
+典型参数：
+
+```json
+{
+  "issue": "API 后台 worker 偶尔启动失败并报 No such file or directory",
+  "paths": ["src/jobs.rs", "src/install.rs"],
+  "logs": "failed to start job worker: No such file or directory (os error 2)",
+  "expected": "MCP 请求返回后 durable worker 可以正常启动",
+  "actual": "Job 立即标记为 failed",
+  "recent_changes": true
+}
+```
 
 ### `plan`
 

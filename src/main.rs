@@ -78,9 +78,9 @@ fn run_gui() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_app_id("llm2mcp")
-            .with_inner_size([1040.0, 840.0])
-            .with_min_inner_size([680.0, 620.0])
+            .with_inner_size([1280.0, 900.0])
             .with_icon(icon::app_icon()),
+        persist_window: true,
         ..Default::default()
     };
     eframe::run_native(
@@ -88,7 +88,7 @@ fn run_gui() -> Result<()> {
         options,
         Box::new(|cc| {
             gui::install_cjk_font(&cc.egui_ctx);
-            Ok(Box::new(gui::Llm2McpApp::new()))
+            Ok(Box::new(gui::Llm2McpApp::new(cc)))
         }),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))

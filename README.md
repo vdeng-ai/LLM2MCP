@@ -11,7 +11,7 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 ## Features
 
 - Single binary for Windows, Linux, and macOS.
-- English and Simplified Chinese GUI.
+- English and Simplified Chinese GUI with six module tabs (`LLM API / Context limits / Per-tool reasoning / System Prompt / Job history / AI coding agents`); native window size/position, UI/text zoom, and the last active tab are restored across launches.
 - Configure OpenAI-compatible API endpoint, API key, model, reasoning transport, and an optional global system-prompt prefix; supports refreshing the OpenAI-compatible `/models` list.
 - Configure reasoning strength, execution mode (`Sync / Auto / Async`), and output budget independently for each MCP tool.
 - Integrations for multiple AI coding agents plus a generic stdio MCP mode.
@@ -66,17 +66,18 @@ The GUI can copy a generic `mcpServers.llm2mcp` JSON template that points to the
 
 ## MCP Tools
 
-LLM2MCP exposes five primary read-only tools plus three portable background-job tools:
+LLM2MCP exposes six primary read-only tools plus three portable background-job tools:
 
 | Tool | Best for | Required parameters | Optional parameters | Default reasoning | Default execution |
 | --- | --- | --- | --- | --- | --- |
 | `analyze` | Root-cause analysis, architecture analysis, large file/directory inspection | `task` | `paths`, `include`, `exclude` | Medium | Auto |
+| `debug_issue` | Diagnosing a concrete malfunction from symptoms, logs, source evidence, and optional recent Git changes | `issue` | `paths`, `logs`, `expected`, `actual`, `recent_changes`, `include`, `exclude` | XHigh | Auto |
 | `plan` | Independent implementation planning and second opinions | `task` | `paths`, `include`, `exclude` | XHigh | Auto |
 | `review_diff` | Reviewing tracked Git changes without loading the full diff into the primary agent | None | `task`, `base_ref` | Medium | Sync |
 | `document_repo` | Scanning a repository and generating grounded project documentation with bounded Map→Reduce passes | None | `document_type`, `paths`, `include`, `exclude`, `audience`, `language` | Medium | Async |
 | `update_docs` | Updating existing README/docs from Git changes without rescanning the entire repository | None | `base_ref`, `target_ref`, `docs`, `language` | XHigh | Async |
 
-Each primary tool has its own configurable reasoning level (`Off / Low / Medium / XHigh`), execution mode (`Sync / Auto / Async`), and secondary-LLM output-token budget in the GUI. `analyze`, `plan`, and `review_diff` also have a separate **Primary return** budget: the secondary model can use a larger internal answer budget, while LLM2MCP locally compacts the structured result before it enters the primary coding agent's context. Defaults are 800 tokens for `analyze`, 1200 for `plan`, and 1000 for `review_diff`; documentation tools return their full generated artifact. Input source limits are token-estimate based as well: the GUI separately controls the overall source budget, per-file budget, and lightweight discovery-index budget. The estimator is intentionally provider-neutral rather than pretending to be the exact tokenizer for every OpenAI-compatible model.
+Each primary tool has its own configurable reasoning level (`Off / Low / Medium / XHigh`), execution mode (`Sync / Auto / Async`), and secondary-LLM output-token budget in the GUI. `analyze`, `debug_issue`, `plan`, and `review_diff` also have a separate **Primary return** budget: the secondary model can use a larger internal answer budget, while LLM2MCP locally compacts the structured result before it enters the primary coding agent's context. Defaults are 800 tokens for `analyze`, 1400 for `debug_issue`, 1200 for `plan`, and 1000 for `review_diff`; documentation tools return their full generated artifact. Input source limits are token-estimate based as well: the GUI separately controls the overall source budget, per-file budget, and lightweight discovery-index budget. The estimator is intentionally provider-neutral rather than pretending to be the exact tokenizer for every OpenAI-compatible model.
 
 Portable job tools are always fast and read-only:
 
@@ -118,6 +119,34 @@ Typical tool arguments:
 ```
 
 The secondary model returns a structured analysis, and LLM2MCP compacts it locally to the configured Primary return budget without a second LLM call. Validated `READ_NEXT` entries are placed first, for example `src/jobs.rs:400-445 — fn spawn_worker(...)`, so the primary coding agent can open only the relevant range rather than ingesting the entire file.
+
+### `debug_issue`
+
+Use `debug_issue` when the program is already malfunctioning and the goal is to explain **why it fails**. It reuses the same bounded file/symbol discovery and Evidence Cache as `analyze`, but its output is specialized for diagnosis: confidence, likely root cause, execution path, intermittent-behavior explanation, alternative hypotheses, verification steps, likely fix area, and validated `READ_NEXT` evidence.
+
+Parameters:
+
+- `issue` — required symptom or malfunction description.
+- `paths` — optional files/directories to prioritize.
+- `logs` — optional stack trace, runtime/compiler error, HTTP error, browser console output, service logs, or other observed evidence.
+- `expected` / `actual` — optional expected and actual behavior.
+- `recent_changes` — optional boolean; when true, the current tracked Git diff against `HEAD` is included as debugging evidence.
+- `include` / `exclude` — optional source globs.
+
+Large logs, recent Git changes, or broad paths automatically favor Async under `Auto`. Runtime evidence shares the configured source-token budget with source context, so logs/diffs cannot silently create an unbounded request. `debug_issue` remains read-only: it does not execute programs, run tests, modify files, or restart services; it returns verification suggestions to the primary coding agent instead.
+
+Typical tool arguments:
+
+```json
+{
+  "issue": "The API worker intermittently fails to start with No such file or directory",
+  "paths": ["src/jobs.rs", "src/install.rs"],
+  "logs": "failed to start job worker: No such file or directory (os error 2)",
+  "expected": "The durable background worker starts after the MCP request returns",
+  "actual": "The job is immediately marked failed",
+  "recent_changes": true
+}
+```
 
 ### `plan`
 

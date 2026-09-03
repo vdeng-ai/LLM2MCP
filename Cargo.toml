@@ -12,7 +12,7 @@ categories = ["development-tools"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
 fs2 = "0.4"
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
