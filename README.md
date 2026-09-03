@@ -414,7 +414,7 @@ Selected source code is still sent to the LLM API you configure. Make sure that 
 
 ## Project Status
 
-LLM2MCP is currently in the `0.1.0` MVP stage. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
+LLM2MCP is currently at version `0.2.0`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
 
 ## License
 
