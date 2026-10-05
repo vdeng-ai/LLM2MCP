@@ -999,8 +999,8 @@ impl Llm2McpApp {
                                             ui.end_row();
                                             ui.small(text.token_usage);
                                             ui.small(format!(
-                                                "prompt {} · completion {}",
-                                                job.prompt_tokens, job.completion_tokens
+                                                "prompt {} · completion {} (usage reported {}/{} calls)",
+                                                job.prompt_tokens, job.completion_tokens, job.usage_reported_calls, job.llm_calls
                                             ));
                                             ui.end_row();
                                             ui.small("Symbol Index");
