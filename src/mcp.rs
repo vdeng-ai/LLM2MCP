@@ -412,7 +412,8 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "task": {"type": "string", "default": "Review the current changes for correctness and regressions"},
-                        "base_ref": {"type": "string", "default": "HEAD"}
+                        "base_ref": {"type": "string", "default": "HEAD"},
+                        "include_untracked": {"type": "boolean", "default": false, "description": "Explicitly include nonignored untracked text files in review"}
                     },
                     "additionalProperties": false
                 },
@@ -1775,30 +1776,89 @@ fn review_diff(
         .get("base_ref")
         .and_then(Value::as_str)
         .unwrap_or("HEAD");
-    let (status, diff, truncated) = workspace::git_diff(root, base_ref, config.max_source_tokens)?;
-    if let Some(reporter) = reporter {
-        reporter.record_context(workspace::estimate_tokens(&diff), 0, truncated)?;
+    let include_untracked = args
+        .get("include_untracked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (batches, omitted) =
+        workspace::review_batches(root, base_ref, include_untracked, config.max_source_tokens)?;
+    if batches.is_empty() && omitted.is_empty() {
+        return Ok("No eligible git diff found for review.".into());
     }
-    if diff.trim().is_empty() {
-        return Ok("No tracked git diff found for review.".to_owned());
+    let mut combined =
+        json!({"conclusion":"Batch review completed", "findings":[], "tests":[], "actions":[]});
+    for (index, batch) in batches.iter().enumerate() {
+        progress(
+            reporter,
+            "reviewing diff batches",
+            index as u64,
+            batches.len() as u64,
+        )?;
+        let prompt = format!(
+            "REVIEW TASK\n{task}\n\nDIFF AGAINST {base_ref}\nFILE {}\nBATCH {}/{}\n{}\n\nSURROUNDING CURRENT SOURCE\n{}\n\nReview only supplied evidence; an individual batch may contain part of a large diff. Return the required review JSON.",
+            batch.path,
+            index + 1,
+            batches.len(),
+            batch.diff,
+            batch.context
+        );
+        let result = chat_with_reporter(
+            config,
+            REVIEW_SYSTEM,
+            &prompt,
+            tool.reasoning,
+            tool.max_output_tokens,
+            reporter,
+        )?;
+        let value: Value = serde_json::from_str(&result)?;
+        for key in ["findings", "tests", "actions"] {
+            for item in value[key].as_array().context("missing review array")? {
+                let output = combined[key]
+                    .as_array_mut()
+                    .expect("review arrays initialized");
+                if !output.contains(item) {
+                    output.push(item.clone());
+                }
+            }
+        }
     }
-    progress(reporter, "reviewing", 1, 2)?;
-    let prompt = format!(
-        "REVIEW TASK\n{task}\n\nGIT STATUS\n{status}\n\nDIFF AGAINST\n{base_ref}\n\nDIFF\n{diff}\n\nDIFF_TRUNCATED\n{truncated}\n\nReturn critical/high/medium findings, missing tests, and recommended fixes.",
+    combined["findings"]
+        .as_array_mut()
+        .expect("findings initialized")
+        .sort_by_key(|item| match item["severity"].as_str().unwrap_or("") {
+            "critical" => 0,
+            "high" => 1,
+            "medium" => 2,
+            "low" => 3,
+            _ => 4,
+        });
+    let coverage = format!(
+        "REVIEW COVERAGE: {} batches reviewed; include_untracked={include_untracked}; omitted={}\n{}",
+        batches.len(),
+        omitted.len(),
+        omitted.join("\n")
     );
-    let result = chat_with_reporter(
-        config,
-        REVIEW_SYSTEM,
-        &prompt,
-        tool.reasoning,
-        tool.max_output_tokens,
+    if let Some(reporter) = reporter {
+        reporter.record_context(
+            batches
+                .iter()
+                .map(|b| {
+                    workspace::estimate_tokens(&b.diff) + workspace::estimate_tokens(&b.context)
+                })
+                .sum(),
+            batches.len(),
+            !omitted.is_empty(),
+        )?;
+    }
+    progress(
         reporter,
+        "finishing",
+        batches.len() as u64,
+        batches.len() as u64,
     )?;
-    progress(reporter, "finishing", 2, 2)?;
-    Ok(compact_primary_result(
-        &result,
-        tool.primary_return_or(1_000),
-        None,
+    Ok(format!(
+        "{coverage}\n\n{}",
+        compact_primary_result(&combined.to_string(), tool.primary_return_or(1000), None)
     ))
 }
 

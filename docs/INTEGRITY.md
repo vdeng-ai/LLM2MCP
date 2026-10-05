@@ -21,3 +21,7 @@ A nonempty response with `finish_reason=length` or `content_filter` is never acc
 ## Routed context budgets
 
 Each tool derives source limits from its routed model ceiling after reserving its system prefix, instructions, request metadata, manifest and final output. Discovery and Map derive their own limits before collecting evidence. Small models cap output reservations and source segment sizes; synthesis allocates space fairly across all Map summaries and marks shortened summaries. Provider preflight still rejects any request that exceeds the configured ceiling. Token counts are conservative local estimates, not a provider tokenizer guarantee.
+
+## Diff review coverage
+
+`review_diff` enumerates changed paths and reviews every diff segment in batches with nearby current source, rather than clipping the global diff prefix. Findings are deduplicated and ordered by severity. Up to 32 batches are reviewed per call; omitted paths/parts are explicitly reported. Set `include_untracked: true` to include nonignored new text files; secret paths, detected secret literals and binary/oversized files retain the existing filtering. Deleted-file hunks remain reviewable without current source.

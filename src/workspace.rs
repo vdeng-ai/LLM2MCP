@@ -1274,6 +1274,137 @@ pub fn git_diff(
     ))
 }
 
+#[derive(Debug)]
+pub struct ReviewBatch {
+    pub path: String,
+    pub diff: String,
+    pub context: String,
+}
+
+pub fn review_batches(
+    workspace: &Path,
+    base_ref: &str,
+    include_untracked: bool,
+    budget: usize,
+) -> Result<(Vec<ReviewBatch>, Vec<String>)> {
+    validate_git_ref(base_ref)?;
+    let root = canonical_workspace(workspace)?;
+    let control = crate::control::Control::current();
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        let result = crate::process::run(
+            Command::new("git").args(args).current_dir(&root),
+            std::time::Duration::from_secs(30),
+            &control,
+        )?;
+        if !result.status.success() {
+            bail!(
+                "Git review enumeration failed: {}",
+                crate::privacy::redact(&String::from_utf8_lossy(&result.stderr))
+            );
+        }
+        Ok(result)
+    };
+    let names = run(&["diff", "--name-only", "-z", base_ref, "--"])?;
+    let mut paths = String::from_utf8(names.stdout)?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| (path.to_owned(), false))
+        .collect::<Vec<_>>();
+    if include_untracked {
+        let names = run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        paths.extend(
+            String::from_utf8(names.stdout)?
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(|path| (path.to_owned(), true)),
+        );
+    }
+    let mut batches = Vec::new();
+    let mut omitted = Vec::new();
+    for (path, untracked) in paths {
+        control.check()?;
+        if is_secret(Path::new(&path)) {
+            continue;
+        }
+        if batches.len() >= 32 {
+            omitted.push(format!("{path}: omitted at 32-batch limit"));
+            continue;
+        }
+        let full = if untracked {
+            match secure_path(&root, &root.join(&path))
+                .and_then(|file| read_text_tokens(&file, usize::MAX))
+            {
+                Ok(text) => format!("UNTRACKED NEW FILE: {path}\n{text}"),
+                Err(_) => {
+                    omitted.push(format!("{path}: unreadable/binary/oversized"));
+                    continue;
+                }
+            }
+        } else {
+            let spec = format!(":(literal){path}");
+            let output = run(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                base_ref,
+                "--",
+                &spec,
+            ])?;
+            crate::privacy::redact(&String::from_utf8_lossy(&output.stdout))
+        };
+        let context = secure_path(&root, &root.join(&path))
+            .and_then(|file| read_source_lines(&file))
+            .map(|lines| {
+                let mut selected = BTreeSet::new();
+                for hunk in full.lines().filter(|line| line.starts_with("@@ ")) {
+                    if let Some(range) = hunk.split_whitespace().find(|word| word.starts_with('+'))
+                    {
+                        let mut values = range.trim_start_matches('+').split(',');
+                        let start = values
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        let count = values
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        for line in start.saturating_sub(11)
+                            ..start
+                                .saturating_add(count.min(100))
+                                .saturating_add(10)
+                                .min(lines.len())
+                        {
+                            selected.insert(line);
+                        }
+                    }
+                }
+                let text = selected
+                    .into_iter()
+                    .map(|i| format!("{} | {}\n", i + 1, lines[i]))
+                    .collect::<String>();
+                truncate_tokens_strict(&text, budget / 4, "[SURROUNDING SOURCE TRUNCATED]")
+            })
+            .unwrap_or_default();
+        let segments = text_segments(&full, (budget * 3 / 4).saturating_sub(64).max(16));
+        let total = segments.len();
+        for (index, (_, _, text)) in segments.into_iter().enumerate() {
+            if batches.len() >= 32 {
+                omitted.push(format!(
+                    "{path}: diff parts {}-{total} omitted at 32-batch limit",
+                    index + 1
+                ));
+                break;
+            }
+            batches.push(ReviewBatch {
+                path: path.clone(),
+                diff: format!("FILE {path} PART {}/{total}\n{text}", index + 1),
+                context: context.clone(),
+            });
+        }
+    }
+    Ok((batches, omitted))
+}
+
 pub fn git_diff_refs(
     workspace: &Path,
     base_ref: &str,
@@ -1390,6 +1521,62 @@ mod tests {
         assert!(index.truncated);
         repo_cache::clear_workspace_cache(root.path()).unwrap();
     }
+    #[test]
+    fn batched_review_preserves_late_diff_and_requires_untracked_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init"]);
+        fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+        fs::write(
+            root.path().join("main.rs"),
+            format!(
+                "{}\nfn late_regression() {{}}\n",
+                "// changed line\n".repeat(600)
+            ),
+        )
+        .unwrap();
+        fs::write(root.path().join("new.rs"), "fn untracked_evidence() {}\n").unwrap();
+        fs::write(root.path().join(".env"), "SECRET=hidden").unwrap();
+        let (batches, omitted) = review_batches(root.path(), "HEAD", false, 1000).unwrap();
+        assert!(omitted.is_empty());
+        assert!(batches.len() > 1);
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.diff.contains("late_regression"))
+        );
+        assert!(batches.iter().any(|batch| batch.context.contains(" | ")));
+        assert!(!batches.iter().any(|batch| batch.path == "new.rs"));
+        let (batches, _) = review_batches(root.path(), "HEAD", true, 1000).unwrap();
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.diff.contains("untracked_evidence"))
+        );
+        assert!(!batches.iter().any(|batch| batch.path == ".env"));
+        assert!(review_batches(root.path(), "--help", true, 1000).is_err());
+    }
+
     #[test]
     fn tracked_secrets_are_excluded_and_diff_literals_redacted() {
         let root = tempfile::tempdir().unwrap();
