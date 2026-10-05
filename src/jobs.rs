@@ -86,6 +86,8 @@ pub struct JobRecord {
     pub estimated_llm_cost_usd: Option<f64>,
     #[serde(default)]
     pub priced_llm_calls: u64,
+    #[serde(default)]
+    pub usage_reported_calls: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +174,9 @@ impl Reporter {
             record.completion_tokens = record
                 .completion_tokens
                 .saturating_add(completion_tokens.unwrap_or_default());
+            if prompt_tokens.is_some() && completion_tokens.is_some() {
+                record.usage_reported_calls += 1;
+            }
             record.last_llm_diagnostics = Some(diagnostics.to_owned());
         })
     }
@@ -289,6 +294,7 @@ fn create_record(
         used_models: Vec::new(),
         estimated_llm_cost_usd: None,
         priced_llm_calls: 0,
+        usage_reported_calls: 0,
     };
     let mut record = record;
     record.config_snapshot = Some(crate::config::load()?.without_credentials());
@@ -482,6 +488,7 @@ pub fn fallback_status_result(record: &JobRecord) -> Value {
             "estimated_llm_cost_usd": record.estimated_llm_cost_usd, "priced_llm_calls": record.priced_llm_calls,
             "duration_ms": display_duration_ms(record),
             "llm_calls": record.llm_calls,
+            "usage_reported_calls": record.usage_reported_calls,
             "prompt_tokens": record.prompt_tokens,
             "completion_tokens": record.completion_tokens,
             "last_llm_diagnostics": record.last_llm_diagnostics,
@@ -550,6 +557,7 @@ pub fn task_get_result(record: &JobRecord) -> Value {
                 "cancelRequested": record.cancel_requested,
                 "durationMs": display_duration_ms(record),
                 "llmCalls": record.llm_calls,
+                "usageReportedCalls": record.usage_reported_calls,
                 "promptTokens": record.prompt_tokens,
                 "completionTokens": record.completion_tokens,
                 "lastLlmDiagnostics": record.last_llm_diagnostics,
@@ -995,6 +1003,7 @@ mod tests {
             used_models: Vec::new(),
             estimated_llm_cost_usd: None,
             priced_llm_calls: 0,
+            usage_reported_calls: 0,
         };
         let value = task_get_result(&record);
         assert_eq!(value["status"], "working");

@@ -16,6 +16,12 @@ pub struct ChatResponse {
 
 impl ChatResponse {
     pub fn final_text(&self) -> Option<&str> {
+        if matches!(
+            self.finish_reason.as_deref(),
+            Some("length" | "content_filter")
+        ) {
+            return None;
+        }
         self.content
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -42,6 +48,7 @@ impl ChatResponse {
         )
     }
 
+    #[cfg(test)]
     pub fn exhausted_before_final(&self) -> bool {
         self.final_text().is_none()
             && (self.finish_reason.as_deref() == Some("length")

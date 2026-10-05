@@ -30,6 +30,12 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 
 See [runtime configuration and usage](docs/RUNTIME.md) for examples, migration, measurements and limits.
 
+## Context integrity in 0.3
+
+Complete-file scanning and batched diff review expose coverage instead of silently dropping late evidence. Output validation rejects incomplete results; source budgets follow each routed model. `update_docs` produces hashed exact-fragment edits that preserve unseen document sections.
+
+See [integrity and migration](docs/INTEGRITY.md), [paired effectiveness evaluation](docs/EVALUATION.md), and [deep MCP/host diagnostics](docs/DIAGNOSTICS.md).
+
 ## Installation
 
 Download the package for your platform from GitHub Releases. Ubuntu/Debian x86_64 users can use the native `.deb` package:
@@ -277,7 +283,7 @@ The final Reduce pass defaults to **Medium** reasoning. If the configured reason
 
 ### `update_docs`
 
-Use `update_docs` after code changes when existing documentation may be stale. LLM2MCP reads the Git diff locally, discovers README/docs Markdown by default, and asks the configured LLM to return complete replacement Markdown only for affected documents. This tool requires the workspace to be a Git repository with the referenced commits/tags available.
+Use `update_docs` after code changes when existing documentation may be stale. LLM2MCP reads the Git diff locally, discovers README/docs Markdown by default, and returns validated exact-fragment edits with original SHA-256 hashes. Unseen original sections are preserved. Check each hash before applying edits; see [safe update format](docs/INTEGRITY.md). This tool requires the workspace to be a Git repository with the referenced commits/tags available.
 
 Parameters:
 

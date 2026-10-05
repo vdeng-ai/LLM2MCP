@@ -58,6 +58,64 @@ pub struct CollectedSource {
     pub evidence_cache_misses: usize,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct ScanCoverage {
+    pub total_files: usize,
+    pub complete_files: usize,
+    pub segments: usize,
+    pub omissions: Vec<String>,
+}
+
+impl ScanCoverage {
+    pub fn summary(&self) -> String {
+        format!(
+            "Repository scan: {}/{} files complete, {} source segments.{}",
+            self.complete_files,
+            self.total_files,
+            self.segments,
+            if self.omissions.is_empty() {
+                String::new()
+            } else {
+                format!("\nOmitted evidence:\n{}", self.omissions.join("\n"))
+            }
+        )
+    }
+}
+
+/// Split complete source, including unusually long individual lines. Line ranges
+/// remain relative to the original file; split-line fragments share a line ID.
+pub fn text_segments(text: &str, budget: usize) -> Vec<(usize, usize, String)> {
+    let budget = budget.max(16);
+    let mut segments = Vec::new();
+    let mut body = String::new();
+    let mut start = 1;
+    let mut end = 1;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let number = index + 1;
+        let mut remaining = line;
+        if !body.is_empty() && estimate_tokens(&body) + estimate_tokens(line) > budget {
+            segments.push((start, end, std::mem::take(&mut body)));
+        }
+        while estimate_tokens(remaining) > budget {
+            let part = truncate_tokens_strict(remaining, budget, "");
+            let consumed = part.len();
+            segments.push((number, number, part));
+            remaining = &remaining[consumed..];
+        }
+        if !remaining.is_empty() {
+            if body.is_empty() {
+                start = number;
+            }
+            body.push_str(remaining);
+            end = number;
+        }
+    }
+    if !body.is_empty() {
+        segments.push((start, end, body));
+    }
+    segments
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolCandidate {
     pub path: String,
@@ -383,6 +441,12 @@ fn requested_files(
 fn file_chunk(root: &Path, file: &Path, max_file_tokens: usize) -> Result<(String, String)> {
     let relative = normalized_relative(file.strip_prefix(root).unwrap_or(file));
     let text = read_text_tokens(file, max_file_tokens)?;
+    let text = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{} | {line}\n", i + 1))
+        .collect::<String>();
+    let text = truncate_tokens_strict(&text, max_file_tokens, "[FILE TRUNCATED]");
     let chunk =
         format!("\n\n===== FILE: {relative} =====\n{text}\n===== END FILE: {relative} =====\n");
     Ok((relative, chunk))
@@ -432,6 +496,7 @@ pub fn manifest(workspace: &Path) -> Result<String> {
     Ok(files.join("\n"))
 }
 
+#[cfg(test)]
 pub fn collect(
     workspace: &Path,
     requested: &[String],
@@ -456,7 +521,7 @@ pub fn collect_filtered(
 
     let per_file_budget = config
         .max_file_tokens
-        .min(config.max_source_tokens.saturating_sub(250).max(500));
+        .min(config.max_source_tokens.saturating_sub(128).max(16));
     for file in files {
         crate::control::Control::current().check()?;
         let Ok((relative, chunk)) = file_chunk(&root, &file, per_file_budget) else {
@@ -475,7 +540,7 @@ pub fn collect_filtered(
     }
 
     Ok(CollectedSource {
-        manifest: manifest(&root)?,
+        manifest: truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]"),
         body,
         included_files,
         truncated,
@@ -492,54 +557,89 @@ pub fn collect_chunks_filtered(
     max_chunks: usize,
     include: &[String],
     exclude: &[String],
-) -> Result<Vec<CollectedSource>> {
+) -> Result<(Vec<CollectedSource>, ScanCoverage)> {
     let root = canonical_workspace(workspace)?;
     let files = if requested.is_empty() {
         requested_files(&root, &[".".to_owned()], include, exclude)?
     } else {
         requested_files(&root, requested, include, exclude)?
     };
-    let manifest = manifest(&root)?;
-    let chunk_limit = chunk_tokens
-        .max(2_500)
-        .min(config.max_source_tokens.max(2_500));
+    let manifest = truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]");
+    let chunk_limit = chunk_tokens.max(128).min(config.max_source_tokens.max(128));
     let mut chunks = Vec::new();
     let mut body = String::new();
     let mut body_tokens = 0usize;
     let mut included_files = Vec::new();
     let mut truncated = false;
+    let mut coverage = ScanCoverage {
+        total_files: files.len(),
+        ..Default::default()
+    };
     let max_file_tokens = config
         .max_file_tokens
-        .min(chunk_limit.saturating_sub(250).max(500));
+        .min(chunk_limit.saturating_sub(128).max(16));
 
     for file in files {
         crate::control::Control::current().check()?;
-        let Ok((relative, chunk)) = file_chunk(&root, &file, max_file_tokens) else {
+        let relative = normalized_relative(file.strip_prefix(&root).unwrap_or(&file));
+        if chunks.len() >= max_chunks {
+            coverage
+                .omissions
+                .push(format!("- {relative}: not scanned (chunk limit)"));
+            truncated = true;
             continue;
+        }
+        let text = match read_text_tokens(&file, usize::MAX) {
+            Ok(text) => text,
+            Err(error) => {
+                coverage.omissions.push(format!("- {relative}: {error}"));
+                truncated = true;
+                continue;
+            }
         };
-        let chunk_cost = estimate_tokens(&chunk);
-        let would_overflow =
-            !body.is_empty() && body_tokens.saturating_add(chunk_cost) > chunk_limit;
-        if would_overflow {
-            chunks.push(CollectedSource {
-                manifest: manifest.clone(),
-                body: std::mem::take(&mut body),
-                included_files: std::mem::take(&mut included_files),
-                truncated,
-                evidence_cache_hits: 0,
-                evidence_cache_misses: 0,
-            });
-            truncated = false;
-            body_tokens = 0;
+        let total_lines = text.lines().count();
+        let segments = text_segments(&text, max_file_tokens.saturating_sub(128));
+        let mut complete = true;
+        for (part, (start, end, text)) in segments.iter().enumerate() {
+            let chunk = format!(
+                "\n===== FILE: {relative} LINES {start}-{end} PART {}/{} =====\n{text}\n===== END FILE =====\n",
+                part + 1,
+                segments.len()
+            );
+            let chunk_cost = estimate_tokens(&chunk);
+            let would_overflow =
+                !body.is_empty() && body_tokens.saturating_add(chunk_cost) > chunk_limit;
+            if would_overflow {
+                chunks.push(CollectedSource {
+                    manifest: manifest.clone(),
+                    body: std::mem::take(&mut body),
+                    included_files: std::mem::take(&mut included_files),
+                    truncated,
+                    evidence_cache_hits: 0,
+                    evidence_cache_misses: 0,
+                });
+                truncated = false;
+                body_tokens = 0;
+            }
             if chunks.len() >= max_chunks {
+                coverage.omissions.push(format!(
+                    "- {relative}: lines {start}-{} not scanned (chunk limit)",
+                    total_lines.max(*end)
+                ));
+                complete = false;
                 truncated = true;
                 break;
             }
+            coverage.segments += 1;
+            body_tokens = body_tokens.saturating_add(chunk_cost);
+            body.push_str(&chunk);
+            if !included_files.contains(&relative) {
+                included_files.push(relative.clone());
+            }
         }
-        truncated |= chunk.contains("[FILE TRUNCATED]");
-        body_tokens = body_tokens.saturating_add(chunk_cost);
-        body.push_str(&chunk);
-        included_files.push(relative);
+        if complete {
+            coverage.complete_files += 1;
+        }
     }
 
     if !body.is_empty() && chunks.len() < max_chunks {
@@ -555,7 +655,12 @@ pub fn collect_chunks_filtered(
         last.truncated = true;
     }
 
-    Ok(chunks)
+    if !coverage.omissions.is_empty()
+        && let Some(last) = chunks.last_mut()
+    {
+        last.truncated = true;
+    }
+    Ok((chunks, coverage))
 }
 
 fn is_symbol_line(line: &str) -> bool {
@@ -754,12 +859,15 @@ pub fn discovery_index_for_task(
         }
     }
     ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    for (_, relative, bytes, symbols, _) in ranked {
+    for (_, relative, bytes, symbols, imports) in ranked {
         if candidate_files.len() >= 512 {
             truncated = true;
             break;
         }
-        let header = format!("FILE {relative} ({bytes} bytes)\n");
+        let header = format!(
+            "FILE {relative} ({bytes} bytes)\nDEPENDENCY HINTS {}\n",
+            imports.join(", ")
+        );
         let cost = estimate_tokens(&header);
         if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
             truncated = true;
@@ -1024,7 +1132,7 @@ pub fn collect_symbol_context(
     );
 
     Ok(CollectedSource {
-        manifest: manifest(&root)?,
+        manifest: truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]"),
         body,
         included_files,
         truncated,
@@ -1075,6 +1183,30 @@ pub fn existing_document_paths(workspace: &Path) -> Result<Vec<String>> {
     }
 
     Ok(docs.into_iter().collect())
+}
+
+pub fn document_snapshot(
+    workspace: &Path,
+    relative: &str,
+    budget: usize,
+) -> Result<crate::doc_edits::Snapshot> {
+    let root = canonical_workspace(workspace)?;
+    let path = secure_path(&root, &root.join(relative))?;
+    if is_secret(&path)
+        || path.extension().and_then(|value| value.to_str()) != Some("md")
+        || fs::metadata(&path)?.len() > 8 * 1024 * 1024
+    {
+        bail!("document is sensitive, oversized or not Markdown: {relative}");
+    }
+    let original = fs::read_to_string(&path)?;
+    let masked = crate::privacy::redact(&original);
+    let visible = truncate_tokens_strict(&masked, budget, "\n[DOCUMENT PREVIEW TRUNCATED]\n");
+    Ok(crate::doc_edits::Snapshot {
+        path: normalized_relative(path.strip_prefix(&root)?),
+        hash: repo_cache::hash_bytes(original.as_bytes()),
+        original,
+        visible,
+    })
 }
 
 fn validate_git_ref(value: &str) -> Result<()> {
@@ -1159,6 +1291,140 @@ pub fn git_diff(
     ))
 }
 
+#[derive(Debug)]
+pub struct ReviewBatch {
+    pub path: String,
+    pub diff: String,
+    pub context: String,
+}
+
+pub fn review_batches(
+    workspace: &Path,
+    base_ref: &str,
+    include_untracked: bool,
+    budget: usize,
+) -> Result<(Vec<ReviewBatch>, Vec<String>)> {
+    validate_git_ref(base_ref)?;
+    let root = canonical_workspace(workspace)?;
+    let control = crate::control::Control::current();
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        let result = crate::process::run(
+            Command::new("git").args(args).current_dir(&root),
+            std::time::Duration::from_secs(30),
+            &control,
+        )?;
+        if !result.status.success() {
+            bail!(
+                "Git review enumeration failed: {}",
+                crate::privacy::redact(&String::from_utf8_lossy(&result.stderr))
+            );
+        }
+        Ok(result)
+    };
+    let names = run(&["diff", "--name-only", "-z", base_ref, "--"])?;
+    let mut paths = String::from_utf8(names.stdout)?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| (path.to_owned(), false))
+        .collect::<Vec<_>>();
+    if include_untracked {
+        let names = run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        paths.extend(
+            String::from_utf8(names.stdout)?
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(|path| (path.to_owned(), true)),
+        );
+    }
+    let mut batches = Vec::new();
+    let mut omitted = Vec::new();
+    for (path, untracked) in paths {
+        control.check()?;
+        if is_secret(Path::new(&path)) {
+            continue;
+        }
+        if batches.len() >= 32 {
+            omitted.push(format!("{path}: omitted at 32-batch limit"));
+            continue;
+        }
+        let full = if untracked {
+            match secure_path(&root, &root.join(&path))
+                .and_then(|file| read_text_tokens(&file, usize::MAX))
+            {
+                Ok(text) => format!("UNTRACKED NEW FILE: {path}\n{text}"),
+                Err(_) => {
+                    omitted.push(format!("{path}: unreadable/binary/oversized"));
+                    continue;
+                }
+            }
+        } else {
+            let spec = format!(":(literal){path}");
+            let output = run(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                base_ref,
+                "--",
+                &spec,
+            ])?;
+            crate::privacy::redact(&String::from_utf8_lossy(&output.stdout))
+        };
+        let context = secure_path(&root, &root.join(&path))
+            .and_then(|file| read_source_lines(&file))
+            .map(|lines| {
+                let mut selected = BTreeSet::new();
+                for hunk in full.lines().filter(|line| line.starts_with("@@ ")) {
+                    if let Some(range) = hunk.split_whitespace().find(|word| word.starts_with('+'))
+                    {
+                        let mut values = range.trim_start_matches('+').split(',');
+                        let start = values
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        let count = values
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        for line in start.saturating_sub(11)
+                            ..start
+                                .saturating_add(count.min(100))
+                                .saturating_add(10)
+                                .min(lines.len())
+                        {
+                            selected.insert(line);
+                        }
+                    }
+                }
+                let text = selected
+                    .into_iter()
+                    .map(|i| format!("{} | {}\n", i + 1, lines[i]))
+                    .collect::<String>();
+                format!(
+                    "===== FILE: {path} =====\n{}\n===== END FILE: {path} =====",
+                    truncate_tokens_strict(&text, budget / 4, "[SURROUNDING SOURCE TRUNCATED]")
+                )
+            })
+            .unwrap_or_default();
+        let segments = text_segments(&full, (budget * 3 / 4).saturating_sub(64).max(16));
+        let total = segments.len();
+        for (index, (_, _, text)) in segments.into_iter().enumerate() {
+            if batches.len() >= 32 {
+                omitted.push(format!(
+                    "{path}: diff parts {}-{total} omitted at 32-batch limit",
+                    index + 1
+                ));
+                break;
+            }
+            batches.push(ReviewBatch {
+                path: path.clone(),
+                diff: format!("FILE {path} PART {}/{total}\n{text}", index + 1),
+                context: context.clone(),
+            });
+        }
+    }
+    Ok((batches, omitted))
+}
+
 pub fn git_diff_refs(
     workspace: &Path,
     base_ref: &str,
@@ -1182,6 +1448,65 @@ pub fn git_diff_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_scan_reads_late_lines_beyond_the_single_file_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let source = format!(
+            "{}\nfn late_tail_evidence() {{}}\n",
+            "fn earlier() {}\n".repeat(300)
+        );
+        fs::write(root.path().join("large.rs"), source).unwrap();
+        let config = AppConfig {
+            max_file_tokens: 500,
+            max_source_tokens: 2500,
+            ..Default::default()
+        };
+        let (chunks, coverage) =
+            collect_chunks_filtered(root.path(), &[], &config, 2500, 12, &[], &[]).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.body.contains("late_tail_evidence"))
+        );
+        assert!(coverage.segments > 1);
+        assert_eq!(coverage.complete_files, 1);
+        assert!(coverage.omissions.is_empty());
+        assert!(chunks.iter().all(|chunk| !chunk.truncated));
+    }
+
+    #[test]
+    fn segmented_unicode_and_long_lines_preserve_every_character() {
+        let source = format!("{}\nlast line", "中文🙂é".repeat(200));
+        let parts = text_segments(&source, 32);
+        assert_eq!(
+            parts.iter().map(|part| part.2.as_str()).collect::<String>(),
+            source
+        );
+        assert!(parts.iter().all(|part| estimate_tokens(&part.2) <= 32));
+    }
+
+    #[test]
+    fn bounded_map_scan_reports_omitted_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("large.rs"),
+            "fn example() {}\n".repeat(1000),
+        )
+        .unwrap();
+        let config = AppConfig {
+            max_file_tokens: 500,
+            max_source_tokens: 2500,
+            ..Default::default()
+        };
+        let (chunks, coverage) =
+            collect_chunks_filtered(root.path(), &[], &config, 2500, 1, &[], &[]).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(coverage.complete_files, 0);
+        assert!(coverage.omissions[0].contains("large.rs"));
+        assert!(coverage.omissions[0].contains("-1000 not scanned"));
+        assert!(chunks[0].truncated);
+    }
 
     #[test]
     fn budget_prioritizes_late_chinese_matches_and_imports() {
@@ -1217,6 +1542,62 @@ mod tests {
         assert!(index.truncated);
         repo_cache::clear_workspace_cache(root.path()).unwrap();
     }
+    #[test]
+    fn batched_review_preserves_late_diff_and_requires_untracked_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init"]);
+        fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+        fs::write(
+            root.path().join("main.rs"),
+            format!(
+                "{}\nfn late_regression() {{}}\n",
+                "// changed line\n".repeat(600)
+            ),
+        )
+        .unwrap();
+        fs::write(root.path().join("new.rs"), "fn untracked_evidence() {}\n").unwrap();
+        fs::write(root.path().join(".env"), "SECRET=hidden").unwrap();
+        let (batches, omitted) = review_batches(root.path(), "HEAD", false, 1000).unwrap();
+        assert!(omitted.is_empty());
+        assert!(batches.len() > 1);
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.diff.contains("late_regression"))
+        );
+        assert!(batches.iter().any(|batch| batch.context.contains(" | ")));
+        assert!(!batches.iter().any(|batch| batch.path == "new.rs"));
+        let (batches, _) = review_batches(root.path(), "HEAD", true, 1000).unwrap();
+        assert!(
+            batches
+                .iter()
+                .any(|batch| batch.diff.contains("untracked_evidence"))
+        );
+        assert!(!batches.iter().any(|batch| batch.path == ".env"));
+        assert!(review_batches(root.path(), "--help", true, 1000).is_err());
+    }
+
     #[test]
     fn tracked_secrets_are_excluded_and_diff_literals_redacted() {
         let root = tempfile::tempdir().unwrap();

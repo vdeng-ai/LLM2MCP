@@ -319,6 +319,25 @@ impl AppConfig {
         }
         Ok(config)
     }
+    pub fn update_api_fields(&mut self, name: Option<&str>, api: &Self) -> Result<()> {
+        if let Some(name) = name {
+            let profile = self
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.name == name)
+                .with_context(|| format!("unknown model profile: {name}"))?;
+            profile.base_url.clone_from(&api.base_url);
+            profile.api_key.clone_from(&api.api_key);
+            profile.model.clone_from(&api.model);
+            profile.reasoning_transport = api.reasoning_transport;
+        } else {
+            self.base_url.clone_from(&api.base_url);
+            self.api_key.clone_from(&api.api_key);
+            self.model.clone_from(&api.model);
+            self.reasoning_transport = api.reasoning_transport;
+        }
+        Ok(())
+    }
     pub fn for_tool(&self, name: &str) -> Result<Self> {
         let tool = match name {
             "analyze" => &self.tools.analyze,
@@ -458,6 +477,18 @@ fn apply_env_overrides(config: &mut AppConfig) {
     {
         config.model = value;
     }
+    if let Ok(value) = std::env::var("LLM2MCP_ACTIVE_PROFILE")
+        && !value.trim().is_empty()
+    {
+        config.active_profile = Some(value);
+    }
+    if let Ok(value) = std::env::var("LLM2MCP_ANALYZE_EXECUTION") {
+        config.tools.analyze.execution = Some(match value.as_str() {
+            "async" => ExecutionMode::Async,
+            "sync" => ExecutionMode::Sync,
+            _ => ExecutionMode::Auto,
+        });
+    }
     if let Ok(value) = std::env::var("LLM2MCP_API_KEY") {
         config.api_key = value;
     }
@@ -512,6 +543,35 @@ mod tests {
         assert!(snapshot.profiles[0].api_key.is_empty());
         config.profiles.push(config.profiles[0].clone());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn selected_api_edits_do_not_change_fallback_or_another_profile() {
+        let mut config = AppConfig::default();
+        config.profiles.push(ModelProfile {
+            name: "selected".into(),
+            ..Default::default()
+        });
+        config.profiles.push(ModelProfile {
+            name: "other".into(),
+            ..Default::default()
+        });
+        let fallback = config.model.clone();
+        let other = config.profiles[1].model.clone();
+        let mut edit = config.with_profile(Some("selected")).unwrap();
+        edit.model = "refreshed-model".into();
+        config.update_api_fields(Some("selected"), &edit).unwrap();
+        assert_eq!(
+            config.with_profile(Some("selected")).unwrap().model,
+            "refreshed-model"
+        );
+        assert_eq!(config.model, fallback);
+        assert_eq!(config.profiles[1].model, other);
+        assert!(
+            config
+                .update_api_fields(Some("deleted-profile"), &edit)
+                .is_err()
+        );
     }
 
     #[test]

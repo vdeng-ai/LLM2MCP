@@ -78,7 +78,7 @@ Cite concrete file paths and symbols. Do not invent missing behavior. Do not wri
 
 const DOC_REDUCE_SYSTEM: &str = r#"You are a senior technical writer synthesizing project documentation from repository-map summaries produced from local source code.
 Write documentation that is useful to developers and grounded only in the supplied evidence. Clearly mark unknowns instead of guessing. Prefer concrete file paths, modules, symbols, commands, and data flows. Mermaid diagrams are welcome when relationships are supported by evidence.
-When asked for multiple documents, emit each document as a complete Markdown block delimited exactly by:
+For every requested document, emit each document as a complete Markdown block delimited exactly by:
 ===== DOCUMENT: relative/path.md =====
 ...content...
 ===== END DOCUMENT =====
@@ -86,11 +86,8 @@ Do not claim files were written; the MCP is read-only."#;
 
 const UPDATE_DOCS_SYSTEM: &str = r#"You are updating software project documentation from a Git diff and the current documentation snapshot.
 Identify only documentation affected by the code changes. Preserve valid existing information, change stale sections, add genuinely new behavior, and avoid speculative statements.
-Return complete replacement Markdown only for documents that should change, each delimited exactly by:
-===== DOCUMENT: relative/path.md =====
-...content...
-===== END DOCUMENT =====
-If no documentation change is needed, say so explicitly. Do not claim files were written; the MCP is read-only."#;
+Return JSON only: {"edits":[{"path":"README.md","original_sha256":"copy supplied hash","old_text":"exact unique supplied fragment","new_text":"replacement fragment"}],"new_documents":[{"path":"docs/new.md","content":"complete new Markdown"}]}.
+Prefer small nonoverlapping exact edits; never replace an entire document from a truncated preview. Preserve unseen sections. Old text must come from the supplied preview and match the original exactly once. Use an empty edits array when unchanged. New documents are optional and must not already exist. Do not claim files were written; the MCP is read-only."#;
 
 pub fn run(workspace_path: &Path) -> Result<()> {
     let workspace = workspace_path
@@ -415,7 +412,8 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "task": {"type": "string", "default": "Review the current changes for correctness and regressions"},
-                        "base_ref": {"type": "string", "default": "HEAD"}
+                        "base_ref": {"type": "string", "default": "HEAD"},
+                        "include_untracked": {"type": "boolean", "default": false, "description": "Explicitly include nonignored untracked text files in review"}
                     },
                     "additionalProperties": false
                 },
@@ -440,7 +438,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "update_docs",
-                "description": "Compare code changes with existing README/docs and return replacement Markdown only for documentation that should change. Defaults to asynchronous execution.",
+                "description": "Compare code changes with existing README/docs and return validated exact-fragment edits with original SHA-256 hashes, preserving unseen sections. Never writes files. Defaults to asynchronous execution.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -745,7 +743,47 @@ fn execute_business_inner(
     args: &Value,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    let routed = config.for_tool(name)?;
+    let mut routed = config.for_tool(name)?;
+    let system = match name {
+        "analyze" => ANALYZE_SYSTEM,
+        "debug_issue" => DEBUG_SYSTEM,
+        "plan" => PLAN_SYSTEM,
+        "review_diff" => REVIEW_SYSTEM,
+        "document_repo" => DOC_REDUCE_SYSTEM,
+        "update_docs" => UPDATE_DOCS_SYSTEM,
+        _ => bail!("unknown tool"),
+    };
+    let output = routed
+        .model_output_limit
+        .min((routed.model_input_limit / 4) as u32);
+    for tool in [
+        &mut routed.tools.analyze,
+        &mut routed.tools.debug_issue,
+        &mut routed.tools.plan,
+        &mut routed.tools.review_diff,
+        &mut routed.tools.document_repo,
+        &mut routed.tools.update_docs,
+    ] {
+        tool.max_output_tokens = tool.max_output_tokens.min(output);
+    }
+    let metadata = format!(
+        "{}\n{}",
+        args,
+        workspace::truncate_tokens_strict(
+            &workspace::manifest(root)?,
+            1024,
+            "[MANIFEST TRUNCATED]"
+        )
+    );
+    let requested_output = match name {
+        "analyze" => routed.tools.analyze.max_output_tokens,
+        "debug_issue" => routed.tools.debug_issue.max_output_tokens,
+        "plan" => routed.tools.plan.max_output_tokens,
+        "review_diff" => routed.tools.review_diff.max_output_tokens,
+        "document_repo" => routed.tools.document_repo.max_output_tokens,
+        _ => routed.tools.update_docs.max_output_tokens,
+    };
+    let routed = budgeted_config(&routed, system, &metadata, requested_output)?;
     let config = &routed;
     match name {
         "analyze" => analyze(config, root, args, &config.tools.analyze, reporter),
@@ -756,6 +794,31 @@ fn execute_business_inner(
         "update_docs" => update_docs(config, root, args, &config.tools.update_docs, reporter),
         _ => bail!("unknown background tool: {name}"),
     }
+}
+
+fn budgeted_config(
+    config: &AppConfig,
+    system: &str,
+    metadata: &str,
+    output: u32,
+) -> Result<AppConfig> {
+    let reserve = workspace::estimate_tokens(&config.system_prompt_prefix)
+        + workspace::estimate_tokens(system)
+        + workspace::estimate_tokens(metadata)
+        + 1024
+        + output.min(config.model_output_limit) as usize;
+    let available = config.model_input_limit.saturating_sub(reserve);
+    if available < 256 || output < 128 {
+        bail!(
+            "prompt overhead exceeds model context limit {}",
+            config.model_input_limit
+        );
+    }
+    let mut bounded = config.clone();
+    bounded.max_source_tokens = config.max_source_tokens.min(available);
+    bounded.max_file_tokens = config.max_file_tokens.min(available.saturating_sub(128));
+    bounded.discovery_index_tokens = config.discovery_index_tokens.min(available);
+    Ok(bounded)
 }
 
 fn paths_arg(args: &Value) -> Vec<String> {
@@ -842,17 +905,163 @@ fn chat_with_reporter(
     max_output_tokens: u32,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    let response =
-        chat_detailed_with_reporter(config, system, user, effort, max_output_tokens, reporter)?;
-    response
-        .final_text()
-        .map(|value| value.trim().to_owned())
-        .with_context(|| {
+    let attempts = reduce_reasoning_attempts(effort);
+    let mut diagnostics = String::new();
+    for attempt in 0..3 {
+        let prompt = if attempt == 0 {
+            user.to_owned()
+        } else {
             format!(
-                "LLM returned no final message content ({})",
-                response.diagnostics()
+                "{user}\n\nRECOVERY: Previous output was incomplete or invalid. Emit the complete requested response, with all required fields and document boundaries. Keep it concise."
             )
-        })
+        };
+        let input = workspace::estimate_tokens(&config.system_prompt_prefix)
+            + workspace::estimate_tokens(system)
+            + workspace::estimate_tokens(&prompt)
+            + 256;
+        let ceiling = config
+            .model_input_limit
+            .saturating_sub(input)
+            .min(config.model_output_limit as usize) as u32;
+        let budget = max_output_tokens.saturating_mul(1 << attempt).min(ceiling);
+        if budget < 128 {
+            bail!(
+                "estimated input plus output exceeds model context limit; insufficient context for output recovery"
+            );
+        }
+        let response = chat_detailed_with_reporter(
+            config,
+            system,
+            &prompt,
+            attempts[attempt.min(attempts.len() - 1)],
+            budget,
+            reporter,
+        )?;
+        diagnostics = response.diagnostics();
+        if let Some(content) = response.final_text() {
+            match validate_model_output(system, user, content) {
+                Ok(()) => {
+                    if [ANALYZE_SYSTEM, DEBUG_SYSTEM, PLAN_SYSTEM, REVIEW_SYSTEM].contains(&system)
+                    {
+                        let value: Value = serde_json::from_str(content)?;
+                        return Ok(crate::evidence::verify(value, user).to_string());
+                    }
+                    return Ok(content.trim().to_owned());
+                }
+                Err(error) => diagnostics = format!("{diagnostics}; {error}"),
+            }
+        }
+    }
+    bail!("model output incomplete or invalid after 3 attempts: {diagnostics}")
+}
+
+fn validate_model_output(system: &str, user: &str, content: &str) -> Result<()> {
+    if system == DOC_REDUCE_SYSTEM {
+        let targets = user
+            .split("TARGET DOCUMENTS\n")
+            .nth(1)
+            .and_then(|text| text.split("\n\n").next())
+            .context("missing document targets")?;
+        let mut remaining = content.trim();
+        for path in targets.lines() {
+            let marker = format!("===== DOCUMENT: {path} =====");
+            let body = remaining
+                .strip_prefix(&marker)
+                .context("missing or reordered document boundary")?;
+            let (body, rest) = body
+                .split_once("===== END DOCUMENT =====")
+                .context("unfinished document")?;
+            if body.trim().is_empty() {
+                bail!("empty document");
+            }
+            remaining = rest.trim();
+        }
+        if !remaining.is_empty() {
+            bail!("unexpected text after documents");
+        }
+        return Ok(());
+    }
+    let (strings, arrays): (&[&str], &[&str]) = if system == ANALYZE_SYSTEM {
+        (
+            &["conclusion"],
+            &["findings", "risks", "actions", "read_next"],
+        )
+    } else if system == DEBUG_SYSTEM {
+        (
+            &["diagnosis", "confidence", "root_cause", "intermittency"],
+            &[
+                "evidence",
+                "execution_path",
+                "alternatives",
+                "verification",
+                "fix_area",
+                "read_next",
+            ],
+        )
+    } else if system == PLAN_SYSTEM {
+        (&["goal"], &["steps", "risks", "tests", "read_next"])
+    } else if system == REVIEW_SYSTEM {
+        (&["conclusion"], &["findings", "tests", "actions"])
+    } else if system == DISCOVERY_SYSTEM {
+        (&[], &["symbols", "files"])
+    } else if system == UPDATE_DOCS_SYSTEM {
+        let value: Value = serde_json::from_str(content).context("invalid document edit JSON")?;
+        serde_json::from_value::<crate::doc_edits::Updates>(value)?;
+        return Ok(());
+    } else {
+        return Ok(());
+    };
+    let value: Value = serde_json::from_str(content).context("invalid response JSON")?;
+    if !value.is_object() {
+        bail!("response must be an object");
+    }
+    for key in strings {
+        if !value.get(key).is_some_and(Value::is_string) {
+            bail!("missing string field {key}");
+        }
+    }
+    for key in arrays {
+        if !value.get(key).is_some_and(Value::is_array) {
+            bail!("missing array field {key}");
+        }
+    }
+    for key in arrays {
+        for item in value[*key].as_array().expect("array checked") {
+            if ["findings", "evidence"].contains(key) {
+                if !item.get("text").is_some_and(Value::is_string)
+                    || !item
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .is_some_and(|severity| {
+                            ["critical", "high", "medium", "low", "info"].contains(&severity)
+                        })
+                    || !item
+                        .get("evidence")
+                        .and_then(Value::as_array)
+                        .is_some_and(|refs| refs.iter().all(Value::is_string))
+                {
+                    bail!("invalid finding in {key}");
+                }
+            } else if *key == "read_next" {
+                if !["path", "symbol", "lines", "reason"]
+                    .iter()
+                    .all(|field| item.get(field).is_some_and(Value::is_string))
+                {
+                    bail!("invalid read_next item");
+                }
+            } else if *key == "symbols" {
+                if !item.get("path").is_some_and(Value::is_string)
+                    || !item.get("start_line").is_some_and(Value::is_u64)
+                    || !item.get("end_line").is_some_and(Value::is_u64)
+                {
+                    bail!("invalid discovery range");
+                }
+            } else if !item.is_string() {
+                bail!("invalid string list {key}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn source_filters(args: &Value) -> (Vec<String>, Vec<String>) {
@@ -923,6 +1132,19 @@ fn local_discovery_selection(
         return None;
     }
 
+    let exact = index
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol
+                .label
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(|name| name.contains('_') && task.split_whitespace().any(|word| word == name))
+        })
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return Some((vec![exact[0].clone()], Vec::new()));
+    }
     let mut symbols = index
         .symbols
         .iter()
@@ -935,7 +1157,10 @@ fn local_discovery_selection(
         .collect::<Vec<_>>();
     symbols.sort_by_key(|item| std::cmp::Reverse(item.0));
     if let Some((top_score, _)) = symbols.first()
-        && *top_score >= 8
+        && *top_score >= 16
+        && symbols
+            .get(1)
+            .is_none_or(|(second, _)| *second < *top_score)
     {
         let threshold = (*top_score / 2).max(4);
         let selected = symbols
@@ -957,7 +1182,8 @@ fn local_discovery_selection(
         .collect::<Vec<_>>();
     files.sort_by_key(|item| std::cmp::Reverse(item.0));
     if let Some((top_score, _)) = files.first()
-        && *top_score >= 5
+        && *top_score >= 10
+        && files.get(1).is_none_or(|(second, _)| *second < *top_score)
     {
         let selected = files
             .into_iter()
@@ -1059,8 +1285,20 @@ fn discover_deep_context(
         });
     }
 
-    let index =
-        workspace::discovery_index_for_task(root, requested, config, include, exclude, task)?;
+    let discovery_config = config.with_profile(config.discovery_profile.as_deref())?;
+    let discovery_output = 1200
+        .min(discovery_config.model_output_limit)
+        .min((discovery_config.model_input_limit / 4) as u32);
+    let discovery_config =
+        budgeted_config(&discovery_config, DISCOVERY_SYSTEM, task, discovery_output)?;
+    let index = workspace::discovery_index_for_task(
+        root,
+        requested,
+        &discovery_config,
+        include,
+        exclude,
+        task,
+    )?;
     if let Some(reporter) = reporter {
         reporter.record_cache_usage(index.cache_hits as u64, index.cache_misses as u64, 0, 0)?;
     }
@@ -1090,13 +1328,12 @@ fn discover_deep_context(
         "TASK\n{task}\n\nCANDIDATE FILE/SYMBOL INDEX\n{}\n\nINDEX_TRUNCATED\n{}\n\nSelect the smallest exact symbol ranges/files needed for a deep second pass. Return JSON only.",
         index.body, index.truncated
     );
-    let discovery_config = config.with_profile(config.discovery_profile.as_deref())?;
     let selection = chat_with_reporter(
         &discovery_config,
         DISCOVERY_SYSTEM,
         &prompt,
         ReasoningEffort::Low,
-        1_200,
+        discovery_output,
         reporter,
     )?;
     let (mut symbols, mut files) = parse_discovery_selection(&selection, &index);
@@ -1429,15 +1666,15 @@ fn debug_issue(
     // Reserve part of the configured source budget for runtime evidence so
     // logs/diffs do not silently make debug requests much larger than normal.
     let mut debug_context_config = config.clone();
-    debug_context_config.max_source_tokens = (config.max_source_tokens * 3 / 4).max(2_500);
+    debug_context_config.max_source_tokens = (config.max_source_tokens / 2).max(128);
     let auxiliary_budget = config
         .max_source_tokens
         .saturating_sub(debug_context_config.max_source_tokens)
-        .max(1_000);
-    let logs_budget = (auxiliary_budget / 2).clamp(500, 8_000);
+        .max(128);
+    let logs_budget = (auxiliary_budget / 2).clamp(64, 8_000);
     let diff_budget = auxiliary_budget
         .saturating_sub(logs_budget)
-        .clamp(500, 12_000);
+        .clamp(64, 12_000);
 
     let logs_for_prompt =
         workspace::truncate_tokens_strict(logs, logs_budget, "\n[DEBUG LOGS TRUNCATED]\n");
@@ -1599,30 +1836,89 @@ fn review_diff(
         .get("base_ref")
         .and_then(Value::as_str)
         .unwrap_or("HEAD");
-    let (status, diff, truncated) = workspace::git_diff(root, base_ref, config.max_source_tokens)?;
-    if let Some(reporter) = reporter {
-        reporter.record_context(workspace::estimate_tokens(&diff), 0, truncated)?;
+    let include_untracked = args
+        .get("include_untracked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (batches, omitted) =
+        workspace::review_batches(root, base_ref, include_untracked, config.max_source_tokens)?;
+    if batches.is_empty() && omitted.is_empty() {
+        return Ok("No eligible git diff found for review.".into());
     }
-    if diff.trim().is_empty() {
-        return Ok("No tracked git diff found for review.".to_owned());
+    let mut combined =
+        json!({"conclusion":"Batch review completed", "findings":[], "tests":[], "actions":[]});
+    for (index, batch) in batches.iter().enumerate() {
+        progress(
+            reporter,
+            "reviewing diff batches",
+            index as u64,
+            batches.len() as u64,
+        )?;
+        let prompt = format!(
+            "REVIEW TASK\n{task}\n\nDIFF AGAINST {base_ref}\nFILE {}\nBATCH {}/{}\n{}\n\nSURROUNDING CURRENT SOURCE\n{}\n\nReview only supplied evidence; an individual batch may contain part of a large diff. Return the required review JSON.",
+            batch.path,
+            index + 1,
+            batches.len(),
+            batch.diff,
+            batch.context
+        );
+        let result = chat_with_reporter(
+            config,
+            REVIEW_SYSTEM,
+            &prompt,
+            tool.reasoning,
+            tool.max_output_tokens,
+            reporter,
+        )?;
+        let value: Value = serde_json::from_str(&result)?;
+        for key in ["findings", "tests", "actions"] {
+            for item in value[key].as_array().context("missing review array")? {
+                let output = combined[key]
+                    .as_array_mut()
+                    .expect("review arrays initialized");
+                if !output.contains(item) {
+                    output.push(item.clone());
+                }
+            }
+        }
     }
-    progress(reporter, "reviewing", 1, 2)?;
-    let prompt = format!(
-        "REVIEW TASK\n{task}\n\nGIT STATUS\n{status}\n\nDIFF AGAINST\n{base_ref}\n\nDIFF\n{diff}\n\nDIFF_TRUNCATED\n{truncated}\n\nReturn critical/high/medium findings, missing tests, and recommended fixes.",
+    combined["findings"]
+        .as_array_mut()
+        .expect("findings initialized")
+        .sort_by_key(|item| match item["severity"].as_str().unwrap_or("") {
+            "critical" => 0,
+            "high" => 1,
+            "medium" => 2,
+            "low" => 3,
+            _ => 4,
+        });
+    let coverage = format!(
+        "REVIEW COVERAGE: {} batches reviewed; include_untracked={include_untracked}; omitted={}\n{}",
+        batches.len(),
+        omitted.len(),
+        omitted.join("\n")
     );
-    let result = chat_with_reporter(
-        config,
-        REVIEW_SYSTEM,
-        &prompt,
-        tool.reasoning,
-        tool.max_output_tokens,
+    if let Some(reporter) = reporter {
+        reporter.record_context(
+            batches
+                .iter()
+                .map(|b| {
+                    workspace::estimate_tokens(&b.diff) + workspace::estimate_tokens(&b.context)
+                })
+                .sum(),
+            batches.len(),
+            !omitted.is_empty(),
+        )?;
+    }
+    progress(
         reporter,
+        "finishing",
+        batches.len() as u64,
+        batches.len() as u64,
     )?;
-    progress(reporter, "finishing", 2, 2)?;
-    Ok(compact_primary_result(
-        &result,
-        tool.primary_return_or(1_000),
-        None,
+    Ok(format!(
+        "{coverage}\n\n{}",
+        compact_primary_result(&combined.to_string(), tool.primary_return_or(1000), None)
     ))
 }
 
@@ -1744,11 +2040,17 @@ fn document_repo(
         .unwrap_or("developer");
     let paths = paths_arg(args);
     let (include, exclude) = source_filters(args);
-    let chunks = workspace::collect_chunks_filtered(
+    let map_config = config.with_profile(config.map_profile.as_deref())?;
+    let map_tokens = (tool.max_output_tokens / 10)
+        .clamp(128, 1200)
+        .min(map_config.model_output_limit)
+        .min((map_config.model_input_limit / 4) as u32);
+    let map_config = budgeted_config(&map_config, DOC_MAP_SYSTEM, &args.to_string(), map_tokens)?;
+    let (chunks, coverage) = workspace::collect_chunks_filtered(
         root,
         &paths,
-        config,
-        config.max_source_tokens.min(MAX_CHUNK_TOKENS),
+        &map_config,
+        map_config.max_source_tokens.min(MAX_CHUNK_TOKENS),
         MAX_CHUNKS,
         &include,
         &exclude,
@@ -1756,11 +2058,11 @@ fn document_repo(
     if chunks.is_empty() {
         bail!("no readable source files found for documentation");
     }
+    let coverage_note = coverage.summary();
 
     // Repository-map summaries are evidence extraction, not final prose. Keeping
     // them compact dramatically reduces both map time and final Reduce context.
-    let map_tokens = (tool.max_output_tokens / 10).clamp(800, 1_200);
-    let map_config = config.with_profile(config.map_profile.as_deref())?;
+
     if let Some(reporter) = reporter {
         reporter.record_context(
             chunks
@@ -1897,62 +2199,43 @@ fn document_repo(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let summaries_budget = config.max_source_tokens;
+    let per_summary = summaries_budget.saturating_sub(workspace::estimate_tokens(&coverage_note))
+        / summaries.len().max(1);
+    let summaries_text = format!(
+        "{coverage_note}\n\n{}",
+        summaries
+            .iter()
+            .map(|summary| workspace::truncate_tokens_strict(
+                summary,
+                per_summary,
+                "[MAP SUMMARY TRUNCATED FOR SYNTHESIS]"
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
     let base_prompt = format!(
         "DOCUMENT TYPE\n{document_type}\n\nTARGET DOCUMENTS\n{}\n\nAUDIENCE\n{audience}\n\nOUTPUT LANGUAGE\n{language}\n\nREPOSITORY MANIFEST\n{manifest}\n\nREPOSITORY MAP SUMMARIES\n{}\n\nSCAN_TRUNCATED\n{scan_truncated}\n\nSynthesize the requested documentation. For full mode, return every target document as a complete Markdown document. For a single document type, return exactly that target document. Ground claims in the repository evidence and mark unknowns instead of guessing. Emit the final Markdown directly; do not spend the output budget restating your analysis.",
         document_targets(document_type),
-        summaries.join("\n\n"),
+        summaries_text,
     );
 
-    let attempts = reduce_reasoning_attempts(tool.reasoning);
-    let mut last_diagnostics = String::from("no response received");
-    for (attempt_index, effort) in attempts.iter().copied().enumerate() {
-        let stage = if attempt_index == 0 {
-            "synthesizing documentation"
-        } else {
-            "retrying synthesis with lower reasoning"
-        };
-        progress(reporter, stage, total_chunks as u64, total_steps)?;
-
-        let prompt = if attempt_index == 0 {
-            base_prompt.clone()
-        } else {
-            format!(
-                "{base_prompt}\n\nSYNTHESIS RETRY DIRECTIVE\nThe previous synthesis attempt exhausted or failed to produce final message content. Do not perform extended reasoning. Use the existing repository-map evidence and emit the requested final Markdown immediately."
-            )
-        };
-        let response = chat_detailed_with_reporter(
-            config,
-            DOC_REDUCE_SYSTEM,
-            &prompt,
-            effort,
-            tool.max_output_tokens,
-            reporter,
-        )?;
-        if let Some(content) = response.final_text() {
-            progress(reporter, "finishing", total_steps, total_steps)?;
-            return Ok(content.trim().to_owned());
-        }
-
-        last_diagnostics = response.diagnostics();
-        eprintln!(
-            "LLM2MCP document_repo Reduce attempt {} ({:?}) returned no final content: {}",
-            attempt_index + 1,
-            effort,
-            last_diagnostics
-        );
-        if !response.exhausted_before_final() {
-            eprintln!(
-                "LLM2MCP Reduce response was empty without a clear token-exhaustion signal; trying the next lower reasoning level if available"
-            );
-        }
-    }
-
-    let _ = progress(reporter, "reduce_failed", total_chunks as u64, total_steps);
-    bail!(
-        "document synthesis produced no final Markdown after {} reasoning attempt(s); last response: {}",
-        attempts.len(),
-        last_diagnostics
-    )
+    progress(
+        reporter,
+        "synthesizing documentation",
+        total_chunks as u64,
+        total_steps,
+    )?;
+    let content = chat_with_reporter(
+        config,
+        DOC_REDUCE_SYSTEM,
+        &base_prompt,
+        tool.reasoning,
+        tool.max_output_tokens,
+        reporter,
+    )?;
+    progress(reporter, "finishing", total_steps, total_steps)?;
+    Ok(format!("{coverage_note}\n\n{content}"))
 }
 
 fn update_docs(
@@ -1978,7 +2261,7 @@ fn update_docs(
         .and_then(Value::as_str)
         .unwrap_or("WORKTREE");
 
-    let per_side_tokens = (config.max_source_tokens / 2).max(2_500);
+    let per_side_tokens = (config.max_source_tokens / 2).max(128);
     let (diff, diff_truncated, comparison) = if target_ref.eq_ignore_ascii_case("WORKTREE") {
         let (_status, diff, truncated) = workspace::git_diff(root, base_ref, per_side_tokens)
             .context("update_docs requires a Git repository with a valid base_ref")?;
@@ -2003,23 +2286,32 @@ fn update_docs(
     } else {
         requested_docs
     };
-    let existing_docs = if doc_paths.is_empty() {
-        None
-    } else {
-        let mut docs_config = config.clone();
-        docs_config.max_source_tokens = per_side_tokens;
-        Some(workspace::collect(root, &doc_paths, &docs_config)?)
-    };
-
-    let (doc_list, doc_body, docs_truncated) = if let Some(docs) = existing_docs {
-        (docs.included_files.join("\n"), docs.body, docs.truncated)
-    } else {
-        (
-            "No existing README/docs Markdown files were discovered.".to_owned(),
-            String::new(),
-            false,
-        )
-    };
+    let preview_budget = (per_side_tokens / doc_paths.len().clamp(1, 64))
+        .min(config.max_file_tokens)
+        .max(64);
+    let snapshots = doc_paths
+        .iter()
+        .take(64)
+        .map(|path| workspace::document_snapshot(root, path, preview_budget))
+        .collect::<Result<Vec<_>>>()?;
+    let doc_list = snapshots
+        .iter()
+        .map(|doc| doc.path.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let doc_body = snapshots
+        .iter()
+        .map(|doc| {
+            serde_json::to_string(&json!({
+                "path":doc.path,"original_sha256":doc.hash,"preview":doc.visible
+            }))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n\n");
+    let docs_truncated = snapshots.len() < doc_paths.len()
+        || snapshots
+            .iter()
+            .any(|doc| doc.visible.contains("[DOCUMENT PREVIEW TRUNCATED]"));
 
     if let Some(reporter) = reporter {
         reporter.record_context(
@@ -2030,7 +2322,7 @@ fn update_docs(
     }
     progress(reporter, "updating documentation", 2, 3)?;
     let prompt = format!(
-        "COMPARISON\n{comparison}\n\nOUTPUT LANGUAGE\n{language}\n\nCODE DIFF\n{diff}\n\nDIFF_TRUNCATED\n{diff_truncated}\n\nEXISTING DOCUMENTS\n{doc_list}\n\nDOCUMENT CONTENT\n{doc_body}\n\nDOCS_TRUNCATED\n{docs_truncated}\n\nDetermine which documents are affected by the code changes. Return complete replacement Markdown only for documents that actually need changes. If a new document is clearly required, use a docs/*.md path and explain it through the document content itself.",
+        "COMPARISON\n{comparison}\n\nOUTPUT LANGUAGE\n{language}\n\nCODE DIFF\n{diff}\n\nDIFF_TRUNCATED\n{diff_truncated}\n\nEXISTING DOCUMENTS\n{doc_list}\n\nDOCUMENT SNAPSHOTS\n{doc_body}\n\nDOCS_TRUNCATED\n{docs_truncated}\n\nReturn exact local edits only for supplied source fragments affected by the code changes. Preserve every unseen original section. Return JSON in the system schema.",
     );
     let result = chat_with_reporter(
         config,
@@ -2040,8 +2332,19 @@ fn update_docs(
         tool.max_output_tokens,
         reporter,
     )?;
+    let updates = crate::doc_edits::validate(
+        json_object(&result).context("document update returned invalid JSON")?,
+        &snapshots,
+        root,
+    )?;
     progress(reporter, "finishing", 3, 3)?;
-    Ok(result)
+    Ok(serde_json::to_string_pretty(&json!({
+        "format":"llm2mcp-document-edits-v1", "edits":updates.edits,
+        "new_documents":updates.new_documents, "source_preview_truncated":docs_truncated,
+        "diff_truncated":diff_truncated,
+        "omitted_documents":doc_paths.iter().skip(64).collect::<Vec<_>>(),
+        "apply_instructions":"Before applying, verify each file's current SHA-256 equals original_sha256, then replace each old_text exactly once; preserve all other text. Reject stale files and overlapping edits. No files have been written."
+    }))?)
 }
 
 #[cfg(test)]
@@ -2158,6 +2461,48 @@ mod tests {
         assert!(files.is_empty());
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].path, "src/jobs.rs");
+    }
+
+    #[test]
+    fn output_validation_rejects_nested_schema_errors_and_unfinished_documents() {
+        let value = json!({"conclusion":"ok","findings":[{"text":"bug","severity":"high","evidence":"not an array"}],"risks":[],"actions":[],"read_next":[]});
+        assert!(validate_model_output(ANALYZE_SYSTEM, "", &value.to_string()).is_err());
+        let prompt = "TARGET DOCUMENTS\ndocs/PROJECT_OVERVIEW.md\n\n";
+        assert!(
+            validate_model_output(
+                DOC_REDUCE_SYSTEM,
+                prompt,
+                "===== DOCUMENT: docs/PROJECT_OVERVIEW.md =====\n# Partial"
+            )
+            .is_err()
+        );
+        assert!(validate_model_output(DOC_REDUCE_SYSTEM, prompt, "===== DOCUMENT: docs/PROJECT_OVERVIEW.md =====\n# Complete\n===== END DOCUMENT =====").is_ok());
+    }
+
+    #[test]
+    fn ambiguous_single_word_discovery_requires_reranking() {
+        let index = workspace::DiscoveryIndex {
+            body: String::new(),
+            candidate_files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            symbols: vec![
+                workspace::SymbolCandidate {
+                    path: "a.rs".into(),
+                    label: "fn login()".into(),
+                    start_line: 1,
+                    end_line: 2,
+                },
+                workspace::SymbolCandidate {
+                    path: "b.rs".into(),
+                    label: "fn login()".into(),
+                    start_line: 1,
+                    end_line: 2,
+                },
+            ],
+            truncated: false,
+            cache_hits: 0,
+            cache_misses: 0,
+        };
+        assert!(local_discovery_selection("login", &index).is_none());
     }
 
     #[test]
