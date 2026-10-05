@@ -490,6 +490,7 @@ pub fn manifest(workspace: &Path) -> Result<String> {
     Ok(files.join("\n"))
 }
 
+#[cfg(test)]
 pub fn collect(
     workspace: &Path,
     requested: &[String],
@@ -1167,6 +1168,30 @@ pub fn existing_document_paths(workspace: &Path) -> Result<Vec<String>> {
     }
 
     Ok(docs.into_iter().collect())
+}
+
+pub fn document_snapshot(
+    workspace: &Path,
+    relative: &str,
+    budget: usize,
+) -> Result<crate::doc_edits::Snapshot> {
+    let root = canonical_workspace(workspace)?;
+    let path = secure_path(&root, &root.join(relative))?;
+    if is_secret(&path)
+        || path.extension().and_then(|value| value.to_str()) != Some("md")
+        || fs::metadata(&path)?.len() > 8 * 1024 * 1024
+    {
+        bail!("document is sensitive, oversized or not Markdown: {relative}");
+    }
+    let original = fs::read_to_string(&path)?;
+    let masked = crate::privacy::redact(&original);
+    let visible = truncate_tokens_strict(&masked, budget, "\n[DOCUMENT PREVIEW TRUNCATED]\n");
+    Ok(crate::doc_edits::Snapshot {
+        path: normalized_relative(path.strip_prefix(&root)?),
+        hash: repo_cache::hash_bytes(original.as_bytes()),
+        original,
+        visible,
+    })
 }
 
 fn validate_git_ref(value: &str) -> Result<()> {

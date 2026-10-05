@@ -86,11 +86,8 @@ Do not claim files were written; the MCP is read-only."#;
 
 const UPDATE_DOCS_SYSTEM: &str = r#"You are updating software project documentation from a Git diff and the current documentation snapshot.
 Identify only documentation affected by the code changes. Preserve valid existing information, change stale sections, add genuinely new behavior, and avoid speculative statements.
-Return complete replacement Markdown only for documents that should change, each delimited exactly by:
-===== DOCUMENT: relative/path.md =====
-...content...
-===== END DOCUMENT =====
-If no documentation change is needed, say so explicitly. Do not claim files were written; the MCP is read-only."#;
+Return JSON only: {"edits":[{"path":"README.md","original_sha256":"copy supplied hash","old_text":"exact unique supplied fragment","new_text":"replacement fragment"}],"new_documents":[{"path":"docs/new.md","content":"complete new Markdown"}]}.
+Prefer small nonoverlapping exact edits; never replace an entire document from a truncated preview. Preserve unseen sections. Old text must come from the supplied preview and match the original exactly once. Use an empty edits array when unchanged. New documents are optional and must not already exist. Do not claim files were written; the MCP is read-only."#;
 
 pub fn run(workspace_path: &Path) -> Result<()> {
     let workspace = workspace_path
@@ -440,7 +437,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "update_docs",
-                "description": "Compare code changes with existing README/docs and return replacement Markdown only for documentation that should change. Defaults to asynchronous execution.",
+                "description": "Compare code changes with existing README/docs and return validated exact-fragment edits with original SHA-256 hashes, preserving unseen sections. Never writes files. Defaults to asynchronous execution.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2005,23 +2002,32 @@ fn update_docs(
     } else {
         requested_docs
     };
-    let existing_docs = if doc_paths.is_empty() {
-        None
-    } else {
-        let mut docs_config = config.clone();
-        docs_config.max_source_tokens = per_side_tokens;
-        Some(workspace::collect(root, &doc_paths, &docs_config)?)
-    };
-
-    let (doc_list, doc_body, docs_truncated) = if let Some(docs) = existing_docs {
-        (docs.included_files.join("\n"), docs.body, docs.truncated)
-    } else {
-        (
-            "No existing README/docs Markdown files were discovered.".to_owned(),
-            String::new(),
-            false,
-        )
-    };
+    let preview_budget = (per_side_tokens / doc_paths.len().clamp(1, 64))
+        .min(config.max_file_tokens)
+        .max(64);
+    let snapshots = doc_paths
+        .iter()
+        .take(64)
+        .map(|path| workspace::document_snapshot(root, path, preview_budget))
+        .collect::<Result<Vec<_>>>()?;
+    let doc_list = snapshots
+        .iter()
+        .map(|doc| doc.path.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let doc_body = snapshots
+        .iter()
+        .map(|doc| {
+            serde_json::to_string(&json!({
+                "path":doc.path,"original_sha256":doc.hash,"preview":doc.visible
+            }))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n\n");
+    let docs_truncated = snapshots.len() < doc_paths.len()
+        || snapshots
+            .iter()
+            .any(|doc| doc.visible.contains("[DOCUMENT PREVIEW TRUNCATED]"));
 
     if let Some(reporter) = reporter {
         reporter.record_context(
@@ -2032,7 +2038,7 @@ fn update_docs(
     }
     progress(reporter, "updating documentation", 2, 3)?;
     let prompt = format!(
-        "COMPARISON\n{comparison}\n\nOUTPUT LANGUAGE\n{language}\n\nCODE DIFF\n{diff}\n\nDIFF_TRUNCATED\n{diff_truncated}\n\nEXISTING DOCUMENTS\n{doc_list}\n\nDOCUMENT CONTENT\n{doc_body}\n\nDOCS_TRUNCATED\n{docs_truncated}\n\nDetermine which documents are affected by the code changes. Return complete replacement Markdown only for documents that actually need changes. If a new document is clearly required, use a docs/*.md path and explain it through the document content itself.",
+        "COMPARISON\n{comparison}\n\nOUTPUT LANGUAGE\n{language}\n\nCODE DIFF\n{diff}\n\nDIFF_TRUNCATED\n{diff_truncated}\n\nEXISTING DOCUMENTS\n{doc_list}\n\nDOCUMENT SNAPSHOTS\n{doc_body}\n\nDOCS_TRUNCATED\n{docs_truncated}\n\nReturn exact local edits only for supplied source fragments affected by the code changes. Preserve every unseen original section. Return JSON in the system schema.",
     );
     let result = chat_with_reporter(
         config,
@@ -2042,8 +2048,19 @@ fn update_docs(
         tool.max_output_tokens,
         reporter,
     )?;
+    let updates = crate::doc_edits::validate(
+        json_object(&result).context("document update returned invalid JSON")?,
+        &snapshots,
+        root,
+    )?;
     progress(reporter, "finishing", 3, 3)?;
-    Ok(result)
+    Ok(serde_json::to_string_pretty(&json!({
+        "format":"llm2mcp-document-edits-v1", "edits":updates.edits,
+        "new_documents":updates.new_documents, "source_preview_truncated":docs_truncated,
+        "diff_truncated":diff_truncated,
+        "omitted_documents":doc_paths.iter().skip(64).collect::<Vec<_>>(),
+        "apply_instructions":"Before applying, verify each file's current SHA-256 equals original_sha256, then replace each old_text exactly once; preserve all other text. Reject stale files and overlapping edits. No files have been written."
+    }))?)
 }
 
 #[cfg(test)]

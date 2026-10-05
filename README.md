@@ -277,7 +277,7 @@ The final Reduce pass defaults to **Medium** reasoning. If the configured reason
 
 ### `update_docs`
 
-Use `update_docs` after code changes when existing documentation may be stale. LLM2MCP reads the Git diff locally, discovers README/docs Markdown by default, and asks the configured LLM to return complete replacement Markdown only for affected documents. This tool requires the workspace to be a Git repository with the referenced commits/tags available.
+Use `update_docs` after code changes when existing documentation may be stale. LLM2MCP reads the Git diff locally, discovers README/docs Markdown by default, and returns validated exact-fragment edits with original SHA-256 hashes. Unseen original sections are preserved. Check each hash before applying edits; see [safe update format](docs/INTEGRITY.md). This tool requires the workspace to be a Git repository with the referenced commits/tags available.
 
 Parameters:
 

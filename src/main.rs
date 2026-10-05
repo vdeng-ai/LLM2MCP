@@ -4,6 +4,7 @@ mod config;
 mod control;
 mod cursor;
 mod doc_cache;
+mod doc_edits;
 mod doctor;
 mod gui;
 mod i18n;

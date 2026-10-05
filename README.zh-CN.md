@@ -278,7 +278,7 @@ LLM2MCP 仍然保持只读。生成内容使用 `===== DOCUMENT: path =====` 分
 
 ### `update_docs`
 
-代码发生变化、怀疑 README 或 docs 已经过时时使用 `update_docs`。LLM2MCP 会在本机读取 Git diff，默认自动发现 README 和 `docs/**/*.md`，只让辅助 LLM 返回真正受影响文档的完整替换 Markdown。这个工具要求当前 workspace 是 Git 仓库，并且指定的 commit/tag/ref 可以访问。
+代码发生变化、怀疑 README 或 docs 已经过时时使用 `update_docs`。LLM2MCP 会在本机读取 Git diff，默认自动发现 README 和 `docs/**/*.md`，返回经过验证、带原文 SHA-256 的精确片段修改，保留未读取的原章节。应用前必须检查原文哈希；详见[安全更新格式](docs/INTEGRITY.md)。这个工具要求当前 workspace 是 Git 仓库，并且指定的 commit/tag/ref 可以访问。
 
 参数：
 
