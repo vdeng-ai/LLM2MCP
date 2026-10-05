@@ -30,6 +30,12 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 
 See [runtime configuration and usage](docs/RUNTIME.md) for examples, migration, measurements and limits.
 
+## Context integrity in 0.3
+
+Complete-file scanning and batched diff review expose coverage instead of silently dropping late evidence. Output validation rejects incomplete results; source budgets follow each routed model. `update_docs` produces hashed exact-fragment edits that preserve unseen document sections.
+
+See [integrity and migration](docs/INTEGRITY.md), [paired effectiveness evaluation](docs/EVALUATION.md), and [deep MCP/host diagnostics](docs/DIAGNOSTICS.md).
+
 ## Installation
 
 Download the package for your platform from GitHub Releases. Ubuntu/Debian x86_64 users can use the native `.deb` package:

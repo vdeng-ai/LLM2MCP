@@ -31,3 +31,7 @@ Real-model evaluation is opt-in and uses the operator's configured APIs. A repro
 8. `feat: add paired effectiveness evaluation tooling`
 9. `feat: verify MCP tool and task lifecycles in diagnostics`
 10. `release: publish LLM2MCP 0.3.0`
+
+## Implementation status
+
+Stages 1–9 are implemented in sequential commits. A subsequent integration fix tightens nested output schemas and cleans synthetic diagnostic handles on failure. The release change runs the final local suite and reusable cross-platform CI before packaging/publishing. Local validation: 58 Rust unit tests, 14 MCP end-to-end tests, 2 paired-evaluation tests, formatting and warning-free Clippy. Private real-model and actual-host evaluation remain operator-run checks, documented in EVALUATION.md and DIAGNOSTICS.md.

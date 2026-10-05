@@ -1,6 +1,6 @@
 # LLM2MCP Release Guide
 
-LLM2MCP uses a tag-driven GitHub Actions release pipeline. A tag such as `v0.2.0` must exactly match `package.version = "0.2.0"` in `Cargo.toml`.
+LLM2MCP releases through GitHub Actions after Linux, Windows and macOS regression gates. A version tag must match `Cargo.toml`. Alternatively, merge a matching `release.json` version request into `main`; the workflow creates the matching tag and publishes signed artifacts from that exact commit.
 
 ## Release outputs
 
@@ -87,23 +87,25 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-4. Commit and push `main`.
-5. Create and push the matching tag:
+4. Set `release.json` to the same version, update the version-specific release notes used by the workflow, and commit the changes.
+5. Merge/push to `main`. A change to `release.json` starts the full release pipeline; the tag is created only after all checks and packaging pass. A manually pushed matching tag remains supported:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
-The `Release` workflow then performs preflight validation, builds all platform packages, generates `latest.json` and `SHA256SUMS`, and creates the GitHub Release with generated release notes.
+The `Release` workflow then performs preflight validation, builds all platform packages, generates `latest.json` and `SHA256SUMS`, and creates the GitHub Release with the reviewed release notes. New releases are staged as drafts until artifact upload completes.
 
 ## 3. CI and release jobs
 
 `.github/workflows/ci.yml` runs tests on Linux, Windows, and macOS for normal pushes and pull requests, plus format/Clippy checks on Linux.
 
-`.github/workflows/release.yml` runs only for version tags and contains:
+`.github/workflows/release.yml` runs for version tags or a changed `release.json` on `main` and contains:
 
-- `preflight` — tag/version and updater-key validation.
+- `verification` — reusable CI gates: Rust tests on Linux/Windows/macOS, format, Clippy, and paired-evaluation HTTP/MCP tests.
+
+- `preflight` — release-request/version and updater-key validation.
 - `linux` — Ubuntu 22.04 x86_64 AppImage + `.deb`. Ubuntu 22.04 is intentionally used for a conservative glibc baseline, so the `.deb` is compatible with Ubuntu 24.04 while retaining support for 22.04-era glibc.
 - `windows` — Windows x86_64 NSIS installer.
 - `macos` — native Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) builds, producing `.app.tar.gz` updater bundles and DMGs.

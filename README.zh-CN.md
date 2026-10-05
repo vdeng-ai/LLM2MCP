@@ -30,6 +30,12 @@ LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也�
 
 配置示例、兼容迁移、使用方法和指标解释见 [运行与诊断指南](docs/RUNTIME.md)。
 
+## 0.3 上下文完整性改进
+
+完整大文件分段扫描、分批 diff 审查会明确报告覆盖范围和遗漏；输出校验拒绝半截结果，源码预算按各路由模型计算。`update_docs` 返回携带原文哈希的精确片段修改，保留未显示的文档内容。
+
+使用和迁移说明见 [完整性指南](docs/INTEGRITY.md)、[成对效果评测](docs/EVALUATION.md) 和 [MCP 深度诊断与 Host 验证](docs/DIAGNOSTICS.md)。
+
 ## 安装
 
 从 GitHub Releases 下载对应平台安装包。Ubuntu / Debian x86_64 用户可以直接使用原生 `.deb`：

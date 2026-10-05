@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -63,7 +64,7 @@ class EvaluationTest(unittest.TestCase):
                 env.update(LLM2MCP_CONFIG_DIR=str(config), LLM2MCP_DATA_DIR=str(root / "data"))
                 for key in ("LLM2MCP_BASE_URL", "LLM2MCP_MODEL", "LLM2MCP_API_KEY"):
                     env.pop(key, None)
-                subprocess.run(["python3", str(Path(paired.__file__).resolve()), "--cases", str(cases),
+                subprocess.run([sys.executable, str(Path(paired.__file__).resolve()), "--cases", str(cases),
                                 "--executable", env["LLM2MCP_TEST_BINARY"], "--primary-url", url, "--primary-model", "primary",
                                 "--run", "--repeats", "1", "--output", str(output), "--timeout", "15"], env=env, check=True)
                 rows = [json.loads(line) for line in output.read_text().splitlines()]
