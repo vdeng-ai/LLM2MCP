@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,7 +11,7 @@ use std::{
 use crate::{config::AppConfig, workspace::CollectedSource};
 
 /// Bump this whenever the repository-map prompt semantics change.
-pub const MAP_CACHE_VERSION: &str = "repo-map-v2";
+pub const MAP_CACHE_VERSION: &str = "repo-map-v3";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn map_key(config: &AppConfig, map_tokens: u32, chunk: &CollectedSource) -> String {
@@ -23,9 +22,16 @@ pub fn map_key(config: &AppConfig, map_tokens: u32, chunk: &CollectedSource) -> 
     hasher.update([0]);
     hasher.update(config.model.as_bytes());
     hasher.update([0]);
+    hasher.update(config.system_prompt_prefix.trim().as_bytes());
+    hasher.update([0]);
+    hasher.update(crate::mcp::DOC_MAP_SYSTEM.as_bytes());
+    hasher.update([0]);
     hasher.update(format!("{:?}", config.reasoning_transport).as_bytes());
     hasher.update([0]);
     hasher.update(config.temperature.to_le_bytes());
+    hasher.update([u8::from(config.send_temperature)]);
+    hasher.update(config.completion_token_parameter.as_bytes());
+    hasher.update(config.model_output_limit.to_le_bytes());
     hasher.update(map_tokens.to_le_bytes());
     for path in &chunk.included_files {
         hasher.update(path.as_bytes());
@@ -93,10 +99,8 @@ pub fn store_summary(key: &str, summary: &str) -> Result<()> {
 }
 
 fn summary_path(key: &str) -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("ai", "LLM2MCP", "LLM2MCP")
-        .context("cannot resolve LLM2MCP data directory")?;
-    Ok(dirs
-        .data_local_dir()
+    let data_dir = crate::config::data_dir()?;
+    Ok(data_dir
         .join("repo-map-cache")
         .join(MAP_CACHE_VERSION)
         .join(format!("{key}.md")))
@@ -126,5 +130,11 @@ mod tests {
         let c = map_key(&config, 1_200, &chunk("fn main() {}"));
         assert_ne!(a, b);
         assert_ne!(a, c);
+        let mut changed = config.clone();
+        changed.system_prompt_prefix = "Team conventions".to_owned();
+        assert_ne!(a, map_key(&changed, 1_000, &chunk("fn main() {}")));
+        changed = config.clone();
+        changed.send_temperature = false;
+        assert_ne!(a, map_key(&changed, 1_000, &chunk("fn main() {}")));
     }
 }

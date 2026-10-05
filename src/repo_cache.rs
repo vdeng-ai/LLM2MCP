@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,8 +13,8 @@ use std::{
 
 use crate::workspace::SymbolCandidate;
 
-pub const SYMBOL_INDEX_VERSION: &str = "repo-symbol-index-v1";
-pub const EVIDENCE_CACHE_VERSION: &str = "repo-evidence-v1";
+pub const SYMBOL_INDEX_VERSION: &str = "repo-symbol-index-v3";
+pub const EVIDENCE_CACHE_VERSION: &str = "repo-evidence-v2";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +29,8 @@ pub struct CachedFileIndex {
     pub content_hash: String,
     pub total_lines: usize,
     pub symbols: Vec<SymbolCandidate>,
+    #[serde(default)]
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,9 +170,8 @@ fn workspace_key(workspace: &Path) -> String {
 }
 
 fn cache_root() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("ai", "LLM2MCP", "LLM2MCP")
-        .context("cannot resolve LLM2MCP data directory")?;
-    let root = dirs.data_local_dir().join("repository-cache");
+    let data_dir = crate::config::data_dir()?;
+    let root = data_dir.join("repository-cache");
     fs::create_dir_all(&root)?;
     secure_directory(&root)?;
     Ok(root)

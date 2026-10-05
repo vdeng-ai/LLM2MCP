@@ -72,7 +72,7 @@ Return JSON only, with no Markdown or code fences, in this shape:
 {"conclusion":"...","findings":[{"severity":"critical|high|medium|low","text":"...","evidence":["path or diff hunk"]}],"tests":["..."],"actions":["..."]}.
 Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
 
-const DOC_MAP_SYSTEM: &str = r#"You are mapping one chunk of a software repository for a later documentation synthesis step.
+pub(crate) const DOC_MAP_SYSTEM: &str = r#"You are mapping one chunk of a software repository for a later documentation synthesis step.
 Extract only evidence useful for accurate project documentation: responsibilities, entry points, important modules and symbols, data/control flow, APIs, configuration, persistence, integrations, build/deploy behavior, and notable constraints.
 Cite concrete file paths and symbols. Do not invent missing behavior. Do not write the final project documentation yet. Keep the chunk summary compact and structured; target roughly 800-1000 tokens and prioritize evidence over prose."#;
 
@@ -93,80 +93,149 @@ Return complete replacement Markdown only for documents that should change, each
 If no documentation change is needed, say so explicitly. Do not claim files were written; the MCP is read-only."#;
 
 pub fn run(workspace_path: &Path) -> Result<()> {
-    let config = config::load().context("failed to load LLM2MCP configuration")?;
     let workspace = workspace_path
         .canonicalize()
         .with_context(|| format!("invalid workspace: {}", workspace_path.display()))?;
+    let _ = jobs::recover_stale();
     let _ = jobs::cleanup_expired();
-
-    eprintln!("LLM2MCP MCP started for {}", workspace.display());
-
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("invalid MCP JSON: {error}");
+    let active = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        crate::control::Control,
+    >::new()));
+    thread::scope(|scope| -> Result<()> {
+        for line in io::stdin().lock().lines() {
+            let line = line?;
+            if line.trim().is_empty() {
                 continue;
             }
-        };
-
-        let Some(id) = request.get("id").cloned() else {
-            continue;
-        };
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let result: std::result::Result<Value, RpcFailure> = match method {
-            "initialize" => Ok(initialize_result(&request)),
-            "server/discover" => Ok(server_discover_result()),
-            "ping" => Ok(json!({"resultType": "complete"})),
-            "tools/list" => Ok(tools_list()),
-            "tools/call" => {
-                call_tool(&config, &workspace, request.get("params")).map_err(RpcFailure::internal)
+            let request: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    send_reply(
+                        &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}),
+                    )?;
+                    continue;
+                }
+            };
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "notifications/cancelled" {
+                if let Some(id) = request.pointer("/params/requestId")
+                    && let Some(control) = active.lock().unwrap().get(&id.to_string())
+                {
+                    control.cancel();
+                }
+                continue;
             }
-            "tasks/get" => tasks_get(request.get("params")),
-            "tasks/cancel" => tasks_cancel(request.get("params")),
-            "tasks/update" => tasks_update(request.get("params")),
-            _ => Err(RpcFailure::new(
-                -32601,
-                format!("method not found: {method}"),
-            )),
-        };
-
-        let response = match result {
-            Ok(mut result) => {
-                stamp_modern_server_info(&request, &mut result);
-                json!({"jsonrpc": "2.0", "id": id, "result": result})
+            let Some(id) = request.get("id") else {
+                continue;
+            };
+            let business = method == "tools/call"
+                && !matches!(
+                    request.pointer("/params/name").and_then(Value::as_str),
+                    Some("job_status" | "job_result" | "job_cancel")
+                );
+            if !business {
+                send_reply(&rpc_response(&workspace, &request))?;
+                continue;
             }
-            Err(error) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": error.code, "message": error.message}
-            }),
-        };
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-    }
+            let key = id.to_string();
+            let control = crate::control::Control::default();
+            {
+                let mut active = active.lock().unwrap();
+                if active.len() >= 8 || active.contains_key(&key) {
+                    send_reply(
+                        &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"server busy or duplicate request id; retry later"}}),
+                    )?;
+                    continue;
+                }
+                active.insert(key.clone(), control.clone());
+            }
+            let active = active.clone();
+            let root = &workspace;
+            scope.spawn(move || { control.set_current(); let reply = std::panic::catch_unwind(|| rpc_response(root, &request)).unwrap_or_else(|_| json!({"jsonrpc":"2.0","id":request.get("id"),"error":{"code":-32603,"message":"request worker failed"}})); let _ = send_reply(&reply); active.lock().unwrap().remove(&key); });
+        }
+        for control in active.lock().unwrap().values() {
+            control.cancel();
+        }
+        Ok(())
+    })
+}
+fn send_reply(reply: &Value) -> Result<()> {
+    let mut output = io::stdout().lock();
+    serde_json::to_writer(&mut output, reply)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
     Ok(())
+}
+fn rpc_response(root: &Path, request: &Value) -> Value {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let result: std::result::Result<Value, RpcFailure> = match method {
+        "initialize" => Ok(initialize_result(request)),
+        "server/discover" => Ok(server_discover_result()),
+        "ping" => Ok(json!({"resultType":"complete"})),
+        "tools/list" => Ok(tools_list()),
+        "tools/call" => config::load()
+            .map_err(RpcFailure::internal)
+            .and_then(|config| {
+                call_tool(&config, root, request.get("params")).map_err(RpcFailure::internal)
+            }),
+        "tasks/get" => tasks_get(request.get("params")),
+        "tasks/cancel" => tasks_cancel(request.get("params")),
+        "tasks/update" => tasks_update(request.get("params")),
+        _ => Err(RpcFailure::new(
+            -32601,
+            format!("method not found: {method}"),
+        )),
+    };
+    match result {
+        Ok(mut result) => {
+            stamp_modern_server_info(request, &mut result);
+            json!({"jsonrpc":"2.0","id":request.get("id"),"result":result})
+        }
+        Err(error) => {
+            json!({"jsonrpc":"2.0","id":request.get("id"),"error":{"code":error.code,"message":crate::privacy::redact(&error.message)}})
+        }
+    }
 }
 
 pub fn run_job_worker(job_id: &str) -> Result<()> {
+    let _lease = jobs::worker_lease(job_id)?;
     let record = jobs::load(job_id)?;
+    if record.state != JobState::Working {
+        return Ok(());
+    }
+    let _heartbeat = jobs::start_heartbeat(job_id)?;
+    let control = crate::control::Control::default().with_job(job_id);
+    control.set_current();
     if record.cancel_requested || record.state == JobState::Cancelled {
         jobs::mark_cancelled(job_id)?;
         return Ok(());
     }
 
-    let config = config::load().context("failed to load LLM2MCP configuration")?;
+    let current = config::load().context("failed to load LLM2MCP configuration")?;
+    let mut config = record
+        .config_snapshot
+        .clone()
+        .unwrap_or_else(|| current.clone());
+    config.restore_credentials(&current);
+    config.max_concurrent_jobs = current.max_concurrent_jobs;
+    config.max_concurrent_requests = current.max_concurrent_requests;
     let reporter = Reporter::new(job_id);
+    reporter.update("queued", 0, 0)?;
+    let _slot =
+        match crate::scheduler::Slot::acquire("worker", config.max_concurrent_jobs, &control) {
+            Ok(slot) => slot,
+            Err(error) => {
+                jobs::fail(job_id, &format!("{error:#}"))?;
+                return Ok(());
+            }
+        };
     reporter.update("starting", 0, 0)?;
 
     let result = execute_business_inner(
@@ -433,6 +502,7 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
     }
 
     let tool = tool_config(config, name)?;
+    let _ = crate::cache::maintain(config.cache_max_mib, config.cache_ttl_days, false);
     let execution = effective_execution(name, tool, root, &args);
     if execution == ExecutionMode::Async {
         let record = jobs::create(
@@ -448,15 +518,33 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
         return Ok(jobs::fallback_started_result(&record));
     }
 
-    Ok(
-        match execute_business_inner(config, root, name, &args, None) {
-            Ok(text) => tool_result(text, false),
-            Err(error) => {
-                eprintln!("tool {name} failed: {error:#}");
-                tool_result(format_business_error(&error), true)
+    let record = jobs::create_sync(
+        name,
+        root,
+        args.clone(),
+        config.job_ttl_hours,
+        config.job_poll_interval_ms,
+    )?;
+    let _heartbeat = jobs::start_heartbeat(&record.id)?;
+    let control = crate::control::Control::current().with_job(&record.id);
+    control.set_current();
+    let reporter = Reporter::new(&record.id);
+    let result = crate::scheduler::Slot::acquire("worker", config.max_concurrent_jobs, &control)
+        .and_then(|_slot| execute_business_inner(config, root, name, &args, Some(&reporter)));
+    match result {
+        Ok(text) => {
+            let result = tool_result(text, false);
+            jobs::complete(&record.id, result.clone())?;
+            Ok(result)
+        }
+        Err(error) => {
+            if control.check().is_err() {
+                jobs::cancel(&record.id)?;
             }
-        },
-    )
+            jobs::fail(&record.id, &format_business_error(&error))?;
+            Ok(tool_result(format_business_error(&error), true))
+        }
+    }
 }
 
 fn tool_config<'a>(config: &'a AppConfig, name: &str) -> Result<&'a ToolConfig> {
@@ -494,6 +582,9 @@ fn effective_execution(name: &str, tool: &ToolConfig, root: &Path, args: &Value)
 }
 
 fn auto_should_async(name: &str, root: &Path, args: &Value) -> bool {
+    if matches!(name, "analyze" | "plan" | "debug_issue") && paths_arg(args).is_empty() {
+        return true;
+    }
     if matches!(name, "document_repo" | "update_docs") {
         return true;
     }
@@ -573,6 +664,7 @@ fn task_id_from_params<'a>(
 }
 
 fn load_task_for_rpc(job_id: &str) -> std::result::Result<jobs::JobRecord, RpcFailure> {
+    jobs::recover_stale().map_err(RpcFailure::internal)?;
     jobs::load(job_id).map_err(|error| RpcFailure::new(-32602, error.to_string()))
 }
 
@@ -607,6 +699,7 @@ fn job_id_arg(args: &Value) -> Result<&str> {
 }
 
 fn job_status(args: &Value) -> Result<Value> {
+    jobs::recover_stale()?;
     Ok(jobs::fallback_status_result(&jobs::load(job_id_arg(
         args,
     )?)?))
@@ -645,6 +738,8 @@ fn execute_business_inner(
     args: &Value,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
+    let routed = config.for_tool(name)?;
+    let config = &routed;
     match name {
         "analyze" => analyze(config, root, args, &config.tools.analyze, reporter),
         "debug_issue" => debug_issue(config, root, args, &config.tools.debug_issue, reporter),
@@ -688,14 +783,20 @@ fn task_arg(args: &Value) -> Result<&str> {
 }
 
 fn progress(reporter: Option<&Reporter>, stage: &str, done: u64, total: u64) -> Result<()> {
+    crate::control::Control::current().check()?;
     if let Some(reporter) = reporter {
         reporter.update(stage, done, total)?;
     }
     Ok(())
 }
 
-fn record_response(reporter: Option<&Reporter>, response: &llm::ChatResponse) -> Result<()> {
+fn record_response(
+    reporter: Option<&Reporter>,
+    response: &llm::ChatResponse,
+    config: &AppConfig,
+) -> Result<()> {
     if let Some(reporter) = reporter {
+        reporter.record_cost(response.prompt_tokens, response.completion_tokens, config)?;
         reporter.record_llm_usage(
             response.prompt_tokens,
             response.completion_tokens,
@@ -716,8 +817,13 @@ fn chat_detailed_with_reporter(
     if let Some(reporter) = reporter {
         reporter.record_llm_attempt()?;
     }
-    let response = llm::chat_detailed(config, system, user, effort, max_output_tokens)?;
-    record_response(reporter, &response)?;
+    let started = std::time::Instant::now();
+    let result = llm::chat_detailed(config, system, user, effort, max_output_tokens);
+    if let Some(reporter) = reporter {
+        reporter.record_wait(started.elapsed().as_millis() as u64, &config.model)?;
+    }
+    let response = result?;
+    record_response(reporter, &response, config)?;
     Ok(response)
 }
 
@@ -789,44 +895,7 @@ fn should_discover(root: &Path, requested: &[String]) -> bool {
 }
 
 fn task_keywords(task: &str) -> Vec<String> {
-    const STOP_WORDS: &[&str] = &[
-        "the",
-        "and",
-        "for",
-        "with",
-        "from",
-        "this",
-        "that",
-        "into",
-        "what",
-        "why",
-        "how",
-        "find",
-        "fix",
-        "plan",
-        "analyze",
-        "review",
-        "implement",
-        "implementation",
-        "code",
-        "project",
-        "issue",
-        "problem",
-        "need",
-        "should",
-        "could",
-        "would",
-    ];
-    let mut keywords = task
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .map(str::trim)
-        .filter(|word| word.len() >= 3)
-        .map(str::to_ascii_lowercase)
-        .filter(|word| !STOP_WORDS.contains(&word.as_str()))
-        .collect::<Vec<_>>();
-    keywords.sort();
-    keywords.dedup();
-    keywords
+    crate::search::keywords(task)
 }
 
 fn lexical_score(keywords: &[String], text: &str, weight: u32) -> u32 {
@@ -983,7 +1052,8 @@ fn discover_deep_context(
         });
     }
 
-    let index = workspace::discovery_index(root, requested, config, include, exclude)?;
+    let index =
+        workspace::discovery_index_for_task(root, requested, config, include, exclude, task)?;
     if let Some(reporter) = reporter {
         reporter.record_cache_usage(index.cache_hits as u64, index.cache_misses as u64, 0, 0)?;
     }
@@ -1013,8 +1083,9 @@ fn discover_deep_context(
         "TASK\n{task}\n\nCANDIDATE FILE/SYMBOL INDEX\n{}\n\nINDEX_TRUNCATED\n{}\n\nSelect the smallest exact symbol ranges/files needed for a deep second pass. Return JSON only.",
         index.body, index.truncated
     );
+    let discovery_config = config.with_profile(config.discovery_profile.as_deref())?;
     let selection = chat_with_reporter(
-        config,
+        &discovery_config,
         DISCOVERY_SYSTEM,
         &prompt,
         ReasoningEffort::Low,
@@ -1286,6 +1357,11 @@ fn analyze(
     progress(reporter, "collecting selected context", 1, 3)?;
     let sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
+        reporter.record_context(
+            workspace::estimate_tokens(&sources.body),
+            sources.included_files.len(),
+            sources.truncated,
+        )?;
         reporter.record_cache_usage(
             0,
             0,
@@ -1397,6 +1473,11 @@ fn debug_issue(
     let sources =
         collect_deep_selection(&debug_context_config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
+        reporter.record_context(
+            workspace::estimate_tokens(&sources.body),
+            sources.included_files.len(),
+            sources.truncated,
+        )?;
         reporter.record_cache_usage(
             0,
             0,
@@ -1452,6 +1533,11 @@ fn plan(
     progress(reporter, "collecting selected context", 1, 3)?;
     let sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
+        reporter.record_context(
+            workspace::estimate_tokens(&sources.body),
+            sources.included_files.len(),
+            sources.truncated,
+        )?;
         reporter.record_cache_usage(
             0,
             0,
@@ -1507,6 +1593,9 @@ fn review_diff(
         .and_then(Value::as_str)
         .unwrap_or("HEAD");
     let (status, diff, truncated) = workspace::git_diff(root, base_ref, config.max_source_tokens)?;
+    if let Some(reporter) = reporter {
+        reporter.record_context(workspace::estimate_tokens(&diff), 0, truncated)?;
+    }
     if diff.trim().is_empty() {
         return Ok("No tracked git diff found for review.".to_owned());
     }
@@ -1664,6 +1753,21 @@ fn document_repo(
     // Repository-map summaries are evidence extraction, not final prose. Keeping
     // them compact dramatically reduces both map time and final Reduce context.
     let map_tokens = (tool.max_output_tokens / 10).clamp(800, 1_200);
+    let map_config = config.with_profile(config.map_profile.as_deref())?;
+    if let Some(reporter) = reporter {
+        reporter.record_context(
+            chunks
+                .iter()
+                .map(|chunk| workspace::estimate_tokens(&chunk.body))
+                .sum(),
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.included_files.iter())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            chunks.iter().any(|chunk| chunk.truncated),
+        )?;
+    }
     let total_chunks = chunks.len();
     let total_steps = total_chunks as u64 + 1;
     let scan_truncated = chunks.iter().any(|chunk| chunk.truncated);
@@ -1678,7 +1782,7 @@ fn document_repo(
     let mut completed = 0usize;
 
     for (index, chunk) in chunks.iter().enumerate() {
-        let key = doc_cache::map_key(config, map_tokens, chunk);
+        let key = doc_cache::map_key(&map_config, map_tokens, chunk);
         match doc_cache::load_summary(&key) {
             Ok(Some(summary)) => {
                 summaries[index] = Some(summary);
@@ -1719,7 +1823,10 @@ fn document_repo(
                 let index = *index;
                 let key = key.clone();
                 let chunk = &chunks[index];
+                let map_config = &map_config;
+                let control = crate::control::Control::current();
                 handles.push(scope.spawn(move || -> Result<(usize, String)> {
+                    control.set_current();
                     eprintln!(
                         "LLM2MCP document_repo mapping chunk {}/{} ({} files)",
                         index + 1,
@@ -1727,7 +1834,7 @@ fn document_repo(
                         chunk.included_files.len()
                     );
                     let summary = map_repository_chunk(
-                        config,
+                        map_config,
                         chunk,
                         index,
                         total_chunks,
@@ -1907,6 +2014,13 @@ fn update_docs(
         )
     };
 
+    if let Some(reporter) = reporter {
+        reporter.record_context(
+            workspace::estimate_tokens(&diff).saturating_add(workspace::estimate_tokens(&doc_body)),
+            doc_paths.len(),
+            diff_truncated || docs_truncated,
+        )?;
+    }
     progress(reporter, "updating documentation", 2, 3)?;
     let prompt = format!(
         "COMPARISON\n{comparison}\n\nOUTPUT LANGUAGE\n{language}\n\nCODE DIFF\n{diff}\n\nDIFF_TRUNCATED\n{diff_truncated}\n\nEXISTING DOCUMENTS\n{doc_list}\n\nDOCUMENT CONTENT\n{doc_body}\n\nDOCS_TRUNCATED\n{docs_truncated}\n\nDetermine which documents are affected by the code changes. Return complete replacement Markdown only for documents that actually need changes. If a new document is clearly required, use a docs/*.md path and explain it through the document content itself.",

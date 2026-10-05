@@ -97,6 +97,14 @@ fn secure_path(root: &Path, candidate: &Path) -> Result<PathBuf> {
 }
 
 fn is_secret(path: &Path) -> bool {
+    if path.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some(".aws" | ".ssh" | ".gnupg" | ".git")
+        )
+    }) {
+        return true;
+    }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return true;
     };
@@ -224,11 +232,14 @@ pub fn truncate_tokens_strict(text: &str, max_tokens: usize, marker: &str) -> St
 }
 
 fn read_text_tokens(path: &Path, max_tokens: usize) -> Result<String> {
+    if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
+        bail!("file exceeds 8 MiB source limit");
+    }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
         bail!("binary file skipped: {}", path.display());
     }
-    let text = String::from_utf8_lossy(&bytes);
+    let text = crate::privacy::redact(&String::from_utf8_lossy(&bytes));
     Ok(truncate_to_token_budget(&text, max_tokens, "\n\n[FILE TRUNCATED]\n").0)
 }
 
@@ -334,6 +345,7 @@ fn requested_files(
     }
 
     for item in requested {
+        crate::control::Control::current().check()?;
         let target = secure_path(root, &root.join(item))?;
         if target.is_file() {
             let relative = normalized_relative(target.strip_prefix(root).unwrap_or(&target));
@@ -353,6 +365,7 @@ fn requested_files(
             .build()
             .filter_map(Result::ok)
         {
+            crate::control::Control::current().check()?;
             let path = entry.path();
             if path.is_file() && !is_secret(path) && looks_text(path) {
                 let resolved = secure_path(root, path)?;
@@ -386,7 +399,11 @@ pub fn manifest(workspace: &Path) -> Result<String> {
         && output.status.success()
     {
         let text = String::from_utf8_lossy(&output.stdout);
-        let lines = text.lines().take(2000).collect::<Vec<_>>();
+        let lines = text
+            .lines()
+            .filter(|line| !is_secret(Path::new(line)))
+            .take(2000)
+            .collect::<Vec<_>>();
         if !lines.is_empty() {
             return Ok(lines.join("\n"));
         }
@@ -441,7 +458,9 @@ pub fn collect_filtered(
         .max_file_tokens
         .min(config.max_source_tokens.saturating_sub(250).max(500));
     for file in files {
+        crate::control::Control::current().check()?;
         let Ok((relative, chunk)) = file_chunk(&root, &file, per_file_budget) else {
+            truncated = true;
             continue;
         };
         let chunk_tokens = estimate_tokens(&chunk);
@@ -449,6 +468,7 @@ pub fn collect_filtered(
             truncated = true;
             break;
         }
+        truncated |= chunk.contains("[FILE TRUNCATED]");
         body_tokens += chunk_tokens;
         body.push_str(&chunk);
         included_files.push(relative);
@@ -493,6 +513,7 @@ pub fn collect_chunks_filtered(
         .min(chunk_limit.saturating_sub(250).max(500));
 
     for file in files {
+        crate::control::Control::current().check()?;
         let Ok((relative, chunk)) = file_chunk(&root, &file, max_file_tokens) else {
             continue;
         };
@@ -504,16 +525,18 @@ pub fn collect_chunks_filtered(
                 manifest: manifest.clone(),
                 body: std::mem::take(&mut body),
                 included_files: std::mem::take(&mut included_files),
-                truncated: false,
+                truncated,
                 evidence_cache_hits: 0,
                 evidence_cache_misses: 0,
             });
+            truncated = false;
             body_tokens = 0;
             if chunks.len() >= max_chunks {
                 truncated = true;
                 break;
             }
         }
+        truncated |= chunk.contains("[FILE TRUNCATED]");
         body_tokens = body_tokens.saturating_add(chunk_cost);
         body.push_str(&chunk);
         included_files.push(relative);
@@ -568,8 +591,11 @@ fn is_symbol_line(line: &str) -> bool {
 }
 
 fn file_symbol_candidates(text: &str, relative: &str) -> (Vec<SymbolCandidate>, usize) {
-    const MAX_SCAN_LINES: usize = 20_000;
-    const MAX_SYMBOLS_PER_FILE: usize = 64;
+    if let Some(symbols) = crate::syntax::symbols(text, relative) {
+        return (symbols, text.lines().count());
+    }
+    const MAX_SCAN_LINES: usize = 200_000;
+    const MAX_SYMBOLS_PER_FILE: usize = 4096;
     const MAX_SYMBOL_SPAN_LINES: usize = 240;
 
     let mut declarations = Vec::<(usize, String)>::new();
@@ -604,26 +630,45 @@ fn file_symbol_candidates(text: &str, relative: &str) -> (Vec<SymbolCandidate>, 
 }
 
 fn index_file(path: &Path, relative: &str) -> Result<repo_cache::CachedFileIndex> {
+    if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
+        bail!("file exceeds 8 MiB indexing limit");
+    }
+    if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
+        bail!("file exceeds 8 MiB source limit");
+    }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
         bail!("binary file skipped: {}", path.display());
     }
-    let text = String::from_utf8_lossy(&bytes);
+    let text = crate::privacy::redact(&String::from_utf8_lossy(&bytes));
     let (symbols, total_lines) = file_symbol_candidates(&text, relative);
     Ok(repo_cache::CachedFileIndex {
         stamp: repo_cache::file_stamp(path)?,
         content_hash: repo_cache::hash_bytes(&bytes),
         total_lines,
         symbols,
+        imports: crate::syntax::imports(&text),
     })
 }
 
+#[cfg(test)]
 pub fn discovery_index(
     workspace: &Path,
     requested: &[String],
     config: &AppConfig,
     include: &[String],
     exclude: &[String],
+) -> Result<DiscoveryIndex> {
+    discovery_index_for_task(workspace, requested, config, include, exclude, "")
+}
+
+pub fn discovery_index_for_task(
+    workspace: &Path,
+    requested: &[String],
+    config: &AppConfig,
+    include: &[String],
+    exclude: &[String],
+    task: &str,
 ) -> Result<DiscoveryIndex> {
     let root = canonical_workspace(workspace)?;
     let discovery_request = if requested.is_empty() {
@@ -649,11 +694,11 @@ pub fn discovery_index(
     let mut cache_hits = 0usize;
     let mut cache_misses = 0usize;
 
+    let keywords = crate::search::keywords(task);
+    let mut ranked = Vec::new();
     for file in files {
-        if candidate_files.len() >= 512 {
-            truncated = true;
-            break;
-        }
+        crate::control::Control::current().check()?;
+        crate::control::Control::current().check()?;
         let relative = normalized_relative(file.strip_prefix(&root).unwrap_or(&file));
         let metadata = fs::metadata(&file).ok();
         let stamp = repo_cache::file_stamp(&file).ok();
@@ -675,39 +720,69 @@ pub fn discovery_index(
             updates.insert(relative.clone(), indexed.clone());
             indexed
         };
-        let symbols = indexed.symbols;
-        let symbol_lines = symbols
-            .iter()
-            .take(32)
-            .map(|symbol| {
-                format!(
-                    "  RANGE {}-{} {}",
-                    symbol.start_line, symbol.end_line, symbol.label
-                )
-            })
-            .collect::<Vec<_>>();
-        let entry = if symbol_lines.is_empty() {
-            format!(
-                "FILE {relative} ({} bytes)\n",
-                metadata.as_ref().map(|value| value.len()).unwrap_or(0)
-            )
-        } else {
-            format!(
-                "FILE {relative} ({} bytes)\nSYMBOLS\n{}\n",
-                metadata.as_ref().map(|value| value.len()).unwrap_or(0),
-                symbol_lines.join("\n")
-            )
-        };
-        let entry_tokens = estimate_tokens(&entry);
-        if used_tokens.saturating_add(entry_tokens) > config.discovery_index_tokens {
+        let mut symbols = indexed.symbols;
+        symbols.sort_by_key(|symbol| {
+            std::cmp::Reverse(crate::search::score(&keywords, &symbol.label))
+        });
+        let score = crate::search::score(&keywords, &relative) * 4
+            + symbols
+                .iter()
+                .map(|symbol| crate::search::score(&keywords, &symbol.label))
+                .max()
+                .unwrap_or(0)
+                * 8;
+        ranked.push((
+            score,
+            relative,
+            metadata.map(|value| value.len()).unwrap_or(0),
+            symbols,
+            indexed.imports,
+        ));
+    }
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let seeds = ranked
+        .iter()
+        .take(3)
+        .filter(|entry| entry.0 > 0)
+        .map(|entry| (entry.0, entry.4.clone()))
+        .collect::<Vec<_>>();
+    for entry in &mut ranked {
+        for (score, imports) in &seeds {
+            if crate::syntax::imports_path(imports, &entry.1) {
+                entry.0 = entry.0.max((*score / 2).max(1));
+            }
+        }
+    }
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    for (_, relative, bytes, symbols, _) in ranked {
+        if candidate_files.len() >= 512 {
             truncated = true;
             break;
         }
-        used_tokens += entry_tokens;
-        body.push_str(&entry);
-        body.push('\n');
+        let header = format!("FILE {relative} ({bytes} bytes)\n");
+        let cost = estimate_tokens(&header);
+        if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
+            truncated = true;
+            continue;
+        }
+        body.push_str(&header);
+        used_tokens += cost;
         candidate_files.push(relative);
-        symbol_candidates.extend(symbols);
+        for symbol in symbols.iter().take(32) {
+            let line = format!(
+                "  RANGE {}-{} {}\n",
+                symbol.start_line, symbol.end_line, symbol.label
+            );
+            let cost = estimate_tokens(&line);
+            if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
+                truncated = true;
+                break;
+            }
+            body.push_str(&line);
+            used_tokens += cost;
+            symbol_candidates.push(symbol.clone());
+        }
+        body.push('\n');
     }
 
     if let Err(error) = repo_cache::merge_symbol_updates(&root, updates) {
@@ -729,13 +804,15 @@ pub fn discovery_index(
 }
 
 fn read_source_lines(path: &Path) -> Result<Vec<String>> {
+    if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
+        bail!("file exceeds 8 MiB source limit");
+    }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
         bail!("binary file skipped: {}", path.display());
     }
-    Ok(String::from_utf8_lossy(&bytes)
+    Ok(crate::privacy::redact(&String::from_utf8_lossy(&bytes))
         .lines()
-        .take(20_000)
         .map(ToOwned::to_owned)
         .collect())
 }
@@ -982,6 +1059,7 @@ pub fn existing_document_paths(workspace: &Path) -> Result<Vec<String>> {
             .build()
             .filter_map(Result::ok)
         {
+            crate::control::Control::current().check()?;
             let path = entry.path();
             if !path.is_file() || is_secret(path) {
                 continue;
@@ -1011,6 +1089,47 @@ fn validate_git_ref(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn filtered_git_diff(root: &Path, refs: &[&str]) -> Result<std::process::Output> {
+    let control = crate::control::Control::current();
+    let names = crate::process::run(
+        Command::new("git")
+            .args(["diff", "--name-only", "-z"])
+            .args(refs)
+            .arg("--")
+            .current_dir(root),
+        std::time::Duration::from_secs(30),
+        &control,
+    )?;
+    if !names.status.success() {
+        bail!(
+            "git diff failed: {}",
+            crate::privacy::redact(&String::from_utf8_lossy(&names.stderr))
+        );
+    }
+    let paths = String::from_utf8_lossy(&names.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty() && !is_secret(Path::new(path)))
+        .map(|path| format!(":(literal){path}"))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(std::process::Output {
+            status: names.status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    }
+    crate::process::run(
+        Command::new("git")
+            .args(["diff", "--no-ext-diff", "--no-textconv"])
+            .args(refs)
+            .arg("--")
+            .args(paths)
+            .current_dir(root),
+        std::time::Duration::from_secs(30),
+        &control,
+    )
+}
+
 pub fn git_diff(
     workspace: &Path,
     base_ref: &str,
@@ -1023,17 +1142,13 @@ pub fn git_diff(
         .current_dir(&root)
         .output()
         .context("failed to run git status")?;
-    let diff = Command::new("git")
-        .args(["diff", base_ref, "--"])
-        .current_dir(&root)
-        .output()
-        .context("failed to run git diff")?;
+    let diff = filtered_git_diff(&root, &[base_ref])?;
     if !diff.status.success() {
         bail!("git diff failed: {}", String::from_utf8_lossy(&diff.stderr));
     }
 
     let (text, truncated) = truncate_to_token_budget(
-        &String::from_utf8_lossy(&diff.stdout),
+        &crate::privacy::redact(&String::from_utf8_lossy(&diff.stdout)),
         max_tokens,
         "\n\n[DIFF TRUNCATED]\n",
     );
@@ -1053,16 +1168,12 @@ pub fn git_diff_refs(
     validate_git_ref(base_ref)?;
     validate_git_ref(target_ref)?;
     let root = canonical_workspace(workspace)?;
-    let diff = Command::new("git")
-        .args(["diff", base_ref, target_ref, "--"])
-        .current_dir(&root)
-        .output()
-        .context("failed to run git diff between refs")?;
+    let diff = filtered_git_diff(&root, &[base_ref, target_ref])?;
     if !diff.status.success() {
         bail!("git diff failed: {}", String::from_utf8_lossy(&diff.stderr));
     }
     Ok(truncate_to_token_budget(
-        &String::from_utf8_lossy(&diff.stdout),
+        &crate::privacy::redact(&String::from_utf8_lossy(&diff.stdout)),
         max_tokens,
         "\n\n[DIFF TRUNCATED]\n",
     ))
@@ -1071,6 +1182,98 @@ pub fn git_diff_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_prioritizes_late_chinese_matches_and_imports() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for n in 0..100 {
+            fs::write(
+                src.join(format!("a{n:03}.rs")),
+                format!("fn unrelated_{n}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            src.join("z_login.rs"),
+            "use crate::z_helper;\nfn login() {}\n",
+        )
+        .unwrap();
+        fs::write(src.join("z_helper.rs"), "fn shared() {}\n").unwrap();
+        let config = AppConfig {
+            discovery_index_tokens: 100,
+            ..AppConfig::default()
+        };
+        let index =
+            discovery_index_for_task(root.path(), &[], &config, &[], &[], "检查登录").unwrap();
+        assert_eq!(index.candidate_files[0], "src/z_login.rs");
+        assert!(
+            index
+                .candidate_files
+                .iter()
+                .any(|file| file == "src/z_helper.rs")
+        );
+        assert!(index.truncated);
+        repo_cache::clear_workspace_cache(root.path()).unwrap();
+    }
+    #[test]
+    fn tracked_secrets_are_excluded_and_diff_literals_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.path().join(".env"), "LEAK=OLD_SECRET\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+        fs::write(root.path().join(".env"), "LEAK=UNFILTERABLE_ENV_SECRET\n").unwrap();
+        fs::write(
+            root.path().join("main.rs"),
+            "fn main() { let password = \"CODE_DIFF_SECRET\"; }\n",
+        )
+        .unwrap();
+        let (_, diff, _) = git_diff(root.path(), "HEAD", 2000).unwrap();
+        assert!(!diff.contains("UNFILTERABLE_ENV_SECRET"));
+        assert!(!diff.contains("CODE_DIFF_SECRET"));
+        assert!(diff.contains("[REDACTED]"));
+        let source = collect(root.path(), &["main.rs".to_owned()], &AppConfig::default()).unwrap();
+        assert!(!source.body.contains("CODE_DIFF_SECRET"));
+        let mut index = discovery_index(
+            root.path(),
+            &["main.rs".to_owned()],
+            &AppConfig::default(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let evidence = collect_symbol_context(
+            root.path(),
+            &[index.symbols.remove(0)],
+            &AppConfig::default(),
+        )
+        .unwrap();
+        assert!(!evidence.body.contains("CODE_DIFF_SECRET"));
+        repo_cache::clear_workspace_cache(root.path()).unwrap();
+    }
 
     #[test]
     fn secret_detection_blocks_common_credentials() {

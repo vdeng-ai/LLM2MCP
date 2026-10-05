@@ -239,3 +239,11 @@ Modern `2026-07-28`：
 另外所有 Host 都可使用 LLM2MCP 自己的 `job_status / job_result / job_cancel` fallback tools。
 
 stdout 只输出 MCP JSON-RPC；worker 日志和 MCP 运行日志都不会污染 stdout。随着协议覆盖面继续扩大，后续仍可评估迁移到官方 Rust SDK `rmcp`，但 Job Manager 与业务工具保持独立，不依赖具体 SDK。
+
+## Runtime hardening and model routing
+
+`control.rs` propagates cancellation through request threads and Map workers. `process.rs` bounds client command waits, while `scheduler.rs` holds shared file-lock leases for job and HTTP slots. The stdio loop dispatches business requests without holding stdout locks during work; each complete reply is written atomically. Durable jobs retain credential-free routing snapshots and heartbeat leases, and readers share the state lock with writers (including Windows replacement).
+
+`syntax.rs` supplies Tree-sitter symbols and lexical import hints; `search.rs` supplies Chinese aliases and path/label scores. Discovery ranks files before emitting its token-bounded index. Evidence is masked before caching and again at the outbound HTTP boundary. `cache.rs` applies on-access age/size pruning across source/index and map caches.
+
+Tool routing selects a named profile first. Discovery/Map optionally override that profile, while Reduce uses the tool profile. `doctor.rs` separates inference/stdio probes from host registration. Both sync and async requests record durable metrics, and the GUI consumes background events for operations and history refresh. Detailed guarantees and limits are documented in [RUNTIME.md](RUNTIME.md).

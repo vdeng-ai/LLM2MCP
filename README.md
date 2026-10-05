@@ -22,6 +22,14 @@ LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does n
 - Durable background jobs let slow local models run for minutes without holding a single MCP `tools/call` open.
 - Supports the MCP `2026-07-28` Tasks extension when the host opts in, with portable `job_status / job_result / job_cancel` fallback tools for older hosts.
 
+## Runtime and diagnostics
+
+- Responsive background operations with cancellation; concurrent stdio requests and bounded job/HTTP scheduling.
+- Named model profiles with per-tool/Discovery/Map routing, AST-assisted discovery and Chinese intent matching.
+- Real inference and local stdio diagnostics (`llm2mcp doctor`), cache cleanup, and actionable job history with usage/cost estimates.
+
+See [runtime configuration and usage](docs/RUNTIME.md) for examples, migration, measurements and limits.
+
 ## Installation
 
 Download the package for your platform from GitHub Releases. Ubuntu/Debian x86_64 users can use the native `.deb` package:

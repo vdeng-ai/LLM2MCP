@@ -1,7 +1,10 @@
+mod cache;
 mod clients;
 mod config;
+mod control;
 mod cursor;
 mod doc_cache;
+mod doctor;
 mod gui;
 mod i18n;
 mod icon;
@@ -10,8 +13,13 @@ mod jobs;
 mod linux_desktop;
 mod llm;
 mod mcp;
+mod privacy;
+mod process;
 mod repo_cache;
 mod safe_fs;
+mod scheduler;
+mod search;
+mod syntax;
 mod updater;
 mod workspace;
 
@@ -37,6 +45,27 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Probe real inference, stdio MCP and client registration.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// List/export recent jobs, request cancellation or rerun a terminal job.
+    Jobs {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, conflicts_with = "cancel")]
+        retry: Option<String>,
+        #[arg(long)]
+        cancel: Option<String>,
+    },
+    /// Inspect/prune source and map caches, or clear cached data.
+    Cache {
+        #[arg(long)]
+        clear: bool,
+    },
     /// Install/update a stable per-user LLM2MCP executable and print its path.
     Install,
     /// Internal durable background worker for asynchronous MCP jobs.
@@ -53,6 +82,65 @@ fn main() -> Result<()> {
         Some(Command::Mcp { workspace }) => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
             mcp::run(&workspace)
+        }
+        Some(Command::Doctor { json, profile }) => {
+            let mut config = config::load()?;
+            if profile.is_some() {
+                config.active_profile = profile;
+            }
+            let report = doctor::run(&config);
+            println!(
+                "{}",
+                if json {
+                    serde_json::to_string_pretty(&report)?
+                } else {
+                    report.text()
+                }
+            );
+            if !report.ok() {
+                anyhow::bail!("one or more required diagnostics failed");
+            }
+            Ok(())
+        }
+        Some(Command::Jobs {
+            json,
+            retry,
+            cancel,
+        }) => {
+            jobs::recover_stale()?;
+            if let Some(id) = retry {
+                println!("{}", serde_json::to_string_pretty(&jobs::retry(&id)?)?);
+            } else if let Some(id) = cancel {
+                println!("{}", serde_json::to_string_pretty(&jobs::cancel(&id)?)?);
+            } else {
+                let records = jobs::list_recent(200)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&records)?);
+                } else {
+                    for record in records {
+                        println!(
+                            "{} {} {} {}",
+                            record.id,
+                            jobs::state_name(record.state),
+                            record.tool,
+                            record.stage
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Cache { clear }) => {
+            let config = config::load()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&cache::maintain(
+                    config.cache_max_mib,
+                    config.cache_ttl_days,
+                    clear
+                )?)?
+            );
+            Ok(())
         }
         Some(Command::Install) => {
             println!("{}", install::ensure_stable_install()?.display());

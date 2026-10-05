@@ -22,6 +22,14 @@ LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也�
 - 持久化后台 Job 让较慢的本地模型运行数分钟，也不会长期占住单次 MCP `tools/call`。
 - Host 支持时使用 MCP `2026-07-28` Tasks Extension；旧 Host 则通过通用 `job_status / job_result / job_cancel` 工具兼容。
 
+## 运行、诊断与模型路由
+
+- 刷新模型、连接测试和客户端命令后台执行，可取消；MCP 支持并发请求及任务/HTTP 并发上限。
+- 默认、每工具、Discovery、Map 独立模型配置；语法树检索、预算前相关性排序和中文意图匹配。
+- `llm2mcp doctor` 验证真实推理和本地 stdio；Job 历史可筛选、查看/复制/导出、取消和重试，并记录 usage、耗时及可选费用估算。
+
+配置示例、兼容迁移、使用方法和指标解释见 [运行与诊断指南](docs/RUNTIME.md)。
+
 ## 安装
 
 从 GitHub Releases 下载对应平台安装包。Ubuntu / Debian x86_64 用户可以直接使用原生 `.deb`：

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{AppConfig, ReasoningEffort, ReasoningTransport};
 
@@ -53,31 +53,79 @@ impl ChatResponse {
 }
 
 pub fn test_connection(config: &AppConfig) -> Result<String> {
-    let models = list_models(config)?;
+    let started = Instant::now();
+    let listing = list_models(config);
+    if let Ok(models) = &listing
+        && !models.is_empty()
+        && !models.contains(&config.model)
+    {
+        bail!("selected model '{}' is absent from /models", config.model);
+    }
+    let response = chat_detailed(
+        config,
+        "Connectivity probe: reply with OK.",
+        "Reply with OK only.",
+        ReasoningEffort::Off,
+        128,
+    )?;
+    if response.final_text().is_none() {
+        bail!(
+            "inference returned no final content: {}",
+            response.diagnostics()
+        );
+    }
     Ok(format!(
-        "Connected: {} ({} model{})",
+        "Inference OK: {} · {} ms · {}{}",
         config.model,
-        models.len(),
-        if models.len() == 1 { "" } else { "s" }
+        started.elapsed().as_millis(),
+        response.diagnostics(),
+        listing
+            .err()
+            .map(|error| format!("; /models unavailable: {error:#}"))
+            .unwrap_or_default()
     ))
 }
 
+fn request_text(request: RequestBuilder, timeout_secs: u64) -> Result<String> {
+    let control = crate::control::Control::current();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let fetch = async {
+            for attempt in 0..=2 {
+                control.check()?;
+                let mut response = request.try_clone().context("request cannot be retried")?.send().await.context("failed to connect to LLM API")?;
+                let status = response.status();
+                let retry_after = response.headers().get("retry-after").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1 << attempt).min(10);
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await.context("failed to read LLM response")? {
+                    if body.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 { bail!("LLM response exceeds 16 MiB limit"); } body.extend_from_slice(&chunk);
+                }
+                if status.is_success() { return String::from_utf8(body).context("LLM response is not UTF-8"); }
+                if attempt < 2 && matches!(status.as_u16(), 429 | 502 | 503 | 504) { tokio::time::sleep(Duration::from_secs(retry_after)).await; continue; }
+                bail!("LLM API HTTP {status}: {}", crate::privacy::redact(&String::from_utf8_lossy(&body)).chars().take(2000).collect::<String>());
+            }
+            unreachable!("retry loop always returns")
+        };
+        let cancellation = async { loop { control.check()?; tokio::time::sleep(Duration::from_millis(150)).await; } #[allow(unreachable_code)] Ok::<String, anyhow::Error>(String::new()) };
+        tokio::select! { result = tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), fetch) => result.context("LLM request timed out")?, result = cancellation => result }
+    })
+}
+
 pub fn list_models(config: &AppConfig) -> Result<Vec<String>> {
+    let _slot = crate::scheduler::Slot::acquire(
+        "http",
+        config.max_concurrent_requests,
+        &crate::control::Control::current(),
+    )?;
     let client = client(config)?;
     let url = format!("{}/models", config.base_url.trim_end_matches('/'));
     let mut request = client.get(url);
     if !config.api_key.trim().is_empty() {
         request = request.bearer_auth(config.api_key.trim());
     }
-    let response = request.send().context("failed to connect to LLM API")?;
-    let status = response.status();
-    let body = response.text().context("failed to read /models response")?;
-    if !status.is_success() {
-        bail!(
-            "LLM API HTTP {status}: {}",
-            body.chars().take(2000).collect::<String>()
-        );
-    }
+    let body = request_text(request, config.timeout_secs)?;
     let value: Value = serde_json::from_str(&body).context("LLM /models returned invalid JSON")?;
     let mut models = value
         .get("data")
@@ -106,6 +154,11 @@ pub fn chat_detailed(
     effort: ReasoningEffort,
     max_output_tokens: u32,
 ) -> Result<ChatResponse> {
+    let _slot = crate::scheduler::Slot::acquire(
+        "http",
+        config.max_concurrent_requests,
+        &crate::control::Control::current(),
+    )?;
     let client = client(config)?;
     let effective_system = if config.system_prompt_prefix.trim().is_empty() {
         system.to_owned()
@@ -115,13 +168,30 @@ pub fn chat_detailed(
     let mut payload = json!({
         "model": config.model,
         "messages": [
-            {"role": "system", "content": effective_system},
-            {"role": "user", "content": user}
+            {"role": "system", "content": crate::privacy::redact(&effective_system)},
+            {"role": "user", "content": crate::privacy::redact(user)}
         ],
-        "temperature": config.temperature,
-        "max_tokens": max_output_tokens,
         "stream": false
     });
+    if !["max_tokens", "max_completion_tokens"]
+        .contains(&config.completion_token_parameter.as_str())
+    {
+        bail!("unsupported output token parameter");
+    }
+    let output_limit = max_output_tokens.min(config.model_output_limit.max(128));
+    payload[&config.completion_token_parameter] = json!(output_limit);
+    if config.send_temperature {
+        payload["temperature"] = json!(config.temperature);
+    }
+    let input_tokens = crate::workspace::estimate_tokens(&effective_system)
+        .saturating_add(crate::workspace::estimate_tokens(user))
+        .saturating_add(128);
+    if input_tokens.saturating_add(output_limit as usize) > config.model_input_limit {
+        bail!(
+            "estimated input {input_tokens} plus output {output_limit} exceeds model context limit {}",
+            config.model_input_limit
+        );
+    }
     apply_reasoning(&mut payload, config.reasoning_transport, effort);
 
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
@@ -129,15 +199,7 @@ pub fn chat_detailed(
     if !config.api_key.trim().is_empty() {
         request = request.bearer_auth(config.api_key.trim());
     }
-    let response = request.send().context("failed to call LLM API")?;
-    let status = response.status();
-    let body = response.text().context("failed to read LLM response")?;
-    if !status.is_success() {
-        bail!(
-            "LLM API HTTP {status}: {}",
-            body.chars().take(2000).collect::<String>()
-        );
-    }
+    let body = request_text(request, config.timeout_secs)?;
     let value: Value = serde_json::from_str(&body).context("LLM returned invalid JSON")?;
     parse_chat_response(&value)
 }

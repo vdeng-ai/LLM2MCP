@@ -143,3 +143,13 @@ Release 打包、Updater 签名、GitHub Actions tag 发布、Windows NSIS、mac
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [ROADMAP.md](ROADMAP.md)
+
+## Runtime regression tests
+
+`tests/mcp_e2e.rs` starts the actual executable with an isolated config/data directory and a loopback mock HTTP service. It checks that slow HTTP does not block ping, request cancellation terminates sync history, 429 retry preserves payload/privacy, profile routing and usage/cost metrics are recorded, `/models`-only connectivity fails doctor, worker crashes are recovered/retried, queued workers respect concurrency, Map/Reduce route and prefix changes invalidate Map checkpoints, oversized requests are rejected before HTTP, and cache age/size cleanup preserves history. No real API credentials or host installs are used.
+
+Unit tests cover credential masking with quote/line preservation, AST multiline and late-file ranges, Chinese intent matching, relevant/dependency files before budget exhaustion, tracked secret-file diff exclusion, source/evidence masking, cache prompt-key invalidation, profile migration and endpoint-bound credential restoration.
+
+For a native desktop check, run `cargo run`, start a slow model-list/inference operation and verify the window remains interactive and Cancel works. Verify all six tabs, profile rename/delete routing, history auto-refresh/result copy and client registration in the actual host. CI compilation does not establish host integration or desktop rendering.
+
+CLI usage and metric definitions are in [RUNTIME.md](RUNTIME.md).

@@ -1,5 +1,11 @@
 use eframe::egui;
-use std::{fs, path::Path, sync::mpsc};
+use std::{
+    fs,
+    path::Path,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::{
     clients::{self, ClientKind, ClientStatus},
@@ -82,7 +88,18 @@ enum UpdateUiState {
     Error(String),
 }
 
+enum UiReply {
+    Models(anyhow::Result<Vec<String>>),
+    Clients(Vec<ClientStatus>),
+    Jobs(Vec<jobs::JobRecord>),
+    Message(String),
+    Clipboard(String),
+}
 pub struct Llm2McpApp {
+    pending: Option<mpsc::Receiver<UiReply>>,
+    operation: crate::control::Control,
+    last_jobs_refresh: Instant,
+    job_filter: String,
     config: AppConfig,
     status: String,
     api_key_visible: bool,
@@ -117,52 +134,104 @@ impl Llm2McpApp {
         } else {
             UpdateUiState::Disabled
         };
-        Self {
+        let mut app = Self {
+            pending: None,
+            operation: crate::control::Control::default(),
+            last_jobs_refresh: Instant::now(),
+            job_filter: String::new(),
             config,
             status: ready,
             api_key_visible: false,
-            clients: clients::statuses(),
-            jobs: jobs::list_recent(40).unwrap_or_default(),
+            clients: Vec::new(),
+            jobs: Vec::new(),
             available_models: Vec::new(),
             ui_zoom_factor,
             active_tab,
             update_state,
             update_rx,
+        };
+        app.refresh_clients();
+        app
+    }
+
+    fn start_operation(&mut self, work: impl FnOnce() -> UiReply + Send + 'static) {
+        if self.pending.is_some() {
+            return;
         }
+        let (sender, receiver) = mpsc::channel();
+        self.operation = crate::control::Control::default();
+        let control = self.operation.clone();
+        self.pending = Some(receiver);
+        self.status = "Working / 正在执行…".to_owned();
+        thread::spawn(move || {
+            control.set_current();
+            let _ = sender.send(work());
+        });
     }
-
-    fn refresh_clients(&mut self) {
-        self.clients = clients::statuses();
-    }
-
-    fn refresh_jobs(&mut self) {
-        self.jobs = jobs::list_recent(40).unwrap_or_default();
-    }
-
-    fn refresh_models(&mut self) {
-        let text = i18n::texts(self.config.language);
-        match llm::list_models(&self.config) {
-            Ok(models) => {
-                self.status = format!("{}: {}", text.refresh_models, models.len());
-                self.available_models = models;
-            }
-            Err(error) => {
-                self.status = format!("{}: {error:#}", text.connection_failed);
-            }
-        }
-    }
-
-    fn generic_mcp_config(&self) -> anyhow::Result<String> {
-        let command = install::ensure_stable_install()?.display().to_string();
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "mcpServers": {
-                "llm2mcp": {
-                    "type": "stdio",
-                    "command": command,
-                    "args": ["mcp"]
+    fn poll_operation(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.pending {
+            match receiver.try_recv() {
+                Ok(reply) => {
+                    self.pending = None;
+                    match reply {
+                        UiReply::Models(Ok(models)) => {
+                            self.status = format!("{} models", models.len());
+                            self.available_models = models;
+                        }
+                        UiReply::Models(Err(error)) => {
+                            self.status = format!(
+                                "{}: {}",
+                                i18n::texts(self.config.language).connection_failed,
+                                crate::privacy::redact(&format!("{error:#}"))
+                            )
+                        }
+                        UiReply::Clients(clients) => {
+                            self.clients = clients;
+                            self.status = i18n::texts(self.config.language).ready.to_owned();
+                        }
+                        UiReply::Jobs(jobs) => self.jobs = jobs,
+                        UiReply::Message(message) => self.status = crate::privacy::redact(&message),
+                        UiReply::Clipboard(value) => {
+                            ctx.copy_text(value);
+                            self.status = i18n::texts(self.config.language)
+                                .generic_config_copied
+                                .to_owned();
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    self.status = "Background operation ended unexpectedly".to_owned();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(100))
                 }
             }
-        }))?)
+        }
+    }
+    fn refresh_clients(&mut self) {
+        self.start_operation(|| UiReply::Clients(clients::statuses()));
+    }
+    fn refresh_jobs(&mut self) {
+        self.start_operation(|| {
+            let _ = jobs::recover_stale();
+            UiReply::Jobs(jobs::list_recent(200).unwrap_or_default())
+        });
+        self.last_jobs_refresh = Instant::now();
+    }
+    fn refresh_models(&mut self) {
+        let mut config = match self
+            .config
+            .with_profile(self.config.active_profile.as_deref())
+        {
+            Ok(config) => config,
+            Err(error) => {
+                self.status = format!("{error:#}");
+                return;
+            }
+        };
+        config.timeout_secs = 20;
+        self.start_operation(move || UiReply::Models(llm::list_models(&config)));
     }
 
     fn save(&mut self) {
@@ -174,29 +243,26 @@ impl Llm2McpApp {
     }
 
     fn test(&mut self) {
-        self.save();
-        let text = i18n::texts(self.config.language);
-        self.status = match llm::test_connection(&self.config) {
-            Ok(message) => message,
-            Err(error) => format!("{}: {error:#}", text.connection_failed),
-        };
+        if let Err(error) = config::save(&self.config) {
+            self.status = format!("{error:#}");
+            return;
+        }
+        let config = self.config.clone();
+        self.start_operation(move || UiReply::Message(crate::doctor::run(&config).text()));
     }
-
     fn install_client(&mut self, kind: ClientKind) {
-        self.save();
-        self.status = match clients::install(kind) {
-            Ok(detail) => format!("{}: {detail}", kind.label()),
-            Err(error) => format!("{}: {error:#}", kind.label()),
-        };
-        self.refresh_clients();
+        if let Err(error) = config::save(&self.config) {
+            self.status = format!("{error:#}");
+            return;
+        }
+        self.start_operation(move || {
+            UiReply::Message(clients::install(kind).unwrap_or_else(|error| format!("{error:#}")))
+        });
     }
-
     fn remove_client(&mut self, kind: ClientKind) {
-        self.status = match clients::remove(kind) {
-            Ok(detail) => format!("{}: {detail}", kind.label()),
-            Err(error) => format!("{}: {error:#}", kind.label()),
-        };
-        self.refresh_clients();
+        self.start_operation(move || {
+            UiReply::Message(clients::remove(kind).unwrap_or_else(|error| format!("{error:#}")))
+        });
     }
 
     fn start_update_check(&mut self) {
@@ -430,6 +496,12 @@ fn brand_mark(ui: &mut egui::Ui, size: f32) {
 impl Llm2McpApp {
     fn render_header(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
         ui.horizontal(|ui| {
+            if self.pending.is_some() {
+                ui.spinner();
+                if ui.button("Cancel / 取消").clicked() {
+                    self.operation.cancel();
+                }
+            }
             brand_mark(ui, 38.0);
             ui.vertical(|ui| {
                 ui.heading("LLM2MCP");
@@ -519,7 +591,13 @@ impl Llm2McpApp {
                         }
                     });
                 ui.label(text.language);
-                if ui.button(text.test_connection).clicked() {
+                if ui
+                    .add_enabled(
+                        self.pending.is_none(),
+                        egui::Button::new(text.test_connection),
+                    )
+                    .clicked()
+                {
                     self.test();
                 }
                 if ui.button(text.save).clicked() {
@@ -596,7 +674,13 @@ impl Llm2McpApp {
                                     }
                                 });
                         }
-                        if ui.small_button(text.refresh_models).clicked() {
+                        if ui
+                            .add_enabled(
+                                self.pending.is_none(),
+                                egui::Button::new(text.refresh_models).small(),
+                            )
+                            .clicked()
+                        {
                             self.refresh_models();
                         }
                     });
@@ -837,6 +921,7 @@ impl Llm2McpApp {
     }
 
     fn render_jobs_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
+        let mut action = None;
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -848,12 +933,14 @@ impl Llm2McpApp {
                 });
             });
             ui.small(text.job_history_hint);
+            ui.text_edit_singleline(&mut self.job_filter).on_hover_text("Filter by workspace, tool or state / 按工作区、工具或状态筛选");
+            ui.small("Source/return tokens are estimates; compression is not verified primary-model cost savings. / 源码与回传为估算，不代表已验证的主模型费用节省。");
             ui.add_space(6.0);
 
             if self.jobs.is_empty() {
                 ui.small(text.no_jobs);
             } else {
-                let job_rows = self.jobs.clone();
+                let job_rows = &self.jobs;
                 egui::ScrollArea::vertical()
                     .id_salt("job_history_scroll")
                     .max_height(560.0)
@@ -861,7 +948,8 @@ impl Llm2McpApp {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         for job in job_rows {
-                            let duration = format_duration(jobs::display_duration_ms(&job));
+                            if !self.job_filter.trim().is_empty() && !format!("{} {} {}", job.workspace.display(), job.tool, jobs::state_name(job.state)).to_lowercase().contains(&self.job_filter.to_lowercase()) { continue; }
+                            let duration = format_duration(jobs::display_duration_ms(job));
                             let heading = format!(
                                 "{} · {} · {} · {duration}",
                                 jobs::state_name(job.state),
@@ -903,6 +991,17 @@ impl Llm2McpApp {
                                             ui.small(&duration);
                                             ui.end_row();
                                         });
+                                    ui.small(format!("source≈{} → return≈{} tokens · files={} · LLM wait={} · models={}", job.source_tokens, job.return_tokens, job.selected_files, format_duration(job.llm_wait_ms), job.used_models.join(", ")));
+                                    if job.source_tokens > 0 { ui.small(format!("Return/source {:.1}% · truncated={}", 100.0 * job.return_tokens as f64 / job.source_tokens as f64, job.source_truncated)); }
+                                    if let Some(cost) = job.estimated_llm_cost_usd { ui.small(format!("Estimated secondary cost ${cost:.6} · priced calls {}/{}", job.priced_llm_calls, job.llm_calls)); }
+                                    let result = job.result.as_ref().and_then(|value| value.pointer("/content/0/text")).and_then(serde_json::Value::as_str).unwrap_or_default();
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Copy result / 复制结果").clicked() { ui.ctx().copy_text(result.to_owned()); }
+                                        if ui.button("Export JSON / 导出 JSON").clicked() { ui.ctx().copy_text(serde_json::to_string_pretty(job).unwrap_or_default()); }
+                                        if job.state == jobs::JobState::Working { if ui.add_enabled(self.pending.is_none(), egui::Button::new("Cancel job / 取消任务")).clicked() { action = Some((job.id.clone(), false)); } }
+                                        else if ui.add_enabled(self.pending.is_none(), egui::Button::new("Retry / 重试")).clicked() { action = Some((job.id.clone(), true)); }
+                                    });
+                                    if !result.is_empty() { egui::CollapsingHeader::new("View result / 查看结果").id_salt(format!("{}_result", job.id)).show(ui, |ui| { egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| { let mut preview = result; ui.add(egui::TextEdit::multiline(&mut preview).desired_width(ui.available_width()).desired_rows(12)); }); }); }
                                     ui.small(format!("job_id: {}", job.id));
                                     ui.small(format!("created: {}", job.created_at));
                                     if let Some(diagnostics) = &job.last_llm_diagnostics {
@@ -919,6 +1018,19 @@ impl Llm2McpApp {
                     });
             }
         });
+        if let Some((id, retry)) = action {
+            self.start_operation(move || {
+                UiReply::Message(if retry {
+                    jobs::retry(&id)
+                        .map(|record| format!("Started {}", record.id))
+                        .unwrap_or_else(|error| format!("{error:#}"))
+                } else {
+                    jobs::cancel(&id)
+                        .map(|_| "Cancellation requested".to_owned())
+                        .unwrap_or_else(|error| format!("{error:#}"))
+                })
+            });
+        }
     }
 
     fn render_clients_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
@@ -933,6 +1045,7 @@ impl Llm2McpApp {
                 });
             });
             ui.small(text.coding_agents_hint);
+            ui.small("Registration status is not a host runtime/Tasks test. / 注册状态不等于宿主运行和 Tasks 验证。");
             ui.add_space(6.0);
 
             let client_rows = self.clients.clone();
@@ -953,14 +1066,14 @@ impl Llm2McpApp {
                         ui.small(format!("{availability} · {installation}"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .add_enabled(client.installed, egui::Button::new(text.remove))
+                                .add_enabled(self.pending.is_none() && client.installed, egui::Button::new(text.remove))
                                 .clicked()
                             {
                                 self.remove_client(client.kind);
                             }
                             if ui
                                 .add_enabled(
-                                    client.available,
+                                    self.pending.is_none() && client.available,
                                     egui::Button::new(text.install_update),
                                 )
                                 .clicked()
@@ -980,16 +1093,8 @@ impl Llm2McpApp {
             }
             ui.horizontal_wrapped(|ui| {
                 ui.small(text.generic_note);
-                if ui.small_button(text.copy_generic_config).clicked() {
-                    match self.generic_mcp_config() {
-                        Ok(config) => {
-                            ui.ctx().copy_text(config);
-                            self.status = text.generic_config_copied.to_owned();
-                        }
-                        Err(error) => {
-                            self.status = format!("{}: {error:#}", text.save_failed);
-                        }
-                    }
+                if ui.add_enabled(self.pending.is_none(), egui::Button::new(text.copy_generic_config).small()).clicked() {
+                    self.start_operation(|| match install::ensure_stable_install().and_then(|path| serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"llm2mcp":{"type":"stdio","command":path,"args":["mcp"]}}})).map_err(Into::into)) { Ok(config) => UiReply::Clipboard(config), Err(error) => UiReply::Message(format!("{error:#}")) });
                 }
             });
         });
@@ -1001,9 +1106,288 @@ impl Llm2McpApp {
     }
 }
 
+fn profile_picker(ui: &mut egui::Ui, label: &str, selected: &mut Option<String>, names: &[String]) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(label)
+        .selected_text(selected.as_deref().unwrap_or("Default / 默认"))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, None, "Default / 默认");
+            for name in names {
+                ui.selectable_value(selected, Some(name.clone()), name);
+            }
+        });
+}
+impl Llm2McpApp {
+    fn render_routes(&mut self, ui: &mut egui::Ui) {
+        let names = self
+            .config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        ui.group(|ui| {
+            ui.heading("Model routing / 模型路由");
+            for (label, route) in [
+                ("Analyze", &mut self.config.tools.analyze.model_profile),
+                (
+                    "Debug issue",
+                    &mut self.config.tools.debug_issue.model_profile,
+                ),
+                ("Plan", &mut self.config.tools.plan.model_profile),
+                (
+                    "Review diff",
+                    &mut self.config.tools.review_diff.model_profile,
+                ),
+                (
+                    "Document repo",
+                    &mut self.config.tools.document_repo.model_profile,
+                ),
+                (
+                    "Update docs",
+                    &mut self.config.tools.update_docs.model_profile,
+                ),
+                ("Discovery", &mut self.config.discovery_profile),
+                ("Document Map", &mut self.config.map_profile),
+            ] {
+                ui.horizontal(|ui| profile_picker(ui, label, route, &names));
+            }
+        });
+    }
+    fn render_profiles(&mut self, ui: &mut egui::Ui) {
+        let names = self
+            .config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        ui.horizontal(|ui| {
+            profile_picker(
+                ui,
+                "Active profile / 默认模型配置",
+                &mut self.config.active_profile,
+                &names,
+            )
+        });
+        ui.small("The API fields above configure the fallback; named profiles below can route individual tools. / 上方 API 字段为回退配置；下方命名配置支持独立路由。");
+        let mut removed = None;
+        let mut renamed = Vec::new();
+        for (index, profile) in self.config.profiles.iter_mut().enumerate() {
+            let old_name = profile.name.clone();
+            egui::CollapsingHeader::new(format!("Profile / 模型配置: {}", profile.name))
+                .id_salt(("profile", index))
+                .show(ui, |ui| {
+                    egui::Grid::new(("profile_fields", index))
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Name / 名称");
+                            ui.text_edit_singleline(&mut profile.name);
+                            ui.end_row();
+                            ui.label("API URL");
+                            ui.text_edit_singleline(&mut profile.base_url);
+                            ui.end_row();
+                            ui.label("API key");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut profile.api_key)
+                                    .password(!self.api_key_visible),
+                            );
+                            ui.end_row();
+                            ui.label("Model / 模型");
+                            ui.text_edit_singleline(&mut profile.model);
+                            ui.end_row();
+                            ui.label("Reasoning transport");
+                            egui::ComboBox::from_id_salt(("profile_transport", index))
+                                .selected_text(profile.reasoning_transport.label())
+                                .show_ui(ui, |ui| {
+                                    for transport in ReasoningTransport::ALL {
+                                        ui.selectable_value(
+                                            &mut profile.reasoning_transport,
+                                            transport,
+                                            transport.label(),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Total context tokens / 总上下文");
+                            ui.add(
+                                egui::DragValue::new(&mut profile.max_input_tokens)
+                                    .range(1024..=2_000_000),
+                            );
+                            ui.end_row();
+                            ui.label("Max output tokens / 输出上限");
+                            ui.add(
+                                egui::DragValue::new(&mut profile.max_output_tokens)
+                                    .range(128..=200_000),
+                            );
+                            ui.end_row();
+                            ui.label("Timeout seconds / 超时秒数");
+                            ui.add(egui::DragValue::new(&mut profile.timeout_secs).range(5..=3600));
+                            ui.end_row();
+                            ui.label("Temperature");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut profile.send_temperature, "Send / 发送");
+                                ui.add(
+                                    egui::DragValue::new(&mut profile.temperature)
+                                        .range(0.0..=2.0)
+                                        .speed(0.05),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label("Output budget parameter");
+                            egui::ComboBox::from_id_salt(("profile_output", index))
+                                .selected_text(&profile.completion_token_parameter)
+                                .show_ui(ui, |ui| {
+                                    for parameter in ["max_tokens", "max_completion_tokens"] {
+                                        ui.selectable_value(
+                                            &mut profile.completion_token_parameter,
+                                            parameter.to_owned(),
+                                            parameter,
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Cost USD / million tokens / 百万 token 费用");
+                            ui.vertical(|ui| {
+                                for (label, rate) in [
+                                    ("Input", &mut profile.input_usd_per_million),
+                                    ("Output", &mut profile.output_usd_per_million),
+                                ] {
+                                    let mut enabled = rate.is_some();
+                                    ui.horizontal(|ui| {
+                                        if ui.checkbox(&mut enabled, label).changed() {
+                                            *rate = enabled.then_some(0.0);
+                                        }
+                                        if let Some(rate) = rate {
+                                            ui.add(
+                                                egui::DragValue::new(rate)
+                                                    .range(0.0..=10000.0)
+                                                    .speed(0.01),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                        });
+                    if ui.button("Delete profile / 删除配置").clicked() {
+                        removed = Some(index);
+                    }
+                });
+            if old_name != profile.name {
+                renamed.push((old_name, Some(profile.name.clone())));
+            }
+        }
+        if let Some(index) = removed {
+            let profile = self.config.profiles.remove(index);
+            renamed.push((profile.name, None));
+        }
+        for (old, new) in renamed {
+            for route in [
+                &mut self.config.active_profile,
+                &mut self.config.discovery_profile,
+                &mut self.config.map_profile,
+                &mut self.config.tools.analyze.model_profile,
+                &mut self.config.tools.debug_issue.model_profile,
+                &mut self.config.tools.plan.model_profile,
+                &mut self.config.tools.review_diff.model_profile,
+                &mut self.config.tools.document_repo.model_profile,
+                &mut self.config.tools.update_docs.model_profile,
+            ] {
+                if route.as_deref() == Some(old.as_str()) {
+                    *route = new.clone();
+                }
+            }
+        }
+        if ui.button("Add profile / 添加模型配置").clicked() {
+            let mut name = format!("Profile {}", self.config.profiles.len() + 1);
+            while self
+                .config
+                .profiles
+                .iter()
+                .any(|profile| profile.name == name)
+            {
+                name.push('_');
+            }
+            self.config.profiles.push(config::ModelProfile {
+                name,
+                base_url: self.config.base_url.clone(),
+                api_key: self.config.api_key.clone(),
+                model: self.config.model.clone(),
+                reasoning_transport: self.config.reasoning_transport,
+                temperature: self.config.temperature,
+                timeout_secs: self.config.timeout_secs,
+                max_input_tokens: self.config.model_input_limit,
+                max_output_tokens: self.config.model_output_limit,
+                send_temperature: self.config.send_temperature,
+                completion_token_parameter: self.config.completion_token_parameter.clone(),
+                input_usd_per_million: self.config.input_usd_per_million,
+                output_usd_per_million: self.config.output_usd_per_million,
+            });
+        }
+    }
+    fn render_runtime(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.heading("Runtime and cache / 运行与缓存");
+            for (label, value) in [
+                (
+                    "Concurrent jobs / 并发任务",
+                    &mut self.config.max_concurrent_jobs,
+                ),
+                (
+                    "Concurrent HTTP requests / 并发请求",
+                    &mut self.config.max_concurrent_requests,
+                ),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    ui.add(egui::DragValue::new(value).range(1..=16));
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Cache MiB / 缓存大小");
+                ui.add(egui::DragValue::new(&mut self.config.cache_max_mib).range(16..=16384));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Cache TTL days / 缓存保留天数");
+                ui.add(egui::DragValue::new(&mut self.config.cache_ttl_days).range(1..=365));
+            });
+            ui.horizontal(|ui| {
+                for (label, clear) in [
+                    ("Inspect / prune / 检查清理", false),
+                    ("Clear cache / 清空缓存", true),
+                ] {
+                    if ui
+                        .add_enabled(self.pending.is_none(), egui::Button::new(label))
+                        .clicked()
+                    {
+                        let max = self.config.cache_max_mib;
+                        let ttl = self.config.cache_ttl_days;
+                        self.start_operation(move || {
+                            UiReply::Message(
+                                crate::cache::maintain(max, ttl, clear)
+                                    .and_then(|stats| {
+                                        serde_json::to_string(&stats).map_err(Into::into)
+                                    })
+                                    .unwrap_or_else(|error| format!("{error:#}")),
+                            )
+                        });
+                    }
+                }
+            });
+        });
+    }
+}
+
 impl eframe::App for Llm2McpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_update(ctx);
+        self.poll_operation(ctx);
+        if self.active_tab == AppTab::JobHistory {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            if self.last_jobs_refresh.elapsed() >= Duration::from_secs(2) && self.pending.is_none()
+            {
+                self.refresh_jobs();
+            }
+        }
         self.ui_zoom_factor = ctx.zoom_factor();
         let text = *i18n::texts(self.config.language);
 
@@ -1022,9 +1406,18 @@ impl eframe::App for Llm2McpApp {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     match active_tab {
-                        AppTab::LlmApi => self.render_api_section(ui, &text),
-                        AppTab::ContextLimits => self.render_context_section(ui, &text),
-                        AppTab::Tools => self.render_tools_section(ui, &text),
+                        AppTab::LlmApi => {
+                            self.render_api_section(ui, &text);
+                            self.render_profiles(ui);
+                        }
+                        AppTab::ContextLimits => {
+                            self.render_context_section(ui, &text);
+                            self.render_runtime(ui);
+                        }
+                        AppTab::Tools => {
+                            self.render_tools_section(ui, &text);
+                            self.render_routes(ui);
+                        }
                         AppTab::SystemPrompt => self.render_system_prompt_section(ui, &text),
                         AppTab::JobHistory => self.render_jobs_section(ui, &text),
                         AppTab::CodingAgents => self.render_clients_section(ui, &text),
@@ -1086,4 +1479,59 @@ pub fn install_cjk_font(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
     eprintln!("LLM2MCP: loaded CJK font from {}", path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn background_work_keeps_ui_polling_responsive_and_observes_cancel() {
+        let mut app = Llm2McpApp {
+            pending: None,
+            operation: crate::control::Control::default(),
+            last_jobs_refresh: Instant::now(),
+            job_filter: String::new(),
+            config: AppConfig::default(),
+            status: String::new(),
+            api_key_visible: false,
+            clients: Vec::new(),
+            jobs: Vec::new(),
+            available_models: Vec::new(),
+            ui_zoom_factor: 1.0,
+            active_tab: AppTab::LlmApi,
+            update_state: UpdateUiState::Disabled,
+            update_rx: None,
+        };
+        let (sender, ready) = mpsc::channel();
+        app.start_operation(move || {
+            sender.send(()).unwrap();
+            while crate::control::Control::current().check().is_ok() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            UiReply::Message("cancelled".to_owned())
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_operation(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.render_profiles(ui);
+                app.render_routes(ui);
+                app.render_runtime(ui);
+            });
+        });
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(app.pending.is_some());
+        app.operation.cancel();
+        for _ in 0..100 {
+            app.poll_operation(&ctx);
+            if app.pending.is_none() {
+                assert_eq!(app.status, "cancelled");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("GUI cancellation did not complete");
+    }
 }

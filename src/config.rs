@@ -102,6 +102,8 @@ pub struct ToolConfig {
     pub primary_return_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
 }
 
 impl ToolConfig {
@@ -116,6 +118,7 @@ impl ToolConfig {
             max_output_tokens,
             primary_return_tokens,
             execution: Some(execution),
+            model_profile: None,
         }
     }
 
@@ -179,7 +182,58 @@ impl Default for ToolsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ModelProfile {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub reasoning_transport: ReasoningTransport,
+    pub temperature: f32,
+    pub timeout_secs: u64,
+    pub max_input_tokens: usize,
+    pub max_output_tokens: u32,
+    pub send_temperature: bool,
+    pub completion_token_parameter: String,
+    pub input_usd_per_million: Option<f64>,
+    pub output_usd_per_million: Option<f64>,
+}
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            name: "New profile".to_owned(),
+            base_url: "http://127.0.0.1:8000/v1".to_owned(),
+            api_key: String::new(),
+            model: "qwen3.8-27b".to_owned(),
+            reasoning_transport: ReasoningTransport::OpenAi,
+            temperature: 0.2,
+            timeout_secs: 900,
+            max_input_tokens: 220_000,
+            max_output_tokens: 16_384,
+            send_temperature: true,
+            completion_token_parameter: "max_tokens".to_owned(),
+            input_usd_per_million: None,
+            output_usd_per_million: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
+    pub profiles: Vec<ModelProfile>,
+    pub active_profile: Option<String>,
+    pub discovery_profile: Option<String>,
+    pub map_profile: Option<String>,
+    pub max_concurrent_jobs: usize,
+    pub max_concurrent_requests: usize,
+    pub cache_max_mib: u64,
+    pub cache_ttl_days: u64,
+    pub model_input_limit: usize,
+    pub model_output_limit: u32,
+    pub send_temperature: bool,
+    pub completion_token_parameter: String,
+    pub input_usd_per_million: Option<f64>,
+    pub output_usd_per_million: Option<f64>,
     pub language: Language,
     pub base_url: String,
     pub api_key: String,
@@ -206,6 +260,20 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            profiles: Vec::new(),
+            active_profile: None,
+            discovery_profile: None,
+            map_profile: None,
+            max_concurrent_jobs: 2,
+            max_concurrent_requests: 4,
+            cache_max_mib: 256,
+            cache_ttl_days: 30,
+            model_input_limit: 220_000,
+            model_output_limit: 16_384,
+            send_temperature: true,
+            completion_token_parameter: "max_tokens".to_owned(),
+            input_usd_per_million: None,
+            output_usd_per_million: None,
             language: Language::English,
             base_url: "http://127.0.0.1:8000/v1".to_owned(),
             api_key: String::new(),
@@ -227,7 +295,110 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    pub fn with_profile(&self, name: Option<&str>) -> Result<Self> {
+        let mut config = self.clone();
+        if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+            let profile = self
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .with_context(|| format!("unknown model profile: {name}"))?;
+            config.base_url = profile.base_url.clone();
+            config.api_key = profile.api_key.clone();
+            config.model = profile.model.clone();
+            config.reasoning_transport = profile.reasoning_transport;
+            config.temperature = profile.temperature;
+            config.timeout_secs = profile.timeout_secs;
+            config.model_input_limit = profile.max_input_tokens;
+            config.model_output_limit = profile.max_output_tokens;
+            config.send_temperature = profile.send_temperature;
+            config.completion_token_parameter = profile.completion_token_parameter.clone();
+            config.input_usd_per_million = profile.input_usd_per_million;
+            config.output_usd_per_million = profile.output_usd_per_million;
+        }
+        Ok(config)
+    }
+    pub fn for_tool(&self, name: &str) -> Result<Self> {
+        let tool = match name {
+            "analyze" => &self.tools.analyze,
+            "debug_issue" => &self.tools.debug_issue,
+            "plan" => &self.tools.plan,
+            "review_diff" => &self.tools.review_diff,
+            "document_repo" => &self.tools.document_repo,
+            "update_docs" => &self.tools.update_docs,
+            _ => anyhow::bail!("unknown tool: {name}"),
+        };
+        self.with_profile(
+            tool.model_profile
+                .as_deref()
+                .or(self.active_profile.as_deref()),
+        )
+    }
+    pub fn without_credentials(&self) -> Self {
+        let mut config = self.clone();
+        config.api_key.clear();
+        config.system_prompt_prefix = crate::privacy::redact(&config.system_prompt_prefix);
+        for profile in &mut config.profiles {
+            profile.api_key.clear();
+        }
+        config
+    }
+    pub fn restore_credentials(&mut self, current: &Self) {
+        self.api_key = if self.base_url == current.base_url {
+            current.api_key.clone()
+        } else {
+            String::new()
+        };
+        for profile in &mut self.profiles {
+            profile.api_key = current
+                .profiles
+                .iter()
+                .find(|live| live.name == profile.name && live.base_url == profile.base_url)
+                .map(|live| live.api_key.clone())
+                .unwrap_or_default();
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for profile in &self.profiles {
+            if profile.name.trim().is_empty() || !names.insert(profile.name.as_str()) {
+                anyhow::bail!("profile names must be non-empty and unique");
+            }
+        }
+        for name in [
+            self.active_profile.as_deref(),
+            self.discovery_profile.as_deref(),
+            self.map_profile.as_deref(),
+            self.tools.analyze.model_profile.as_deref(),
+            self.tools.debug_issue.model_profile.as_deref(),
+            self.tools.plan.model_profile.as_deref(),
+            self.tools.review_diff.model_profile.as_deref(),
+            self.tools.document_repo.model_profile.as_deref(),
+            self.tools.update_docs.model_profile.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.with_profile(Some(name))?;
+        }
+        Ok(())
+    }
+}
+pub fn data_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("LLM2MCP_DATA_DIR").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(ProjectDirs::from("ai", "LLM2MCP", "LLM2MCP")
+        .context("cannot resolve data directory")?
+        .data_local_dir()
+        .to_owned())
+}
+
 pub fn config_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("LLM2MCP_CONFIG_DIR").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path).join("config.json"));
+    }
     let dirs = ProjectDirs::from("ai", "LLM2MCP", "LLM2MCP")
         .context("cannot resolve the user configuration directory")?;
     Ok(dirs.config_dir().join("config.json"))
@@ -293,6 +464,7 @@ fn apply_env_overrides(config: &mut AppConfig) {
 }
 
 pub fn save(config: &AppConfig) -> Result<()> {
+    config.validate()?;
     let path = config_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -315,6 +487,32 @@ pub fn save(config: &AppConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profiles_preserve_old_defaults_and_do_not_restore_keys_to_changed_endpoints() {
+        let mut config: AppConfig =
+            serde_json::from_value(serde_json::json!({"api_key":"top-secret"})).unwrap();
+        assert!(config.profiles.is_empty());
+        assert_eq!(config.max_concurrent_jobs, 2);
+        config.profiles.push(ModelProfile {
+            name: "analysis".to_owned(),
+            api_key: "profile-secret".to_owned(),
+            model: "analysis-model".to_owned(),
+            ..ModelProfile::default()
+        });
+        config.tools.analyze.model_profile = Some("analysis".to_owned());
+        assert_eq!(config.for_tool("analyze").unwrap().model, "analysis-model");
+        let mut snapshot = config.without_credentials();
+        assert!(snapshot.api_key.is_empty());
+        assert!(snapshot.profiles[0].api_key.is_empty());
+        snapshot.restore_credentials(&config);
+        assert_eq!(snapshot.profiles[0].api_key, "profile-secret");
+        snapshot = config.without_credentials();
+        snapshot.profiles[0].base_url = "https://other.example/v1".to_owned();
+        snapshot.restore_credentials(&config);
+        assert!(snapshot.profiles[0].api_key.is_empty());
+        config.profiles.push(config.profiles[0].clone());
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn token_budgets_replace_legacy_character_fields_when_saving() {

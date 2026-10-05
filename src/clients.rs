@@ -90,18 +90,19 @@ fn cli_status(kind: ClientKind, command: &str, args: &[&str]) -> ClientStatus {
         };
     };
 
-    let installed = Command::new(&path)
-        .args(args)
-        .output()
-        .map(|output| {
-            if kind == ClientKind::GrokBuild {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(SERVER_NAME)
-            } else {
-                output.status.success()
-            }
-        })
-        .unwrap_or(false);
+    let installed = crate::process::run(
+        Command::new(&path).args(args),
+        std::time::Duration::from_secs(10),
+        &crate::control::Control::current(),
+    )
+    .map(|output| {
+        if kind == ClientKind::GrokBuild {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(SERVER_NAME)
+        } else {
+            output.status.success()
+        }
+    })
+    .unwrap_or(false);
 
     ClientStatus {
         kind,
@@ -185,14 +186,19 @@ pub fn remove(kind: ClientKind) -> Result<String> {
 fn run_cli(command: &str, args: &[&str]) -> Result<Output> {
     let executable = find_executable(command)
         .ok_or_else(|| anyhow!("{command} executable was not found in PATH"))?;
-    let output = Command::new(executable)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {command}"))?;
+    let output = crate::process::run(
+        Command::new(executable).args(args),
+        std::time::Duration::from_secs(120),
+        &crate::control::Control::current(),
+    )
+    .with_context(|| format!("failed to run {command}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!("{command} failed: {}{}", stdout.trim(), stderr.trim());
+        bail!(
+            "{command} failed: {}",
+            crate::privacy::redact(&format!("{}{}", stdout.trim(), stderr.trim()))
+        );
     }
     Ok(output)
 }

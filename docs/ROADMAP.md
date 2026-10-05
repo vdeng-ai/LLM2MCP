@@ -100,3 +100,19 @@
 - 替代任何编码智能体的主模型
 
 LLM2MCP 的核心定位是：**本地上下文读取 + 外部 LLM 深度分析 + MCP 压缩结果回传。**
+
+## Eleven-point runtime improvements (development branch)
+
+- [x] Background GUI operations with cancellation and independent timeouts
+- [x] Consistent source/evidence/diff/log/outbound sensitive-data masking
+- [x] Concurrent stdio dispatch and cancellable async HTTP waits
+- [x] Shared job/request caps, bounded queue, heartbeat and stale-worker recovery
+- [x] Ranking before budgets, Tree-sitter symbols and one-hop import hints
+- [x] Chinese intent aliases for local routing
+- [x] Complete Map prompt keys, cache size/TTL/cleanup
+- [x] Named model profiles and per-tool/Discovery/Map routing
+- [x] Real inference plus local stdio doctor diagnostics
+- [x] Source/return, usage, wait time and optional secondary-cost measurements
+- [x] History filtering, result view/copy/export, cancellation and retry
+
+Implementation and regression tests are included. Native host/desktop verification above remains distinct from local mock tests.

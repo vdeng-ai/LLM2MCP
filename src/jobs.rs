@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use directories::ProjectDirs;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,6 +64,28 @@ pub struct JobRecord {
     pub evidence_cache_hits: u64,
     #[serde(default)]
     pub evidence_cache_misses: u64,
+    #[serde(default)]
+    pub heartbeat_at: Option<String>,
+    #[serde(default)]
+    pub worker_pid: Option<u32>,
+    #[serde(default)]
+    pub config_snapshot: Option<crate::config::AppConfig>,
+    #[serde(default)]
+    pub source_tokens: u64,
+    #[serde(default)]
+    pub return_tokens: u64,
+    #[serde(default)]
+    pub selected_files: u64,
+    #[serde(default)]
+    pub source_truncated: bool,
+    #[serde(default)]
+    pub llm_wait_ms: u64,
+    #[serde(default)]
+    pub used_models: Vec<String>,
+    #[serde(default)]
+    pub estimated_llm_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub priced_llm_calls: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +94,48 @@ pub struct Reporter {
 }
 
 impl Reporter {
+    pub fn record_context(&self, tokens: usize, files: usize, truncated: bool) -> Result<()> {
+        update_record(&self.job_id, |record| {
+            record.source_tokens = tokens as u64;
+            record.selected_files = files as u64;
+            record.source_truncated |= truncated;
+        })
+    }
+    pub fn record_wait(&self, ms: u64, model: &str) -> Result<()> {
+        update_record(&self.job_id, |record| {
+            record.llm_wait_ms += ms;
+            if !record.used_models.iter().any(|used| used == model) {
+                record.used_models.push(model.to_owned());
+            }
+        })
+    }
+    pub fn record_cost(
+        &self,
+        prompt: Option<u64>,
+        completion: Option<u64>,
+        config: &crate::config::AppConfig,
+    ) -> Result<()> {
+        if let (Some(input), Some(output), Some(prompt), Some(completion)) = (
+            config.input_usd_per_million,
+            config.output_usd_per_million,
+            prompt,
+            completion,
+        ) && input.is_finite()
+            && output.is_finite()
+            && input >= 0.0
+            && output >= 0.0
+        {
+            update_record(&self.job_id, |record| {
+                record.estimated_llm_cost_usd = Some(
+                    record.estimated_llm_cost_usd.unwrap_or_default()
+                        + (prompt as f64 * input + completion as f64 * output) / 1_000_000.0,
+                );
+                record.priced_llm_calls += 1;
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn new(job_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),
@@ -145,6 +208,45 @@ pub fn create(
     ttl_hours: u64,
     poll_interval_ms: u64,
 ) -> Result<JobRecord> {
+    create_record(tool, workspace, args, ttl_hours, poll_interval_ms, true)
+}
+
+pub fn create_sync(
+    tool: &str,
+    workspace: &Path,
+    args: Value,
+    ttl_hours: u64,
+    poll_interval_ms: u64,
+) -> Result<JobRecord> {
+    create_record(tool, workspace, args, ttl_hours, poll_interval_ms, false)
+}
+
+fn create_record(
+    tool: &str,
+    workspace: &Path,
+    args: Value,
+    ttl_hours: u64,
+    poll_interval_ms: u64,
+    spawn: bool,
+) -> Result<JobRecord> {
+    recover_stale()?;
+    let dir = jobs_dir()?;
+    fs::create_dir_all(&dir)?;
+    let queue_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("queue.lock"))?;
+    queue_lock.lock_exclusive()?;
+    if list_recent(1000)?
+        .iter()
+        .filter(|record| record.state == JobState::Working)
+        .count()
+        >= 64
+    {
+        bail!("job queue is full (64 pending/running jobs)");
+    }
     let workspace = workspace
         .canonicalize()
         .with_context(|| format!("invalid workspace: {}", workspace.display()))?;
@@ -154,7 +256,7 @@ pub fn create(
         id: id.clone(),
         tool: tool.to_owned(),
         workspace,
-        args,
+        args: crate::privacy::redact_value(args),
         state: JobState::Working,
         stage: "queued".to_owned(),
         progress: 0,
@@ -176,10 +278,24 @@ pub fn create(
         symbol_index_misses: 0,
         evidence_cache_hits: 0,
         evidence_cache_misses: 0,
+        heartbeat_at: None,
+        worker_pid: None,
+        config_snapshot: None,
+        source_tokens: 0,
+        return_tokens: 0,
+        selected_files: 0,
+        source_truncated: false,
+        llm_wait_ms: 0,
+        used_models: Vec::new(),
+        estimated_llm_cost_usd: None,
+        priced_llm_calls: 0,
     };
+    let mut record = record;
+    record.config_snapshot = Some(crate::config::load()?.without_credentials());
     save(&record)?;
+    FileExt::unlock(&queue_lock)?;
 
-    if let Err(error) = spawn_worker(&id) {
+    if spawn && let Err(error) = spawn_worker(&id) {
         let message = format!("failed to start job worker: {error:#}");
         fail(&id, &message)?;
         bail!(message)
@@ -191,7 +307,19 @@ pub fn create(
 pub fn load(job_id: &str) -> Result<JobRecord> {
     validate_job_id(job_id)?;
     let path = job_path(job_id)?;
-    let text = fs::read_to_string(&path)
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path(job_id)?)?;
+    FileExt::lock_shared(&lock)?;
+    let result = read_unlocked(&path, job_id);
+    FileExt::unlock(&lock)?;
+    result
+}
+fn read_unlocked(path: &Path, job_id: &str) -> Result<JobRecord> {
+    let text = fs::read_to_string(path)
         .with_context(|| format!("unknown job_id or unreadable job: {job_id}"))?;
     serde_json::from_str(&text).with_context(|| format!("invalid job state: {}", path.display()))
 }
@@ -225,6 +353,9 @@ pub fn save(record: &JobRecord) -> Result<()> {
 
 pub fn complete(job_id: &str, result: Value) -> Result<()> {
     update_record(job_id, |record| {
+        if record.state != JobState::Working {
+            return;
+        }
         if record.cancel_requested {
             record.state = JobState::Cancelled;
             record.stage = "cancelled".to_owned();
@@ -236,6 +367,11 @@ pub fn complete(job_id: &str, result: Value) -> Result<()> {
         }
         record.state = JobState::Completed;
         record.stage = "completed".to_owned();
+        record.return_tokens = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(crate::workspace::estimate_tokens)
+            .unwrap_or_default() as u64;
         record.result = Some(result);
         record.error = None;
         record.error_hint = None;
@@ -248,6 +384,9 @@ pub fn complete(job_id: &str, result: Value) -> Result<()> {
 
 pub fn fail(job_id: &str, message: &str) -> Result<()> {
     update_record(job_id, |record| {
+        if record.state != JobState::Working {
+            return;
+        }
         if record.cancel_requested {
             record.state = JobState::Cancelled;
             record.stage = "cancelled".to_owned();
@@ -259,7 +398,7 @@ pub fn fail(job_id: &str, message: &str) -> Result<()> {
             if !record.stage.ends_with("_failed") {
                 record.stage = "failed".to_owned();
             }
-            record.error = Some(message.to_owned());
+            record.error = Some(crate::privacy::redact(message));
             record.error_hint = diagnostic_hint(message);
             record.duration_ms = Some(elapsed_ms(record));
         }
@@ -278,6 +417,9 @@ pub fn cancel(job_id: &str) -> Result<JobRecord> {
 
 pub fn mark_cancelled(job_id: &str) -> Result<()> {
     update_record(job_id, |record| {
+        if record.state != JobState::Working {
+            return;
+        }
         record.state = JobState::Cancelled;
         record.stage = "cancelled".to_owned();
         record.result = None;
@@ -334,6 +476,10 @@ pub fn fallback_status_result(record: &JobRecord) -> Value {
             "created_at": record.created_at,
             "updated_at": record.updated_at,
             "poll_after_ms": record.poll_interval_ms,
+            "source_tokens": record.source_tokens, "return_tokens": record.return_tokens,
+            "selected_files": record.selected_files, "source_truncated": record.source_truncated,
+            "llm_wait_ms": record.llm_wait_ms, "used_models": record.used_models,
+            "estimated_llm_cost_usd": record.estimated_llm_cost_usd, "priced_llm_calls": record.priced_llm_calls,
             "duration_ms": display_duration_ms(record),
             "llm_calls": record.llm_calls,
             "prompt_tokens": record.prompt_tokens,
@@ -450,10 +596,9 @@ pub fn list_recent(limit: usize) -> Result<Vec<JobRecord>> {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Ok(record) = serde_json::from_str::<JobRecord>(&text) {
+        if let Some(id) = path.file_stem().and_then(|id| id.to_str())
+            && let Ok(record) = load(id)
+        {
             records.push(record);
         }
     }
@@ -482,10 +627,10 @@ pub fn cleanup_expired() -> Result<usize> {
             continue;
         };
         let created_ms = parse_rfc3339_millis(&record.created_at).unwrap_or(now_ms);
-        if now_ms.saturating_sub(created_ms) > record.ttl_ms {
+        if record.state != JobState::Working && now_ms.saturating_sub(created_ms) > record.ttl_ms {
             let _ = fs::remove_file(&path);
             let _ = fs::remove_file(log_path(&record.id)?);
-            let _ = fs::remove_file(lock_path(&record.id)?);
+            // Retain lock files so readers cannot lock a different inode during cleanup.
             removed += 1;
         }
     }
@@ -510,7 +655,7 @@ where
     lock.lock_exclusive()?;
 
     let result = (|| {
-        let mut record = load(job_id)?;
+        let mut record = read_unlocked(&job_path(job_id)?, job_id)?;
         update(&mut record);
         save(&record)
     })();
@@ -577,9 +722,7 @@ fn spawn_worker(job_id: &str) -> Result<()> {
 }
 
 fn jobs_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("ai", "LLM2MCP", "LLM2MCP")
-        .context("cannot resolve LLM2MCP data directory")?;
-    Ok(dirs.data_local_dir().join("jobs"))
+    Ok(crate::config::data_dir()?.join("jobs"))
 }
 
 fn job_path(job_id: &str) -> Result<PathBuf> {
@@ -690,6 +833,97 @@ fn status_message(record: &JobRecord) -> String {
     }
 }
 
+pub struct Heartbeat {
+    stop: std::sync::mpsc::Sender<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+pub fn start_heartbeat(job_id: &str) -> Result<Heartbeat> {
+    let id = job_id.to_owned();
+    update_record(&id, |record| {
+        record.heartbeat_at = Some(now_rfc3339());
+        record.worker_pid = Some(std::process::id());
+    })?;
+    let (stop, receive) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        while matches!(
+            receive.recv_timeout(std::time::Duration::from_secs(3)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            if update_record(&id, |record| record.heartbeat_at = Some(now_rfc3339())).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(Heartbeat {
+        stop,
+        handle: Some(handle),
+    })
+}
+pub fn worker_lease(job_id: &str) -> Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(job_path(job_id)?.with_extension("worker.lock"))?;
+    lock.try_lock_exclusive()
+        .context("job already has a running worker")?;
+    Ok(lock)
+}
+pub fn recover_stale() -> Result<usize> {
+    let mut recovered = 0;
+    for record in list_recent(10000)? {
+        if record.state != JobState::Working {
+            continue;
+        }
+        let expired = |record: &JobRecord| {
+            unix_millis().saturating_sub(
+                parse_rfc3339_millis(record.heartbeat_at.as_deref().unwrap_or(&record.created_at))
+                    .unwrap_or_else(unix_millis),
+            ) > 30_000
+        };
+        if expired(&record) {
+            update_record(&record.id, |current| {
+                if current.state == JobState::Working && expired(current) {
+                    current.state = if current.cancel_requested {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Failed
+                    };
+                    current.stage = "worker_lost".to_owned();
+                    current.error = Some(
+                        "Worker heartbeat expired; retry to reuse cached checkpoints.".to_owned(),
+                    );
+                    current.duration_ms = Some(elapsed_ms(current));
+                }
+            })?;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+pub fn retry(job_id: &str) -> Result<JobRecord> {
+    let record = load(job_id)?;
+    if record.state == JobState::Working {
+        bail!("finish or cancel the active job before retrying");
+    }
+    create(
+        &record.tool,
+        &record.workspace,
+        record.args,
+        record.ttl_ms / 3_600_000,
+        record.poll_interval_ms,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +956,17 @@ mod tests {
             symbol_index_misses: 1,
             evidence_cache_hits: 3,
             evidence_cache_misses: 2,
+            heartbeat_at: None,
+            worker_pid: None,
+            config_snapshot: None,
+            source_tokens: 0,
+            return_tokens: 0,
+            selected_files: 0,
+            source_truncated: false,
+            llm_wait_ms: 0,
+            used_models: Vec::new(),
+            estimated_llm_cost_usd: None,
+            priced_llm_calls: 0,
         };
         let value = task_get_result(&record);
         assert_eq!(value["status"], "working");
