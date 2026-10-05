@@ -183,10 +183,13 @@ impl Drop for Session {
         let _ = self.child.wait();
     }
 }
-struct ProbeJob(String);
+struct ProbeJob(String, bool);
 impl Drop for ProbeJob {
     fn drop(&mut self) {
         let _ = crate::jobs::cancel(&self.0);
+        if self.1 {
+            let _ = crate::jobs::mark_cancelled(&self.0);
+        }
     }
 }
 
@@ -211,7 +214,7 @@ fn deep_probe(config: &AppConfig, workspace: &std::path::Path, path: &str) -> Re
         .as_str()
         .context("analysis did not return a durable task")?
         .to_owned();
-    let _guard = ProbeJob(id.clone());
+    let _guard = ProbeJob(id.clone(), false);
     drop(session);
     let mut reconnected = Session::new(config, &workspace)?;
     let deadline = std::time::Instant::now()
@@ -258,7 +261,7 @@ fn deep_probe(config: &AppConfig, workspace: &std::path::Path, path: &str) -> Re
         1,
         1000,
     )?;
-    let _cancel_guard = ProbeJob(queued.id.clone());
+    let _cancel_guard = ProbeJob(queued.id.clone(), true);
     reconnected.call(
         "tasks/update",
         serde_json::json!({"taskId":queued.id,"inputResponses":{}}),

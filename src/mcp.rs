@@ -1025,6 +1025,42 @@ fn validate_model_output(system: &str, user: &str, content: &str) -> Result<()> 
             bail!("missing array field {key}");
         }
     }
+    for key in arrays {
+        for item in value[*key].as_array().expect("array checked") {
+            if ["findings", "evidence"].contains(key) {
+                if !item.get("text").is_some_and(Value::is_string)
+                    || !item
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .is_some_and(|severity| {
+                            ["critical", "high", "medium", "low", "info"].contains(&severity)
+                        })
+                    || !item
+                        .get("evidence")
+                        .and_then(Value::as_array)
+                        .is_some_and(|refs| refs.iter().all(Value::is_string))
+                {
+                    bail!("invalid finding in {key}");
+                }
+            } else if *key == "read_next" {
+                if !["path", "symbol", "lines", "reason"]
+                    .iter()
+                    .all(|field| item.get(field).is_some_and(Value::is_string))
+                {
+                    bail!("invalid read_next item");
+                }
+            } else if *key == "symbols" {
+                if !item.get("path").is_some_and(Value::is_string)
+                    || !item.get("start_line").is_some_and(Value::is_u64)
+                    || !item.get("end_line").is_some_and(Value::is_u64)
+                {
+                    bail!("invalid discovery range");
+                }
+            } else if !item.is_string() {
+                bail!("invalid string list {key}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2425,6 +2461,22 @@ mod tests {
         assert!(files.is_empty());
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].path, "src/jobs.rs");
+    }
+
+    #[test]
+    fn output_validation_rejects_nested_schema_errors_and_unfinished_documents() {
+        let value = json!({"conclusion":"ok","findings":[{"text":"bug","severity":"high","evidence":"not an array"}],"risks":[],"actions":[],"read_next":[]});
+        assert!(validate_model_output(ANALYZE_SYSTEM, "", &value.to_string()).is_err());
+        let prompt = "TARGET DOCUMENTS\ndocs/PROJECT_OVERVIEW.md\n\n";
+        assert!(
+            validate_model_output(
+                DOC_REDUCE_SYSTEM,
+                prompt,
+                "===== DOCUMENT: docs/PROJECT_OVERVIEW.md =====\n# Partial"
+            )
+            .is_err()
+        );
+        assert!(validate_model_output(DOC_REDUCE_SYSTEM, prompt, "===== DOCUMENT: docs/PROJECT_OVERVIEW.md =====\n# Complete\n===== END DOCUMENT =====").is_ok());
     }
 
     #[test]

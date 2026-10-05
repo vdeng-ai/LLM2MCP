@@ -68,6 +68,8 @@ def primary(args, task, context):
         result = subprocess.run(args.primary_command, input=json.dumps(prompt), text=True, capture_output=True,
                                 timeout=args.timeout, check=True)
         result = json.loads(result.stdout)
+        if not isinstance(result.get("answer"), str) or not result["answer"].strip():
+            raise ValueError("primary adapter output empty or invalid")
         return result["answer"], result.get("usage")
     payload = {"model": args.primary_model, "messages": [
         {"role": "system", "content": "Answer the software task using supplied context. Cite evidence and identify uncertainty."},
