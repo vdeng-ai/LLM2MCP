@@ -582,6 +582,13 @@ pub fn collect_chunks_filtered(
     for file in files {
         crate::control::Control::current().check()?;
         let relative = normalized_relative(file.strip_prefix(&root).unwrap_or(&file));
+        if chunks.len() >= max_chunks {
+            coverage
+                .omissions
+                .push(format!("- {relative}: not scanned (chunk limit)"));
+            truncated = true;
+            continue;
+        }
         let text = match read_text_tokens(&file, usize::MAX) {
             Ok(text) => text,
             Err(error) => {
@@ -590,6 +597,7 @@ pub fn collect_chunks_filtered(
                 continue;
             }
         };
+        let total_lines = text.lines().count();
         let segments = text_segments(&text, max_file_tokens.saturating_sub(128));
         let mut complete = true;
         for (part, (start, end, text)) in segments.iter().enumerate() {
@@ -616,7 +624,7 @@ pub fn collect_chunks_filtered(
             if chunks.len() >= max_chunks {
                 coverage.omissions.push(format!(
                     "- {relative}: lines {start}-{} not scanned (chunk limit)",
-                    text.lines().count().max(*end)
+                    total_lines.max(*end)
                 ));
                 complete = false;
                 truncated = true;
@@ -1496,6 +1504,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(coverage.complete_files, 0);
         assert!(coverage.omissions[0].contains("large.rs"));
+        assert!(coverage.omissions[0].contains("-1000 not scanned"));
         assert!(chunks[0].truncated);
     }
 
