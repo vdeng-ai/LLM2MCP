@@ -940,7 +940,14 @@ fn chat_with_reporter(
         diagnostics = response.diagnostics();
         if let Some(content) = response.final_text() {
             match validate_model_output(system, user, content) {
-                Ok(()) => return Ok(content.trim().to_owned()),
+                Ok(()) => {
+                    if [ANALYZE_SYSTEM, DEBUG_SYSTEM, PLAN_SYSTEM, REVIEW_SYSTEM].contains(&system)
+                    {
+                        let value: Value = serde_json::from_str(content)?;
+                        return Ok(crate::evidence::verify(value, user).to_string());
+                    }
+                    return Ok(content.trim().to_owned());
+                }
                 Err(error) => diagnostics = format!("{diagnostics}; {error}"),
             }
         }
@@ -1089,6 +1096,19 @@ fn local_discovery_selection(
         return None;
     }
 
+    let exact = index
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol
+                .label
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(|name| name.contains('_') && task.split_whitespace().any(|word| word == name))
+        })
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return Some((vec![exact[0].clone()], Vec::new()));
+    }
     let mut symbols = index
         .symbols
         .iter()
@@ -1101,7 +1121,10 @@ fn local_discovery_selection(
         .collect::<Vec<_>>();
     symbols.sort_by_key(|item| std::cmp::Reverse(item.0));
     if let Some((top_score, _)) = symbols.first()
-        && *top_score >= 8
+        && *top_score >= 16
+        && symbols
+            .get(1)
+            .is_none_or(|(second, _)| *second < *top_score)
     {
         let threshold = (*top_score / 2).max(4);
         let selected = symbols
@@ -1123,7 +1146,8 @@ fn local_discovery_selection(
         .collect::<Vec<_>>();
     files.sort_by_key(|item| std::cmp::Reverse(item.0));
     if let Some((top_score, _)) = files.first()
-        && *top_score >= 5
+        && *top_score >= 10
+        && files.get(1).is_none_or(|(second, _)| *second < *top_score)
     {
         let selected = files
             .into_iter()
@@ -2401,6 +2425,32 @@ mod tests {
         assert!(files.is_empty());
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].path, "src/jobs.rs");
+    }
+
+    #[test]
+    fn ambiguous_single_word_discovery_requires_reranking() {
+        let index = workspace::DiscoveryIndex {
+            body: String::new(),
+            candidate_files: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            symbols: vec![
+                workspace::SymbolCandidate {
+                    path: "a.rs".into(),
+                    label: "fn login()".into(),
+                    start_line: 1,
+                    end_line: 2,
+                },
+                workspace::SymbolCandidate {
+                    path: "b.rs".into(),
+                    label: "fn login()".into(),
+                    start_line: 1,
+                    end_line: 2,
+                },
+            ],
+            truncated: false,
+            cache_hits: 0,
+            cache_misses: 0,
+        };
+        assert!(local_discovery_selection("login", &index).is_none());
     }
 
     #[test]

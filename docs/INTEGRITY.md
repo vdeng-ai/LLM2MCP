@@ -25,3 +25,9 @@ Each tool derives source limits from its routed model ceiling after reserving it
 ## Diff review coverage
 
 `review_diff` enumerates changed paths and reviews every diff segment in batches with nearby current source, rather than clipping the global diff prefix. Findings are deduplicated and ordered by severity. Up to 32 batches are reviewed per call; omitted paths/parts are explicitly reported. Set `include_untracked: true` to include nonignored new text files; secret paths, detected secret literals and binary/oversized files retain the existing filtering. Deleted-file hunks remain reviewable without current source.
+
+## Discovery and citations
+
+Ambiguous single-word or tied lexical matches are reranked rather than treated as confident symbol selection. Unique explicit identifiers still avoid an unnecessary model call. The index includes locally extracted dependency hints; hints do not prove runtime reachability.
+
+Structured analysis/debug/review finding citations are checked against the source actually supplied, not the repository manifest. Exact numbered ranges must be wholly present; nonexistent or unseen references are removed, and claims without a verified location are visibly marked `UNVERIFIED CLAIM`. This validates source locations, not the truth of the model's reasoning. Whole-file evidence is numbered before transmission.

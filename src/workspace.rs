@@ -441,6 +441,12 @@ fn requested_files(
 fn file_chunk(root: &Path, file: &Path, max_file_tokens: usize) -> Result<(String, String)> {
     let relative = normalized_relative(file.strip_prefix(root).unwrap_or(file));
     let text = read_text_tokens(file, max_file_tokens)?;
+    let text = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{} | {line}\n", i + 1))
+        .collect::<String>();
+    let text = truncate_tokens_strict(&text, max_file_tokens, "[FILE TRUNCATED]");
     let chunk =
         format!("\n\n===== FILE: {relative} =====\n{text}\n===== END FILE: {relative} =====\n");
     Ok((relative, chunk))
@@ -845,12 +851,15 @@ pub fn discovery_index_for_task(
         }
     }
     ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    for (_, relative, bytes, symbols, _) in ranked {
+    for (_, relative, bytes, symbols, imports) in ranked {
         if candidate_files.len() >= 512 {
             truncated = true;
             break;
         }
-        let header = format!("FILE {relative} ({bytes} bytes)\n");
+        let header = format!(
+            "FILE {relative} ({bytes} bytes)\nDEPENDENCY HINTS {}\n",
+            imports.join(", ")
+        );
         let cost = estimate_tokens(&header);
         if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
             truncated = true;
@@ -1382,7 +1391,10 @@ pub fn review_batches(
                     .into_iter()
                     .map(|i| format!("{} | {}\n", i + 1, lines[i]))
                     .collect::<String>();
-                truncate_tokens_strict(&text, budget / 4, "[SURROUNDING SOURCE TRUNCATED]")
+                format!(
+                    "===== FILE: {path} =====\n{}\n===== END FILE: {path} =====",
+                    truncate_tokens_strict(&text, budget / 4, "[SURROUNDING SOURCE TRUNCATED]")
+                )
             })
             .unwrap_or_default();
         let segments = text_segments(&full, (budget * 3 / 4).saturating_sub(64).max(16));
