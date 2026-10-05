@@ -31,3 +31,7 @@ Each tool derives source limits from its routed model ceiling after reserving it
 Ambiguous single-word or tied lexical matches are reranked rather than treated as confident symbol selection. Unique explicit identifiers still avoid an unnecessary model call. The index includes locally extracted dependency hints; hints do not prove runtime reachability.
 
 Structured analysis/debug/review finding citations are checked against the source actually supplied, not the repository manifest. Exact numbered ranges must be wholly present; nonexistent or unseen references are removed, and claims without a verified location are visibly marked `UNVERIFIED CLAIM`. This validates source locations, not the truth of the model's reasoning. Whole-file evidence is numbered before transmission.
+
+## Selected profile in the GUI
+
+Choose `Editing / 编辑配置` before editing API URL/key/model or refreshing models. The picker, model list and top-bar inference test operate on that same profile. Fallback fields remain separate, and delayed model-list replies carry their originating profile; lists from another profile are never offered in the current picker. Rename/removal continues to update all profile routes.

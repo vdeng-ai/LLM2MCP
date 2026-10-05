@@ -89,7 +89,7 @@ enum UpdateUiState {
 }
 
 enum UiReply {
-    Models(anyhow::Result<Vec<String>>),
+    Models(Option<String>, anyhow::Result<Vec<String>>),
     Clients(Vec<ClientStatus>),
     Jobs(Vec<jobs::JobRecord>),
     Message(String),
@@ -106,6 +106,7 @@ pub struct Llm2McpApp {
     clients: Vec<ClientStatus>,
     jobs: Vec<jobs::JobRecord>,
     available_models: Vec<String>,
+    models_profile: Option<String>,
     ui_zoom_factor: f32,
     active_tab: AppTab,
     update_state: UpdateUiState,
@@ -145,6 +146,7 @@ impl Llm2McpApp {
             clients: Vec::new(),
             jobs: Vec::new(),
             available_models: Vec::new(),
+            models_profile: None,
             ui_zoom_factor,
             active_tab,
             update_state,
@@ -174,11 +176,14 @@ impl Llm2McpApp {
                 Ok(reply) => {
                     self.pending = None;
                     match reply {
-                        UiReply::Models(Ok(models)) => {
+                        UiReply::Models(profile, Ok(models)) => {
+                            self.models_profile = profile;
                             self.status = format!("{} models", models.len());
                             self.available_models = models;
                         }
-                        UiReply::Models(Err(error)) => {
+                        UiReply::Models(profile, Err(error)) => {
+                            self.models_profile = profile;
+                            self.available_models.clear();
                             self.status = format!(
                                 "{}: {}",
                                 i18n::texts(self.config.language).connection_failed,
@@ -231,7 +236,8 @@ impl Llm2McpApp {
             }
         };
         config.timeout_secs = 20;
-        self.start_operation(move || UiReply::Models(llm::list_models(&config)));
+        let profile = self.config.active_profile.clone();
+        self.start_operation(move || UiReply::Models(profile, llm::list_models(&config)));
     }
 
     fn save(&mut self) {
@@ -640,6 +646,27 @@ impl Llm2McpApp {
     }
 
     fn render_api_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
+        let names = self
+            .config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        profile_picker(
+            ui,
+            "Editing / 编辑配置",
+            &mut self.config.active_profile,
+            &names,
+        );
+        let selected = self.config.active_profile.clone();
+        let mut api = match self.config.with_profile(selected.as_deref()) {
+            Ok(api) => api,
+            Err(error) => {
+                ui.label(format!("{error:#}"));
+                return;
+            }
+        };
+        let mut refresh = false;
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
             section_header(ui, text.llm_api, None);
@@ -650,27 +677,22 @@ impl Llm2McpApp {
                 .show(ui, |ui| {
                     ui.label(text.base_url);
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.config.base_url)
-                            .desired_width(field_width),
+                        egui::TextEdit::singleline(&mut api.base_url).desired_width(field_width),
                     );
                     ui.end_row();
 
                     ui.label(text.model);
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.config.model)
+                            egui::TextEdit::singleline(&mut api.model)
                                 .desired_width((field_width - 130.0).max(120.0)),
                         );
-                        if !self.available_models.is_empty() {
+                        if self.models_profile == selected && !self.available_models.is_empty() {
                             egui::ComboBox::from_id_salt("model_picker")
                                 .selected_text("▾")
                                 .show_ui(ui, |ui| {
                                     for model in &self.available_models {
-                                        ui.selectable_value(
-                                            &mut self.config.model,
-                                            model.clone(),
-                                            model,
-                                        );
+                                        ui.selectable_value(&mut api.model, model.clone(), model);
                                     }
                                 });
                         }
@@ -681,7 +703,7 @@ impl Llm2McpApp {
                             )
                             .clicked()
                         {
-                            self.refresh_models();
+                            refresh = true;
                         }
                     });
                     ui.end_row();
@@ -689,7 +711,7 @@ impl Llm2McpApp {
                     ui.label(text.api_key);
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.config.api_key)
+                            egui::TextEdit::singleline(&mut api.api_key)
                                 .password(!self.api_key_visible)
                                 .desired_width((field_width - 58.0).max(120.0)),
                         );
@@ -699,11 +721,11 @@ impl Llm2McpApp {
 
                     ui.label(text.reasoning_protocol);
                     egui::ComboBox::from_id_salt("reasoning_transport")
-                        .selected_text(self.config.reasoning_transport.label())
+                        .selected_text(api.reasoning_transport.label())
                         .show_ui(ui, |ui| {
                             for transport in ReasoningTransport::ALL {
                                 ui.selectable_value(
-                                    &mut self.config.reasoning_transport,
+                                    &mut api.reasoning_transport,
                                     transport,
                                     transport.label(),
                                 );
@@ -712,6 +734,12 @@ impl Llm2McpApp {
                     ui.end_row();
                 });
         });
+        if let Err(error) = self.config.update_api_fields(selected.as_deref(), &api) {
+            self.status = format!("{error:#}");
+        }
+        if refresh {
+            self.refresh_models();
+        }
     }
 
     fn render_context_section(&mut self, ui: &mut egui::Ui, text: &i18n::Texts) {
@@ -1168,7 +1196,7 @@ impl Llm2McpApp {
                 &names,
             )
         });
-        ui.small("The API fields above configure the fallback; named profiles below can route individual tools. / 上方 API 字段为回退配置；下方命名配置支持独立路由。");
+        ui.small("The API fields above edit the selected profile; refresh, selection and inference tests use that same profile. / 上方 API 编辑当前选中配置；刷新、模型选择和推理测试均使用该配置。");
         let mut removed = None;
         let mut renamed = Vec::new();
         for (index, profile) in self.config.profiles.iter_mut().enumerate() {
@@ -1497,6 +1525,7 @@ mod tests {
             clients: Vec::new(),
             jobs: Vec::new(),
             available_models: Vec::new(),
+            models_profile: None,
             ui_zoom_factor: 1.0,
             active_tab: AppTab::LlmApi,
             update_state: UpdateUiState::Disabled,
