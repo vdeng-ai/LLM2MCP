@@ -710,6 +710,10 @@ fn spawn_worker(job_id: &str) -> Result<()> {
 
     #[cfg(windows)]
     {
+        // Windows may inherit the CLI's original output pipe even though the
+        // worker's standard output is redirected to a log. That keeps
+        // `jobs --retry` callers waiting for EOF until the worker finishes.
+        prevent_standard_handle_inheritance()?;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
@@ -718,6 +722,30 @@ fn spawn_worker(job_id: &str) -> Result<()> {
     command
         .spawn()
         .context("failed to spawn background worker")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prevent_standard_handle_inheritance() -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        // GUI processes may have no standard handles. Explicit child stdio
+        // remains inheritable through the duplicates created by Command.
+        if !handle.is_null() && handle as isize != -1 {
+            let ok = unsafe { SetHandleInformation(handle, 1, 0) };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
     Ok(())
 }
 

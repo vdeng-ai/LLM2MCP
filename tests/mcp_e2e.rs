@@ -88,7 +88,7 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
     let _ = sender.send(payload);
     let number = count.fetch_add(1, Ordering::Relaxed);
     if mode == "slow" && !listing {
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(30));
     }
     let (status, body) = if mode == "bad" && !listing {
         (401, json!({"error":"inference rejected"}))
@@ -328,12 +328,17 @@ fn worker_crash_recovery_and_retry() {
     let records = fixture.records();
     assert_eq!(records[0]["state"], "failed");
     assert_eq!(records[0]["stage"], "worker_lost");
+    let retry_started = std::time::Instant::now();
     let output = fixture
         .command()
         .args(["jobs", "--retry", id])
         .output()
         .unwrap();
     assert!(output.status.success());
+    assert!(
+        retry_started.elapsed() < Duration::from_secs(5),
+        "retry CLI waited for the background worker"
+    );
     let retried: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_ne!(retried["id"], id);
     let id = retried["id"].as_str().unwrap();
