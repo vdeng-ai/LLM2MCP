@@ -87,7 +87,7 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
     } else {
         serde_json::from_slice(&bytes).unwrap()
     };
-    let _ = sender.send(payload);
+    let _ = sender.send(payload.clone());
     let number = count.fetch_add(1, Ordering::Relaxed);
     if mode == "slow" && !listing {
         thread::sleep(Duration::from_secs(30));
@@ -99,9 +99,30 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
     } else if listing {
         (200, json!({"data":[{"id":"mock"}]}))
     } else {
+        let system = payload["messages"][0]["content"].as_str().unwrap_or("");
+        let user = payload["messages"][1]["content"].as_str().unwrap_or("");
+        let mut content = json!({"conclusion":"Mock analysis","findings":[],"risks":[],"tests":[],"actions":[],"read_next":[]}).to_string();
+        if system.contains("synthesizing project documentation") {
+            let targets = user
+                .split("TARGET DOCUMENTS\n")
+                .nth(1)
+                .unwrap()
+                .split("\n\n")
+                .next()
+                .unwrap();
+            content = targets.lines().map(|path| format!("===== DOCUMENT: {path} =====\n# Mock documentation\n===== END DOCUMENT =====")).collect::<Vec<_>>().join("\n");
+        }
+        if mode == "malformed_once" && number == 0 {
+            content = "{broken".into();
+        }
+        let finish = if mode == "always_truncated" || (mode == "truncated_once" && number == 0) {
+            "length"
+        } else {
+            "stop"
+        };
         (
             200,
-            json!({"choices":[{"message":{"content":"{\"conclusion\":\"Mock analysis\",\"findings\":[],\"risks\":[],\"actions\":[],\"read_next\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20}}),
+            json!({"choices":[{"message":{"content":content},"finish_reason":finish}],"usage":{"prompt_tokens":100,"completion_tokens":20}}),
         )
     };
     let body = body.to_string();
@@ -506,4 +527,30 @@ fn cache_age_and_size_prune_oldest_entries() {
     assert!(cache.join("newest.md").exists());
     assert!(!cache.join("expired.md").exists());
     assert!(!cache.join("older.md").exists());
+}
+
+#[test]
+fn incomplete_and_malformed_outputs_recover_with_bounded_attempts() {
+    for (mode, success, calls) in [
+        ("truncated_once", true, 2),
+        ("malformed_once", true, 2),
+        ("always_truncated", false, 3),
+    ] {
+        let http = Http::new(mode);
+        let fixture = Fixture::new(&http, "sync");
+        let mut mcp = Mcp::new(&fixture);
+        mcp.analyze(1);
+        let reply = mcp.receive();
+        assert_eq!(reply["result"]["isError"], !success, "{mode}: {reply}");
+        for _ in 0..calls {
+            http.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(http.requests.try_recv().is_err());
+        let record = &fixture.records()[0];
+        assert_eq!(
+            record["state"],
+            if success { "completed" } else { "failed" }
+        );
+        assert_eq!(record["prompt_tokens"], calls * 100);
+    }
 }

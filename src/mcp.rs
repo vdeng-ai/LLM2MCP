@@ -78,7 +78,7 @@ Cite concrete file paths and symbols. Do not invent missing behavior. Do not wri
 
 const DOC_REDUCE_SYSTEM: &str = r#"You are a senior technical writer synthesizing project documentation from repository-map summaries produced from local source code.
 Write documentation that is useful to developers and grounded only in the supplied evidence. Clearly mark unknowns instead of guessing. Prefer concrete file paths, modules, symbols, commands, and data flows. Mermaid diagrams are welcome when relationships are supported by evidence.
-When asked for multiple documents, emit each document as a complete Markdown block delimited exactly by:
+For every requested document, emit each document as a complete Markdown block delimited exactly by:
 ===== DOCUMENT: relative/path.md =====
 ...content...
 ===== END DOCUMENT =====
@@ -839,17 +839,120 @@ fn chat_with_reporter(
     max_output_tokens: u32,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    let response =
-        chat_detailed_with_reporter(config, system, user, effort, max_output_tokens, reporter)?;
-    response
-        .final_text()
-        .map(|value| value.trim().to_owned())
-        .with_context(|| {
+    let attempts = reduce_reasoning_attempts(effort);
+    let mut diagnostics = String::new();
+    for attempt in 0..3 {
+        let prompt = if attempt == 0 {
+            user.to_owned()
+        } else {
             format!(
-                "LLM returned no final message content ({})",
-                response.diagnostics()
+                "{user}\n\nRECOVERY: Previous output was incomplete or invalid. Emit the complete requested response, with all required fields and document boundaries. Keep it concise."
             )
-        })
+        };
+        let input = workspace::estimate_tokens(&config.system_prompt_prefix)
+            + workspace::estimate_tokens(system)
+            + workspace::estimate_tokens(&prompt)
+            + 256;
+        let ceiling = config
+            .model_input_limit
+            .saturating_sub(input)
+            .min(config.model_output_limit as usize) as u32;
+        let budget = max_output_tokens.saturating_mul(1 << attempt).min(ceiling);
+        if budget < 128 {
+            bail!(
+                "estimated input plus output exceeds model context limit; insufficient context for output recovery"
+            );
+        }
+        let response = chat_detailed_with_reporter(
+            config,
+            system,
+            &prompt,
+            attempts[attempt.min(attempts.len() - 1)],
+            budget,
+            reporter,
+        )?;
+        diagnostics = response.diagnostics();
+        if let Some(content) = response.final_text() {
+            match validate_model_output(system, user, content) {
+                Ok(()) => return Ok(content.trim().to_owned()),
+                Err(error) => diagnostics = format!("{diagnostics}; {error}"),
+            }
+        }
+    }
+    bail!("model output incomplete or invalid after 3 attempts: {diagnostics}")
+}
+
+fn validate_model_output(system: &str, user: &str, content: &str) -> Result<()> {
+    if system == DOC_REDUCE_SYSTEM {
+        let targets = user
+            .split("TARGET DOCUMENTS\n")
+            .nth(1)
+            .and_then(|text| text.split("\n\n").next())
+            .context("missing document targets")?;
+        let mut remaining = content.trim();
+        for path in targets.lines() {
+            let marker = format!("===== DOCUMENT: {path} =====");
+            let body = remaining
+                .strip_prefix(&marker)
+                .context("missing or reordered document boundary")?;
+            let (body, rest) = body
+                .split_once("===== END DOCUMENT =====")
+                .context("unfinished document")?;
+            if body.trim().is_empty() {
+                bail!("empty document");
+            }
+            remaining = rest.trim();
+        }
+        if !remaining.is_empty() {
+            bail!("unexpected text after documents");
+        }
+        return Ok(());
+    }
+    let (strings, arrays): (&[&str], &[&str]) = if system == ANALYZE_SYSTEM {
+        (
+            &["conclusion"],
+            &["findings", "risks", "actions", "read_next"],
+        )
+    } else if system == DEBUG_SYSTEM {
+        (
+            &["diagnosis", "confidence", "root_cause", "intermittency"],
+            &[
+                "evidence",
+                "execution_path",
+                "alternatives",
+                "verification",
+                "fix_area",
+                "read_next",
+            ],
+        )
+    } else if system == PLAN_SYSTEM {
+        (&["goal"], &["steps", "risks", "tests", "read_next"])
+    } else if system == REVIEW_SYSTEM {
+        (&["conclusion"], &["findings", "tests", "actions"])
+    } else if system == DISCOVERY_SYSTEM {
+        (&[], &["symbols", "files"])
+    } else if system == UPDATE_DOCS_SYSTEM {
+        let value: Value = serde_json::from_str(content).context("invalid document edit JSON")?;
+        serde_json::from_value::<crate::doc_edits::Updates>(value)?;
+        return Ok(());
+    } else {
+        return Ok(());
+    };
+    let value: Value = serde_json::from_str(content).context("invalid response JSON")?;
+    if !value.is_object() {
+        bail!("response must be an object");
+    }
+    for key in strings {
+        if !value.get(key).is_some_and(Value::is_string) {
+            bail!("missing string field {key}");
+        }
+    }
+    for key in arrays {
+        if !value.get(key).is_some_and(Value::is_array) {
+            bail!("missing array field {key}");
+        }
+    }
+    Ok(())
 }
 
 fn source_filters(args: &Value) -> (Vec<String>, Vec<String>) {
@@ -1902,56 +2005,22 @@ fn document_repo(
         summaries_text,
     );
 
-    let attempts = reduce_reasoning_attempts(tool.reasoning);
-    let mut last_diagnostics = String::from("no response received");
-    for (attempt_index, effort) in attempts.iter().copied().enumerate() {
-        let stage = if attempt_index == 0 {
-            "synthesizing documentation"
-        } else {
-            "retrying synthesis with lower reasoning"
-        };
-        progress(reporter, stage, total_chunks as u64, total_steps)?;
-
-        let prompt = if attempt_index == 0 {
-            base_prompt.clone()
-        } else {
-            format!(
-                "{base_prompt}\n\nSYNTHESIS RETRY DIRECTIVE\nThe previous synthesis attempt exhausted or failed to produce final message content. Do not perform extended reasoning. Use the existing repository-map evidence and emit the requested final Markdown immediately."
-            )
-        };
-        let response = chat_detailed_with_reporter(
-            config,
-            DOC_REDUCE_SYSTEM,
-            &prompt,
-            effort,
-            tool.max_output_tokens,
-            reporter,
-        )?;
-        if let Some(content) = response.final_text() {
-            progress(reporter, "finishing", total_steps, total_steps)?;
-            return Ok(format!("{coverage_note}\n\n{}", content.trim()));
-        }
-
-        last_diagnostics = response.diagnostics();
-        eprintln!(
-            "LLM2MCP document_repo Reduce attempt {} ({:?}) returned no final content: {}",
-            attempt_index + 1,
-            effort,
-            last_diagnostics
-        );
-        if !response.exhausted_before_final() {
-            eprintln!(
-                "LLM2MCP Reduce response was empty without a clear token-exhaustion signal; trying the next lower reasoning level if available"
-            );
-        }
-    }
-
-    let _ = progress(reporter, "reduce_failed", total_chunks as u64, total_steps);
-    bail!(
-        "document synthesis produced no final Markdown after {} reasoning attempt(s); last response: {}",
-        attempts.len(),
-        last_diagnostics
-    )
+    progress(
+        reporter,
+        "synthesizing documentation",
+        total_chunks as u64,
+        total_steps,
+    )?;
+    let content = chat_with_reporter(
+        config,
+        DOC_REDUCE_SYSTEM,
+        &base_prompt,
+        tool.reasoning,
+        tool.max_output_tokens,
+        reporter,
+    )?;
+    progress(reporter, "finishing", total_steps, total_steps)?;
+    Ok(format!("{coverage_note}\n\n{content}"))
 }
 
 fn update_docs(
