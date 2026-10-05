@@ -206,6 +206,13 @@ fn rpc_response(root: &Path, request: &Value) -> Value {
 
 pub fn run_job_worker(job_id: &str) -> Result<()> {
     let _lease = jobs::worker_lease(job_id)?;
+    if let Err(error) = run_job_worker_inner(job_id) {
+        jobs::fail(job_id, &format!("LLM2MCP error: {error:#}"))?;
+    }
+    Ok(())
+}
+
+fn run_job_worker_inner(job_id: &str) -> Result<()> {
     let record = jobs::load(job_id)?;
     if record.state != JobState::Working {
         return Ok(());

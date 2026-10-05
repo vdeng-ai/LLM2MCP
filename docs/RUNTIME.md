@@ -1,6 +1,6 @@
 # Runtime, profiles, diagnostics and job history
 
-These features are part of the development branch; installing an older release does not enable them. Existing JSON configuration migrates with defaults and keeps the original endpoint/model when no named profile is selected.
+These features are available from the main branch; installing an older release does not enable them. Existing JSON configuration migrates with defaults and keeps the original endpoint/model when no named profile is selected.
 
 ## Quick start
 

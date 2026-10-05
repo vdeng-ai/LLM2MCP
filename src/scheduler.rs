@@ -24,7 +24,8 @@ impl Slot {
                     .open(dir.join(format!("{pool}-{index}.lock")))?;
                 match file.try_lock_exclusive() {
                     Ok(()) => return Ok(Self { _file: file }),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error)
+                        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
                     Err(error) => return Err(error.into()),
                 }
             }
