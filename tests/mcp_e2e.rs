@@ -58,6 +58,8 @@ impl Drop for Http {
     }
 }
 fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count: &AtomicUsize) {
+    // Accepted sockets inherit the nonblocking listener mode on Windows.
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
