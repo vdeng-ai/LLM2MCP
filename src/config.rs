@@ -477,6 +477,18 @@ fn apply_env_overrides(config: &mut AppConfig) {
     {
         config.model = value;
     }
+    if let Ok(value) = std::env::var("LLM2MCP_ACTIVE_PROFILE")
+        && !value.trim().is_empty()
+    {
+        config.active_profile = Some(value);
+    }
+    if let Ok(value) = std::env::var("LLM2MCP_ANALYZE_EXECUTION") {
+        config.tools.analyze.execution = Some(match value.as_str() {
+            "async" => ExecutionMode::Async,
+            "sync" => ExecutionMode::Sync,
+            _ => ExecutionMode::Auto,
+        });
+    }
     if let Ok(value) = std::env::var("LLM2MCP_API_KEY") {
         config.api_key = value;
     }

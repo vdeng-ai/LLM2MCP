@@ -578,3 +578,95 @@ fn small_routed_model_receives_bounded_source_and_output() {
     assert!(request["messages"][1]["content"].as_str().unwrap().len() < 10000);
     assert!(fixture.records()[0]["source_truncated"].as_bool().unwrap());
 }
+
+fn tasks_meta() -> Value {
+    json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}}})
+}
+
+#[test]
+fn modern_tasks_complete_after_reconnect_and_match_portable_result() {
+    let http = Http::new("ok");
+    let fixture = Fixture::new(&http, "async");
+    let mut mcp = Mcp::new(&fixture);
+    mcp.send(
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":tasks_meta()}}),
+    );
+    let discovery = mcp.receive();
+    assert!(
+        discovery["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+            .is_object()
+    );
+    mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":tasks_meta(),"name":"analyze","arguments":{"task":"explain main","paths":["main.rs"]}}}));
+    let reply = mcp.receive();
+    assert_eq!(reply["result"]["resultType"], "task", "{reply}");
+    let id = reply["result"]["taskId"].as_str().unwrap().to_owned();
+    drop(mcp);
+    assert_eq!(fixture.terminal(&id)["state"], "completed");
+    let mut reconnected = Mcp::new(&fixture);
+    reconnected.send(json!({"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"_meta":tasks_meta(),"taskId":id}}));
+    let task = reconnected.receive();
+    assert_eq!(task["result"]["status"], "completed");
+    reconnected.send(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"job_result","arguments":{"job_id":id}}}));
+    assert_eq!(reconnected.receive()["result"], task["result"]["result"]);
+}
+
+#[test]
+fn modern_tasks_cancel_active_http_and_reject_missing_capability() {
+    let http = Http::new("slow");
+    let fixture = Fixture::new(&http, "async");
+    let mut mcp = Mcp::new(&fixture);
+    mcp.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":tasks_meta(),"name":"analyze","arguments":{"task":"explain main","paths":["main.rs"]}}}));
+    let started = mcp.receive();
+    let id = started["result"]["taskId"].as_str().unwrap().to_owned();
+    http.requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"taskId":id}}));
+    assert_eq!(mcp.receive()["error"]["code"], -32003);
+    mcp.send(json!({"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"_meta":tasks_meta(),"taskId":id}}));
+    assert!(mcp.receive().get("error").is_none());
+    assert_eq!(fixture.terminal(&id)["state"], "cancelled");
+}
+
+#[test]
+fn deep_doctor_verifies_real_analysis_and_durable_lifecycle() {
+    let http = Http::new("ok");
+    let fixture = Fixture::new(&http, "sync");
+    let output = fixture
+        .command()
+        .args([
+            "doctor",
+            "--json",
+            "--deep",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--path",
+            "main.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["name"] == "Deep MCP lifecycle" && check["ok"] == true)
+    );
+    assert!(
+        fixture
+            .records()
+            .iter()
+            .any(|record| record["state"] == "completed" && record["llm_calls"] == 1)
+    );
+    assert!(
+        fixture
+            .records()
+            .iter()
+            .any(|record| record["state"] == "cancelled" && record["llm_calls"] == 0)
+    );
+}

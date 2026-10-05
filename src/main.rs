@@ -53,6 +53,14 @@ enum Command {
         json: bool,
         #[arg(long)]
         profile: Option<String>,
+        /// Execute a real analysis and verify durable Tasks, reconnection and cancellation.
+        #[arg(long)]
+        deep: bool,
+        #[arg(long, requires = "deep")]
+        workspace: Option<PathBuf>,
+        /// A workspace-relative source file used for the opt-in deep analysis.
+        #[arg(long, requires = "deep", default_value = "README.md")]
+        path: String,
     },
     /// List/export recent jobs, request cancellation or rerun a terminal job.
     Jobs {
@@ -85,12 +93,24 @@ fn main() -> Result<()> {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
             mcp::run(&workspace)
         }
-        Some(Command::Doctor { json, profile }) => {
+        Some(Command::Doctor {
+            json,
+            profile,
+            deep,
+            workspace,
+            path,
+        }) => {
             let mut config = config::load()?;
             if profile.is_some() {
                 config.active_profile = profile;
             }
-            let report = doctor::run(&config);
+            let mut report = doctor::run(&config);
+            if deep {
+                let workspace = workspace.unwrap_or(std::env::current_dir()?);
+                report
+                    .checks
+                    .push(doctor::deep_check(&config, &workspace, &path));
+            }
             println!(
                 "{}",
                 if json {
