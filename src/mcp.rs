@@ -1744,7 +1744,7 @@ fn document_repo(
         .unwrap_or("developer");
     let paths = paths_arg(args);
     let (include, exclude) = source_filters(args);
-    let chunks = workspace::collect_chunks_filtered(
+    let (chunks, coverage) = workspace::collect_chunks_filtered(
         root,
         &paths,
         config,
@@ -1756,6 +1756,7 @@ fn document_repo(
     if chunks.is_empty() {
         bail!("no readable source files found for documentation");
     }
+    let coverage_note = coverage.summary();
 
     // Repository-map summaries are evidence extraction, not final prose. Keeping
     // them compact dramatically reduces both map time and final Reduce context.
@@ -1897,10 +1898,11 @@ fn document_repo(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let summaries_text = format!("{coverage_note}\n\n{}", summaries.join("\n\n"));
     let base_prompt = format!(
         "DOCUMENT TYPE\n{document_type}\n\nTARGET DOCUMENTS\n{}\n\nAUDIENCE\n{audience}\n\nOUTPUT LANGUAGE\n{language}\n\nREPOSITORY MANIFEST\n{manifest}\n\nREPOSITORY MAP SUMMARIES\n{}\n\nSCAN_TRUNCATED\n{scan_truncated}\n\nSynthesize the requested documentation. For full mode, return every target document as a complete Markdown document. For a single document type, return exactly that target document. Ground claims in the repository evidence and mark unknowns instead of guessing. Emit the final Markdown directly; do not spend the output budget restating your analysis.",
         document_targets(document_type),
-        summaries.join("\n\n"),
+        summaries_text,
     );
 
     let attempts = reduce_reasoning_attempts(tool.reasoning);
@@ -1930,7 +1932,7 @@ fn document_repo(
         )?;
         if let Some(content) = response.final_text() {
             progress(reporter, "finishing", total_steps, total_steps)?;
-            return Ok(content.trim().to_owned());
+            return Ok(format!("{coverage_note}\n\n{}", content.trim()));
         }
 
         last_diagnostics = response.diagnostics();
