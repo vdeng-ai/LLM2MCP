@@ -515,7 +515,7 @@ pub fn collect_filtered(
 
     let per_file_budget = config
         .max_file_tokens
-        .min(config.max_source_tokens.saturating_sub(250).max(500));
+        .min(config.max_source_tokens.saturating_sub(128).max(16));
     for file in files {
         crate::control::Control::current().check()?;
         let Ok((relative, chunk)) = file_chunk(&root, &file, per_file_budget) else {
@@ -534,7 +534,7 @@ pub fn collect_filtered(
     }
 
     Ok(CollectedSource {
-        manifest: manifest(&root)?,
+        manifest: truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]"),
         body,
         included_files,
         truncated,
@@ -558,10 +558,8 @@ pub fn collect_chunks_filtered(
     } else {
         requested_files(&root, requested, include, exclude)?
     };
-    let manifest = manifest(&root)?;
-    let chunk_limit = chunk_tokens
-        .max(2_500)
-        .min(config.max_source_tokens.max(2_500));
+    let manifest = truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]");
+    let chunk_limit = chunk_tokens.max(128).min(config.max_source_tokens.max(128));
     let mut chunks = Vec::new();
     let mut body = String::new();
     let mut body_tokens = 0usize;
@@ -573,7 +571,7 @@ pub fn collect_chunks_filtered(
     };
     let max_file_tokens = config
         .max_file_tokens
-        .min(chunk_limit.saturating_sub(250).max(500));
+        .min(chunk_limit.saturating_sub(128).max(16));
 
     for file in files {
         crate::control::Control::current().check()?;
@@ -1117,7 +1115,7 @@ pub fn collect_symbol_context(
     );
 
     Ok(CollectedSource {
-        manifest: manifest(&root)?,
+        manifest: truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]"),
         body,
         included_files,
         truncated,

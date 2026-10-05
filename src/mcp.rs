@@ -742,7 +742,47 @@ fn execute_business_inner(
     args: &Value,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    let routed = config.for_tool(name)?;
+    let mut routed = config.for_tool(name)?;
+    let system = match name {
+        "analyze" => ANALYZE_SYSTEM,
+        "debug_issue" => DEBUG_SYSTEM,
+        "plan" => PLAN_SYSTEM,
+        "review_diff" => REVIEW_SYSTEM,
+        "document_repo" => DOC_REDUCE_SYSTEM,
+        "update_docs" => UPDATE_DOCS_SYSTEM,
+        _ => bail!("unknown tool"),
+    };
+    let output = routed
+        .model_output_limit
+        .min((routed.model_input_limit / 4) as u32);
+    for tool in [
+        &mut routed.tools.analyze,
+        &mut routed.tools.debug_issue,
+        &mut routed.tools.plan,
+        &mut routed.tools.review_diff,
+        &mut routed.tools.document_repo,
+        &mut routed.tools.update_docs,
+    ] {
+        tool.max_output_tokens = tool.max_output_tokens.min(output);
+    }
+    let metadata = format!(
+        "{}\n{}",
+        args,
+        workspace::truncate_tokens_strict(
+            &workspace::manifest(root)?,
+            1024,
+            "[MANIFEST TRUNCATED]"
+        )
+    );
+    let requested_output = match name {
+        "analyze" => routed.tools.analyze.max_output_tokens,
+        "debug_issue" => routed.tools.debug_issue.max_output_tokens,
+        "plan" => routed.tools.plan.max_output_tokens,
+        "review_diff" => routed.tools.review_diff.max_output_tokens,
+        "document_repo" => routed.tools.document_repo.max_output_tokens,
+        _ => routed.tools.update_docs.max_output_tokens,
+    };
+    let routed = budgeted_config(&routed, system, &metadata, requested_output)?;
     let config = &routed;
     match name {
         "analyze" => analyze(config, root, args, &config.tools.analyze, reporter),
@@ -753,6 +793,31 @@ fn execute_business_inner(
         "update_docs" => update_docs(config, root, args, &config.tools.update_docs, reporter),
         _ => bail!("unknown background tool: {name}"),
     }
+}
+
+fn budgeted_config(
+    config: &AppConfig,
+    system: &str,
+    metadata: &str,
+    output: u32,
+) -> Result<AppConfig> {
+    let reserve = workspace::estimate_tokens(&config.system_prompt_prefix)
+        + workspace::estimate_tokens(system)
+        + workspace::estimate_tokens(metadata)
+        + 1024
+        + output.min(config.model_output_limit) as usize;
+    let available = config.model_input_limit.saturating_sub(reserve);
+    if available < 256 || output < 128 {
+        bail!(
+            "prompt overhead exceeds model context limit {}",
+            config.model_input_limit
+        );
+    }
+    let mut bounded = config.clone();
+    bounded.max_source_tokens = config.max_source_tokens.min(available);
+    bounded.max_file_tokens = config.max_file_tokens.min(available.saturating_sub(128));
+    bounded.discovery_index_tokens = config.discovery_index_tokens.min(available);
+    Ok(bounded)
 }
 
 fn paths_arg(args: &Value) -> Vec<String> {
@@ -1159,8 +1224,20 @@ fn discover_deep_context(
         });
     }
 
-    let index =
-        workspace::discovery_index_for_task(root, requested, config, include, exclude, task)?;
+    let discovery_config = config.with_profile(config.discovery_profile.as_deref())?;
+    let discovery_output = 1200
+        .min(discovery_config.model_output_limit)
+        .min((discovery_config.model_input_limit / 4) as u32);
+    let discovery_config =
+        budgeted_config(&discovery_config, DISCOVERY_SYSTEM, task, discovery_output)?;
+    let index = workspace::discovery_index_for_task(
+        root,
+        requested,
+        &discovery_config,
+        include,
+        exclude,
+        task,
+    )?;
     if let Some(reporter) = reporter {
         reporter.record_cache_usage(index.cache_hits as u64, index.cache_misses as u64, 0, 0)?;
     }
@@ -1190,13 +1267,12 @@ fn discover_deep_context(
         "TASK\n{task}\n\nCANDIDATE FILE/SYMBOL INDEX\n{}\n\nINDEX_TRUNCATED\n{}\n\nSelect the smallest exact symbol ranges/files needed for a deep second pass. Return JSON only.",
         index.body, index.truncated
     );
-    let discovery_config = config.with_profile(config.discovery_profile.as_deref())?;
     let selection = chat_with_reporter(
         &discovery_config,
         DISCOVERY_SYSTEM,
         &prompt,
         ReasoningEffort::Low,
-        1_200,
+        discovery_output,
         reporter,
     )?;
     let (mut symbols, mut files) = parse_discovery_selection(&selection, &index);
@@ -1529,15 +1605,15 @@ fn debug_issue(
     // Reserve part of the configured source budget for runtime evidence so
     // logs/diffs do not silently make debug requests much larger than normal.
     let mut debug_context_config = config.clone();
-    debug_context_config.max_source_tokens = (config.max_source_tokens * 3 / 4).max(2_500);
+    debug_context_config.max_source_tokens = (config.max_source_tokens / 2).max(128);
     let auxiliary_budget = config
         .max_source_tokens
         .saturating_sub(debug_context_config.max_source_tokens)
-        .max(1_000);
-    let logs_budget = (auxiliary_budget / 2).clamp(500, 8_000);
+        .max(128);
+    let logs_budget = (auxiliary_budget / 2).clamp(64, 8_000);
     let diff_budget = auxiliary_budget
         .saturating_sub(logs_budget)
-        .clamp(500, 12_000);
+        .clamp(64, 12_000);
 
     let logs_for_prompt =
         workspace::truncate_tokens_strict(logs, logs_budget, "\n[DEBUG LOGS TRUNCATED]\n");
@@ -1844,11 +1920,17 @@ fn document_repo(
         .unwrap_or("developer");
     let paths = paths_arg(args);
     let (include, exclude) = source_filters(args);
+    let map_config = config.with_profile(config.map_profile.as_deref())?;
+    let map_tokens = (tool.max_output_tokens / 10)
+        .clamp(128, 1200)
+        .min(map_config.model_output_limit)
+        .min((map_config.model_input_limit / 4) as u32);
+    let map_config = budgeted_config(&map_config, DOC_MAP_SYSTEM, &args.to_string(), map_tokens)?;
     let (chunks, coverage) = workspace::collect_chunks_filtered(
         root,
         &paths,
-        config,
-        config.max_source_tokens.min(MAX_CHUNK_TOKENS),
+        &map_config,
+        map_config.max_source_tokens.min(MAX_CHUNK_TOKENS),
         MAX_CHUNKS,
         &include,
         &exclude,
@@ -1860,8 +1942,7 @@ fn document_repo(
 
     // Repository-map summaries are evidence extraction, not final prose. Keeping
     // them compact dramatically reduces both map time and final Reduce context.
-    let map_tokens = (tool.max_output_tokens / 10).clamp(800, 1_200);
-    let map_config = config.with_profile(config.map_profile.as_deref())?;
+
     if let Some(reporter) = reporter {
         reporter.record_context(
             chunks
@@ -1998,7 +2079,21 @@ fn document_repo(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let summaries_text = format!("{coverage_note}\n\n{}", summaries.join("\n\n"));
+    let summaries_budget = config.max_source_tokens;
+    let per_summary = summaries_budget.saturating_sub(workspace::estimate_tokens(&coverage_note))
+        / summaries.len().max(1);
+    let summaries_text = format!(
+        "{coverage_note}\n\n{}",
+        summaries
+            .iter()
+            .map(|summary| workspace::truncate_tokens_strict(
+                summary,
+                per_summary,
+                "[MAP SUMMARY TRUNCATED FOR SYNTHESIS]"
+            ))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
     let base_prompt = format!(
         "DOCUMENT TYPE\n{document_type}\n\nTARGET DOCUMENTS\n{}\n\nAUDIENCE\n{audience}\n\nOUTPUT LANGUAGE\n{language}\n\nREPOSITORY MANIFEST\n{manifest}\n\nREPOSITORY MAP SUMMARIES\n{}\n\nSCAN_TRUNCATED\n{scan_truncated}\n\nSynthesize the requested documentation. For full mode, return every target document as a complete Markdown document. For a single document type, return exactly that target document. Ground claims in the repository evidence and mark unknowns instead of guessing. Emit the final Markdown directly; do not spend the output budget restating your analysis.",
         document_targets(document_type),
@@ -2046,7 +2141,7 @@ fn update_docs(
         .and_then(Value::as_str)
         .unwrap_or("WORKTREE");
 
-    let per_side_tokens = (config.max_source_tokens / 2).max(2_500);
+    let per_side_tokens = (config.max_source_tokens / 2).max(128);
     let (diff, diff_truncated, comparison) = if target_ref.eq_ignore_ascii_case("WORKTREE") {
         let (_status, diff, truncated) = workspace::git_diff(root, base_ref, per_side_tokens)
             .context("update_docs requires a Git repository with a valid base_ref")?;

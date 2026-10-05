@@ -17,3 +17,7 @@ The primary agent must check the file's current SHA-256 before applying the edit
 ## Output completeness
 
 A nonempty response with `finish_reason=length` or `content_filter` is never accepted as final. Structured tools require their documented JSON fields; documentation synthesis requires every requested document boundary and a closing marker. The bridge makes at most three attempts, lowers reasoning when supported, and grows the output allowance within the selected model's context/output ceiling. Every attempt contributes to recorded usage and cost. Exhaustion reports failure instead of returning partial findings or Markdown.
+
+## Routed context budgets
+
+Each tool derives source limits from its routed model ceiling after reserving its system prefix, instructions, request metadata, manifest and final output. Discovery and Map derive their own limits before collecting evidence. Small models cap output reservations and source segment sizes; synthesis allocates space fairly across all Map summaries and marks shortened summaries. Provider preflight still rejects any request that exceeds the configured ceiling. Token counts are conservative local estimates, not a provider tokenizer guarantee.

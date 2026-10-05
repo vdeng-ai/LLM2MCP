@@ -554,3 +554,27 @@ fn incomplete_and_malformed_outputs_recover_with_bounded_attempts() {
         assert_eq!(record["prompt_tokens"], calls * 100);
     }
 }
+
+#[test]
+fn small_routed_model_receives_bounded_source_and_output() {
+    let http = Http::new("ok");
+    let fixture = Fixture::new(&http, "sync");
+    fs::write(
+        fixture.workspace.join("main.rs"),
+        "fn item() {}\n".repeat(10000),
+    )
+    .unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["profiles"] = json!([{"name":"small","base_url":http.url,"model":"small","max_input_tokens":4096,"max_output_tokens":512}]);
+    config["tools"]["analyze"]["model_profile"] = json!("small");
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    let mut mcp = Mcp::new(&fixture);
+    mcp.analyze(1);
+    let reply = mcp.receive();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let request = http.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(request["model"], "small");
+    assert!(request["messages"][1]["content"].as_str().unwrap().len() < 10000);
+    assert!(fixture.records()[0]["source_truncated"].as_bool().unwrap());
+}
