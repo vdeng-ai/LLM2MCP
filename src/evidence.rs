@@ -142,7 +142,7 @@ impl Catalog {
         catalog
     }
 
-    fn accepts(&self, citation: &str) -> bool {
+    pub(crate) fn accepts(&self, citation: &str) -> bool {
         if let Some(excerpt) = citation.strip_prefix("log:") {
             return excerpt.trim().chars().count() >= 8 && self.logs.contains(excerpt.trim());
         }

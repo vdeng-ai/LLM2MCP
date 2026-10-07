@@ -113,6 +113,37 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
                 "fix_area":[], "read_next":[]
             }).to_string();
         }
+        if mode.starts_with("supplement") && system.contains("secondary code-analysis") {
+            if number > 0 && mode == "supplement_slow" {
+                thread::sleep(Duration::from_secs(30));
+            }
+            content = if number == 0 && mode == "supplement_text" {
+                json!({"conclusion":"Need literal evidence","findings":[],"risks":[],"actions":[],"read_next":[],"context_requests":[{"query":"late_literal_marker","paths":[]}]}).to_string()
+            } else if number == 0 {
+                json!({"conclusion":"Need worker evidence","findings":[],"risks":[],"actions":[],"read_next":[],
+                    "context_requests":[{"query":"worker_timeout_secs","paths":["worker.rs"]},
+                    {"query":"PRIVATE_FILE_MUST_NOT_APPEAR","paths":["secrets.txt","../outside.rs"]}]}).to_string()
+            } else {
+                let evidence = if mode == "supplement_text" {
+                    assert!(user.contains("late_literal_marker = 42"));
+                    "data.rs:202"
+                } else {
+                    assert!(user.contains("fn worker_timeout_secs"));
+                    "worker.rs:1"
+                };
+                let mut findings=(0..20).map(|index| json!({"severity":"low","text":format!("PAGE_ONLY_{index} 中文🙂"),"evidence":[evidence]})).collect::<Vec<_>>();
+                findings.push(json!({"severity":"critical","text":"Worker timeout requires verification","evidence":[evidence]}));
+                json!({"conclusion":"Worker inspected","findings":findings,"risks":[],"actions":[],"read_next":[],
+                    "context_requests":[{"query":"more evidence","paths":["missing.rs"]}]}).to_string()
+            };
+        }
+        if mode == "scan_tail" && system.contains("mapping one chunk") {
+            content = if user.contains("scan_item_69") {
+                "LATE_TAIL_EVIDENCE".to_owned()
+            } else {
+                "mapped earlier evidence".to_owned()
+            };
+        }
         if mode == "document_fragments"
             && system.contains("updating software project documentation")
         {
@@ -148,7 +179,18 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
                 .split("\n\n")
                 .next()
                 .unwrap();
-            content = targets.lines().map(|path| format!("===== DOCUMENT: {path} =====\n# Mock documentation\n===== END DOCUMENT =====")).collect::<Vec<_>>().join("\n");
+            let body = if mode == "scan_tail" && user.contains("LATE_TAIL_EVIDENCE") {
+                "LATE_TAIL_EVIDENCE"
+            } else {
+                "Mock documentation"
+            };
+            content = targets
+                .lines()
+                .map(|path| {
+                    format!("===== DOCUMENT: {path} =====\n# {body}\n===== END DOCUMENT =====")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
         }
         if mode == "malformed_once" && number == 0 {
             content = "{broken".into();
@@ -793,4 +835,413 @@ fn deep_doctor_verifies_real_analysis_and_durable_lifecycle() {
             .iter()
             .any(|record| record["state"] == "cancelled" && record["llm_calls"] == 0)
     );
+}
+
+fn call(mcp: &mut Mcp, id: i64, name: &str, arguments: Value) -> Value {
+    mcp.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}));
+    let reply = mcp.receive();
+    assert_eq!(reply["id"], id);
+    reply
+}
+fn complete_pages(mcp: &mut Mcp, job: &str) -> String {
+    let mut cursor = None;
+    let mut output = String::new();
+    let mut pages = 0;
+    loop {
+        let mut args = json!({"job_id":job,"page_tokens":512});
+        if let Some(cursor) = &cursor {
+            args["cursor"] = json!(cursor);
+        }
+        let reply = call(mcp, 900, "result_page", args);
+        assert!(reply.get("error").is_none(), "{reply}");
+        let page: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(page["offset"].as_u64().unwrap() as usize, output.len());
+        output.push_str(page["text"].as_str().unwrap());
+        pages += 1;
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            assert_eq!(page["complete"], true);
+            break;
+        }
+        assert!(pages < 200);
+    }
+    output
+}
+fn supplemental_fixture(http: &Http, execution: &str) -> Fixture {
+    let fixture = Fixture::new(http, execution);
+    fs::write(
+        fixture.workspace.join("worker.rs"),
+        "fn worker_timeout_secs() -> u64 { 30 }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.workspace.join("secrets.txt"),
+        "PRIVATE_FILE_MUST_NOT_APPEAR\n",
+    )
+    .unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["tools"]["analyze"]["max_output_tokens"] = json!(4096);
+    config["tools"]["analyze"]["primary_return_tokens"] = json!(128);
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    fixture
+}
+#[test]
+fn supplemental_retrieval_is_bounded_and_complete_result_survives_reconnect() {
+    let http = Http::new("supplement");
+    let fixture = supplemental_fixture(&http, "sync");
+    let mut mcp = Mcp::new(&fixture);
+    let reply = call(
+        &mut mcp,
+        1,
+        "analyze",
+        json!({"task":"explain main","paths":["main.rs"]}),
+    );
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let job = reply["result"]["_meta"]["llm2mcp/job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("FULL_RESULT")
+    );
+    assert_eq!(fixture.terminal(&job)["llm_calls"], 2);
+    let first = http.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    let second = http.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(!first.to_string().contains("fn worker_timeout_secs"));
+    assert!(second.to_string().contains("fn worker_timeout_secs"));
+    assert!(!second.to_string().contains("PRIVATE_FILE_MUST_NOT_APPEAR"));
+    assert!(!second.to_string().contains("FAKE_SOURCE_SECRET"));
+    drop(mcp);
+    let mut reconnected = Mcp::new(&fixture);
+    let full = complete_pages(&mut reconnected, &job);
+    let value: Value = serde_json::from_str(&full).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 21);
+    assert!(full.contains("PAGE_ONLY_19"));
+    assert!(full.contains("one-round limit"));
+    assert_eq!(fixture.records()[0]["llm_calls"], 2);
+    assert!(http.requests.try_recv().is_err());
+}
+#[test]
+fn disabled_or_filtered_supplement_never_starts_another_analysis() {
+    for args in [
+        json!({"allow_supplement":false}),
+        json!({"exclude":["worker.rs"]}),
+    ] {
+        let http = Http::new("supplement");
+        let fixture = supplemental_fixture(&http, "sync");
+        let mut mcp = Mcp::new(&fixture);
+        let mut arguments = json!({"task":"explain main","paths":["main.rs"]});
+        for (key, value) in args.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        let reply = call(&mut mcp, 1, "analyze", arguments);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.records()[0]["llm_calls"], 1);
+    }
+}
+#[test]
+fn cancellation_interrupts_the_supplemental_model_call() {
+    let http = Http::new("supplement_slow");
+    let fixture = supplemental_fixture(&http, "sync");
+    let mut mcp = Mcp::new(&fixture);
+    mcp.analyze(1);
+    for _ in 0..2 {
+        http.requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}));
+    let reply = mcp.replies.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(fixture.records()[0]["state"], "cancelled");
+}
+#[test]
+fn async_pages_reject_foreign_workspaces_changed_artifacts_and_expiration() {
+    let http = Http::new("ok");
+    let mut fixture = Fixture::new(&http, "async");
+    let mut mcp = Mcp::new(&fixture);
+    mcp.analyze(1);
+    let reply = mcp.receive();
+    let job = reply["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(mcp);
+    let record = fixture.terminal(&job);
+    assert_eq!(record["state"], "completed");
+    let mut reconnected = Mcp::new(&fixture);
+    assert!(complete_pages(&mut reconnected, &job).contains("Mock analysis"));
+    for arguments in [
+        json!({"job_id":job,"page_tokens":-1}),
+        json!({"job_id":job,"page_tokens":128}),
+        json!({"job_id":job,"cursor":123}),
+    ] {
+        assert!(
+            call(&mut reconnected, 20, "result_page", arguments)
+                .get("error")
+                .is_some()
+        );
+    }
+    assert!(
+        call(&mut reconnected, 21, "continue_scan", json!({}))
+            .get("error")
+            .is_some()
+    );
+    let bad_cursor = call(
+        &mut reconnected,
+        2,
+        "result_page",
+        json!({"job_id":job,"cursor":"bad"}),
+    );
+    assert!(bad_cursor.get("error").is_some());
+    drop(reconnected);
+    let original = fixture.workspace.clone();
+    fixture.workspace = fixture._root.path().join("other-repo");
+    fs::create_dir(&fixture.workspace).unwrap();
+    let mut foreign = Mcp::new(&fixture);
+    assert!(
+        call(&mut foreign, 3, "result_page", json!({"job_id":job}))["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("different workspace")
+    );
+    drop(foreign);
+    fixture.workspace = original;
+    let artifact = fixture.data.join("jobs").join(format!("{job}.full.txt"));
+    fs::write(&artifact, "changed").unwrap();
+    let unfinished = artifact.with_extension("tmp");
+    fs::write(&unfinished, "abandoned artifact write").unwrap();
+    let mut mcp = Mcp::new(&fixture);
+    assert!(
+        call(&mut mcp, 4, "result_page", json!({"job_id":job}))["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("changed")
+    );
+    let path = fixture.data.join("jobs").join(format!("{job}.json"));
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["created_at"] = json!("2020-01-01T00:00:00Z");
+    fs::write(path, record.to_string()).unwrap();
+    assert!(
+        call(&mut mcp, 5, "result_page", json!({"job_id":job}))["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expired")
+    );
+    drop(mcp);
+    let mut cleaned = Mcp::new(&fixture);
+    cleaned.send(json!({"jsonrpc":"2.0","id":6,"method":"ping"}));
+    cleaned.receive();
+    assert!(!artifact.exists());
+    assert!(!unfinished.exists());
+    assert!(
+        !fixture
+            .data
+            .join("jobs")
+            .join(format!("{job}.json"))
+            .exists()
+    );
+}
+fn continuation(reply: &Value) -> Value {
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    let metadata = text
+        .split("SCAN_CONTINUATION\n")
+        .nth(1)
+        .unwrap()
+        .split('\n')
+        .next()
+        .unwrap();
+    serde_json::from_str(metadata).unwrap()
+}
+fn scan_fixture(http: &Http) -> Fixture {
+    let fixture = Fixture::new(http, "sync");
+    let text = (0..70)
+        .map(|index| format!("fn scan_item_{index}() {{}}\n"))
+        .collect::<String>();
+    fs::write(fixture.workspace.join("large.rs"), text).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["max_source_tokens"] = json!(512);
+    config["max_file_tokens"] = json!(180);
+    config["tools"]["document_repo"] =
+        json!({"reasoning":"off","max_output_tokens":2000,"execution":"sync"});
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    fixture
+}
+#[test]
+fn repository_scan_continues_after_reconnect_and_synthesizes_accumulated_evidence() {
+    let http = Http::new("scan_tail");
+    let fixture = scan_fixture(&http);
+    let mut mcp = Mcp::new(&fixture);
+    let first = call(
+        &mut mcp,
+        1,
+        "document_repo",
+        json!({"paths":["large.rs"],"max_chunks":1}),
+    );
+    let mut metadata = continuation(&first);
+    assert_eq!(metadata["complete"], false);
+    let first_cursor = metadata["scan_cursor"].as_str().unwrap().to_owned();
+    drop(mcp);
+    let mut mcp = Mcp::new(&fixture);
+    let replay = call(
+        &mut mcp,
+        2,
+        "continue_scan",
+        json!({"scan_cursor":first_cursor}),
+    );
+    let replay_metadata = continuation(&replay);
+    let same = call(
+        &mut mcp,
+        3,
+        "continue_scan",
+        json!({"scan_cursor":first_cursor}),
+    );
+    assert_eq!(continuation(&same), replay_metadata);
+    metadata = replay_metadata;
+    let mut pages = 2;
+    let mut final_reply = replay;
+    while !metadata["complete"].as_bool().unwrap() {
+        let cursor = metadata["scan_cursor"].as_str().unwrap();
+        final_reply = call(
+            &mut mcp,
+            10 + pages,
+            "continue_scan",
+            json!({"scan_cursor":cursor}),
+        );
+        metadata = continuation(&final_reply);
+        pages += 1;
+        assert!(pages < 30);
+    }
+    assert!(pages > 2);
+    assert_eq!(metadata["files_complete"], 1);
+    assert!(metadata["scan_cursor"].is_null());
+    assert!(
+        final_reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("LATE_TAIL_EVIDENCE")
+    );
+    let requests = http.requests.try_iter().collect::<Vec<_>>();
+    let maps = requests
+        .iter()
+        .filter(|request| {
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("mapping one chunk")
+        })
+        .collect::<Vec<_>>();
+    let joined = maps
+        .iter()
+        .map(|request| request["messages"][1]["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for index in 0..70 {
+        assert_eq!(
+            joined.matches(&format!("fn scan_item_{index}() ")).count(),
+            1
+        );
+    }
+    let job = final_reply["result"]["_meta"]["llm2mcp/job_id"]
+        .as_str()
+        .unwrap();
+    assert!(complete_pages(&mut mcp, job).contains("LATE_TAIL_EVIDENCE"));
+}
+#[test]
+fn scan_continuations_reject_changed_sources_options_profiles_and_foreign_workspaces() {
+    let http = Http::new("scan_tail");
+    let mut fixture = scan_fixture(&http);
+    let mut mcp = Mcp::new(&fixture);
+    let first = call(
+        &mut mcp,
+        1,
+        "document_repo",
+        json!({"paths":["large.rs"],"max_chunks":1}),
+    );
+    let metadata = continuation(&first);
+    let cursor = metadata["scan_cursor"].as_str().unwrap();
+    let changed_opts = call(
+        &mut mcp,
+        2,
+        "document_repo",
+        json!({"scan_cursor":cursor,"paths":["main.rs"]}),
+    );
+    assert!(
+        changed_opts["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("options changed")
+    );
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["system_prompt_prefix"] = json!("changed rules");
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    let profile = call(&mut mcp, 3, "continue_scan", json!({"scan_cursor":cursor}));
+    assert!(
+        profile["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("layout changed")
+    );
+    config["system_prompt_prefix"] = json!("");
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    fs::write(fixture.workspace.join("large.rs"), "changed").unwrap();
+    let changed = call(&mut mcp, 4, "continue_scan", json!({"scan_cursor":cursor}));
+    assert!(
+        changed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("repository changed")
+    );
+    drop(mcp);
+    fixture.workspace = fixture._root.path().join("foreign");
+    fs::create_dir(&fixture.workspace).unwrap();
+    let mut foreign = Mcp::new(&fixture);
+    let reply = call(
+        &mut foreign,
+        5,
+        "continue_scan",
+        json!({"scan_cursor":cursor}),
+    );
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("different workspace")
+    );
+    assert_eq!(http.requests.try_iter().count(), 2);
+}
+
+#[test]
+fn supplemental_literal_search_reaches_evidence_beyond_the_file_prefix() {
+    let http = Http::new("supplement_text");
+    let fixture = supplemental_fixture(&http, "sync");
+    let text = format!(
+        "fn unrelated_factory() {{\n{}let late_literal_marker = 42;\n}}\n",
+        "let unrelated = 1;\n".repeat(200)
+    );
+    fs::write(fixture.workspace.join("data.rs"), text).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["max_source_tokens"] = json!(1000);
+    config["max_file_tokens"] = json!(128);
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    let mut mcp = Mcp::new(&fixture);
+    let reply = call(
+        &mut mcp,
+        1,
+        "analyze",
+        json!({"task":"explain main","paths":["main.rs"]}),
+    );
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(fixture.records()[0]["llm_calls"], 2);
+    let job = reply["result"]["_meta"]["llm2mcp/job_id"].as_str().unwrap();
+    let full = complete_pages(&mut mcp, job);
+    assert!(full.contains("data.rs:202"));
+    assert!(!full.contains("UNVERIFIED"));
 }

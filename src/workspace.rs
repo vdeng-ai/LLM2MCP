@@ -58,7 +58,7 @@ pub struct CollectedSource {
     pub evidence_cache_misses: usize,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanCoverage {
     pub total_files: usize,
     pub complete_files: usize,
@@ -289,7 +289,7 @@ pub fn truncate_tokens_strict(text: &str, max_tokens: usize, marker: &str) -> St
     }
 }
 
-fn read_text_tokens(path: &Path, max_tokens: usize) -> Result<String> {
+pub(crate) fn read_text_tokens(path: &Path, max_tokens: usize) -> Result<String> {
     if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
         bail!("file exceeds 8 MiB source limit");
     }
@@ -301,7 +301,7 @@ fn read_text_tokens(path: &Path, max_tokens: usize) -> Result<String> {
     Ok(truncate_to_token_budget(&text, max_tokens, "\n\n[FILE TRUNCATED]\n").0)
 }
 
-fn normalized_relative(path: &Path) -> String {
+pub(crate) fn normalized_relative(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
         .trim_start_matches("./")
@@ -385,7 +385,7 @@ fn overview_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn requested_files(
+pub(crate) fn requested_files(
     root: &Path,
     requested: &[String],
     include: &[String],
@@ -547,120 +547,6 @@ pub fn collect_filtered(
         evidence_cache_hits: 0,
         evidence_cache_misses: 0,
     })
-}
-
-pub fn collect_chunks_filtered(
-    workspace: &Path,
-    requested: &[String],
-    config: &AppConfig,
-    chunk_tokens: usize,
-    max_chunks: usize,
-    include: &[String],
-    exclude: &[String],
-) -> Result<(Vec<CollectedSource>, ScanCoverage)> {
-    let root = canonical_workspace(workspace)?;
-    let files = if requested.is_empty() {
-        requested_files(&root, &[".".to_owned()], include, exclude)?
-    } else {
-        requested_files(&root, requested, include, exclude)?
-    };
-    let manifest = truncate_tokens_strict(&manifest(&root)?, 1024, "[MANIFEST TRUNCATED]");
-    let chunk_limit = chunk_tokens.max(128).min(config.max_source_tokens.max(128));
-    let mut chunks = Vec::new();
-    let mut body = String::new();
-    let mut body_tokens = 0usize;
-    let mut included_files = Vec::new();
-    let mut truncated = false;
-    let mut coverage = ScanCoverage {
-        total_files: files.len(),
-        ..Default::default()
-    };
-    let max_file_tokens = config
-        .max_file_tokens
-        .min(chunk_limit.saturating_sub(128).max(16));
-
-    for file in files {
-        crate::control::Control::current().check()?;
-        let relative = normalized_relative(file.strip_prefix(&root).unwrap_or(&file));
-        if chunks.len() >= max_chunks {
-            coverage
-                .omissions
-                .push(format!("- {relative}: not scanned (chunk limit)"));
-            truncated = true;
-            continue;
-        }
-        let text = match read_text_tokens(&file, usize::MAX) {
-            Ok(text) => text,
-            Err(error) => {
-                coverage.omissions.push(format!("- {relative}: {error}"));
-                truncated = true;
-                continue;
-            }
-        };
-        let total_lines = text.lines().count();
-        let segments = text_segments(&text, max_file_tokens.saturating_sub(128));
-        let mut complete = true;
-        for (part, (start, end, text)) in segments.iter().enumerate() {
-            let chunk = format!(
-                "\n===== FILE: {relative} LINES {start}-{end} PART {}/{} =====\n{text}\n===== END FILE =====\n",
-                part + 1,
-                segments.len()
-            );
-            let chunk_cost = estimate_tokens(&chunk);
-            let would_overflow =
-                !body.is_empty() && body_tokens.saturating_add(chunk_cost) > chunk_limit;
-            if would_overflow {
-                chunks.push(CollectedSource {
-                    manifest: manifest.clone(),
-                    body: std::mem::take(&mut body),
-                    included_files: std::mem::take(&mut included_files),
-                    truncated,
-                    evidence_cache_hits: 0,
-                    evidence_cache_misses: 0,
-                });
-                truncated = false;
-                body_tokens = 0;
-            }
-            if chunks.len() >= max_chunks {
-                coverage.omissions.push(format!(
-                    "- {relative}: lines {start}-{} not scanned (chunk limit)",
-                    total_lines.max(*end)
-                ));
-                complete = false;
-                truncated = true;
-                break;
-            }
-            coverage.segments += 1;
-            body_tokens = body_tokens.saturating_add(chunk_cost);
-            body.push_str(&chunk);
-            if !included_files.contains(&relative) {
-                included_files.push(relative.clone());
-            }
-        }
-        if complete {
-            coverage.complete_files += 1;
-        }
-    }
-
-    if !body.is_empty() && chunks.len() < max_chunks {
-        chunks.push(CollectedSource {
-            manifest,
-            body,
-            included_files,
-            truncated,
-            evidence_cache_hits: 0,
-            evidence_cache_misses: 0,
-        });
-    } else if truncated && let Some(last) = chunks.last_mut() {
-        last.truncated = true;
-    }
-
-    if !coverage.omissions.is_empty()
-        && let Some(last) = chunks.last_mut()
-    {
-        last.truncated = true;
-    }
-    Ok((chunks, coverage))
 }
 
 fn is_symbol_line(line: &str) -> bool {
@@ -1141,6 +1027,100 @@ pub fn collect_symbol_context(
     })
 }
 
+/// Supplemental literal search over already-filtered candidates. Read work and
+/// matches are capped independently of outbound source/model budgets.
+pub fn supplemental_text_context(
+    workspace: &Path,
+    candidates: &[String],
+    query: &str,
+    config: &AppConfig,
+    remaining_bytes: &mut usize,
+    max_matches: usize,
+    supplied: &crate::evidence::Catalog,
+) -> Result<(CollectedSource, Vec<SymbolCandidate>)> {
+    let root = canonical_workspace(workspace)?;
+    let keywords = crate::search::keywords(query);
+    let mut body = String::new();
+    let mut ranges = Vec::new();
+    let mut included_files = Vec::new();
+    let mut truncated = false;
+    for relative in candidates.iter().take(32) {
+        crate::control::Control::current().check()?;
+        let path = secure_path(&root, &root.join(relative))?;
+        if is_secret(&path) || !looks_text(&path) {
+            continue;
+        }
+        let size = fs::metadata(&path)?.len() as usize;
+        if size > 8 * 1024 * 1024 {
+            continue;
+        }
+        if size > *remaining_bytes {
+            truncated = true;
+            break;
+        }
+        *remaining_bytes -= size;
+        let Ok(text) = read_text_tokens(&path, usize::MAX) else {
+            continue;
+        };
+        let lines = text.lines().collect::<Vec<_>>();
+        let Some((focus, score)) = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| (index, crate::search::score(&keywords, line)))
+            .max_by_key(|(index, score)| (*score, std::cmp::Reverse(*index)))
+        else {
+            continue;
+        };
+        if score == 0 {
+            continue;
+        }
+        let start = focus.saturating_sub(4);
+        let end = (focus + 5).min(lines.len());
+        if supplied.accepts(&format!("{relative}:{}-{end}", start + 1)) {
+            continue;
+        }
+        let mut fragment = format!("\n===== FILE: {relative} (SELECTED SYMBOLS) =====\n");
+        for (index, line) in lines.iter().enumerate().take(end).skip(start) {
+            fragment.push_str(&format!("{} | {line}\n", index + 1));
+        }
+        fragment.push_str(&format!("===== END FILE: {relative} =====\n"));
+        let remaining = config
+            .max_source_tokens
+            .saturating_sub(estimate_tokens(&body));
+        let exact = truncate_tokens_strict(
+            &fragment,
+            remaining.min(config.max_file_tokens),
+            "[SEARCH CONTEXT TRUNCATED]",
+        );
+        truncated |= exact != fragment;
+        if exact.is_empty() {
+            break;
+        }
+        body.push_str(&exact);
+        included_files.push(relative.clone());
+        ranges.push(SymbolCandidate {
+            path: relative.clone(),
+            label: format!("text match at line {}", focus + 1),
+            start_line: start + 1,
+            end_line: end,
+        });
+        if ranges.len() >= max_matches {
+            break;
+        }
+    }
+    Ok((
+        CollectedSource {
+            manifest: String::new(),
+            body,
+            included_files,
+            truncated,
+            evidence_cache_hits: 0,
+            evidence_cache_misses: 0,
+        },
+        ranges,
+    ))
+}
+
 pub fn existing_document_paths(workspace: &Path) -> Result<Vec<String>> {
     let root = canonical_workspace(workspace)?;
     let mut docs = BTreeSet::new();
@@ -1452,6 +1432,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn supplemental_text_search_finds_late_non_symbol_evidence_and_obeys_read_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let text = format!(
+            "fn unrelated_factory() {{\n{}let late_literal_marker = 42;\n}}\n",
+            "let unrelated = 1;\n".repeat(200)
+        );
+        fs::write(root.path().join("data.rs"), text).unwrap();
+        fs::write(
+            root.path().join("secrets.txt"),
+            "late_literal_marker PRIVATE_SECRET",
+        )
+        .unwrap();
+        let config = AppConfig {
+            max_source_tokens: 128,
+            max_file_tokens: 128,
+            ..Default::default()
+        };
+        let candidates = vec!["secrets.txt".to_owned(), "data.rs".to_owned()];
+        let mut read_budget = 64 * 1024;
+        let supplied = crate::evidence::Catalog::new("", "", "");
+        let (source, ranges) = supplemental_text_context(
+            root.path(),
+            &candidates,
+            "late_literal_marker",
+            &config,
+            &mut read_budget,
+            2,
+            &supplied,
+        )
+        .unwrap();
+        assert!(source.body.contains("late_literal_marker = 42"));
+        assert!(!source.body.contains("PRIVATE_SECRET"));
+        assert!(estimate_tokens(&source.body) <= 128);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].path, "data.rs");
+        let (source, _) = supplemental_text_context(
+            root.path(),
+            &candidates,
+            "late_literal_marker",
+            &config,
+            &mut 0,
+            2,
+            &supplied,
+        )
+        .unwrap();
+        assert!(source.body.is_empty());
+        assert!(source.truncated);
+    }
+
+    #[test]
     fn map_scan_reads_late_lines_beyond_the_single_file_budget() {
         let root = tempfile::tempdir().unwrap();
         let source = format!(
@@ -1464,8 +1494,9 @@ mod tests {
             max_source_tokens: 2500,
             ..Default::default()
         };
-        let (chunks, coverage) =
-            collect_chunks_filtered(root.path(), &[], &config, 2500, 12, &[], &[]).unwrap();
+        let page =
+            crate::scan::collect(root.path(), &serde_json::json!({}), &config, 2500, None).unwrap();
+        let (chunks, coverage) = (page.chunks, page.coverage);
         assert!(
             chunks
                 .iter()
@@ -1489,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_map_scan_reports_omitted_evidence() {
+    fn bounded_map_scan_reports_pending_continuation() {
         let root = tempfile::tempdir().unwrap();
         fs::write(
             root.path().join("large.rs"),
@@ -1501,13 +1532,20 @@ mod tests {
             max_source_tokens: 2500,
             ..Default::default()
         };
-        let (chunks, coverage) =
-            collect_chunks_filtered(root.path(), &[], &config, 2500, 1, &[], &[]).unwrap();
+        let page = crate::scan::collect(
+            root.path(),
+            &serde_json::json!({"max_chunks":1}),
+            &config,
+            2500,
+            None,
+        )
+        .unwrap();
+        assert!(page.next.is_some());
+        let (chunks, coverage) = (page.chunks, page.coverage);
         assert_eq!(chunks.len(), 1);
         assert_eq!(coverage.complete_files, 0);
-        assert!(coverage.omissions[0].contains("large.rs"));
-        assert!(coverage.omissions[0].contains("-1000 not scanned"));
-        assert!(chunks[0].truncated);
+        assert!(coverage.omissions.is_empty());
+        assert!(!chunks[0].truncated);
     }
 
     #[test]
