@@ -116,3 +116,13 @@ LLM2MCP 的核心定位是：**本地上下文读取 + 外部 LLM 深度分析 +
 - [x] History filtering, result view/copy/export, cancellation and retry
 
 Implementation and regression tests are included. Native host/desktop verification above remains distinct from local mock tests.
+
+## 0.4.0 — 有界补充检索与续传
+
+- [x] Analyze / Debug / Plan 一次补充检索，最多 3 个请求、6 个新候选；symbol 与有界文本匹配，沿用过滤、隐私、预算和取消。
+- [x] 完整结果在压缩前持久化，result_page 通过 Job/内容绑定游标分页，支持 UTF-8、TTL、workspace 和哈希校验。
+- [x] document_repo 每次最多 12 个 chunk，continue_scan 按文件/分段恢复，合成累计 Map 并校验快照与配置。
+- [x] 断线重连、缓存重放、取消、过滤、过期与源码/配置变更回归。
+- [ ] 真实模型补充检索质量评测与实际 Host 使用验证。
+
+使用方法见 [CONTINUATIONS.md](CONTINUATIONS.md)。

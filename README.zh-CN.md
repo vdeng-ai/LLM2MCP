@@ -442,11 +442,15 @@ LLM2MCP 0.1 默认只读，不提供任意 shell、写文件、Git commit 或 pu
 
 ## 项目状态
 
-当前版本为 `0.3.1`。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
+本源码版本为 `0.4.0`。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
 
 ### 0.3.1 质量修复
 
 审查覆盖说明计入完整回传预算；压缩优先保留严重问题；日志和 diff 引用按实际提供的证据校验；文档更新会选择与变更相关的章节，包括文件末尾的章节。详见 [0.3.1 发布说明](docs/RELEASE_NOTES-0.3.1.md)。
+
+### 0.4.0 补充检索与续传
+
+分析、Debug 和规划支持一次有界补充检索，可用 `allow_supplement` 关闭。`result_page` 分页读取 Job 的完整校验结果，不增加模型调用。大仓库文档扫描返回持久化 `scan_cursor`，`continue_scan` 从下一文件/分段继续，并使用累计 Map 证据。详见 [用法与 JSON 示例](docs/CONTINUATIONS.md) 和 [0.4.0 发布说明](docs/RELEASE_NOTES-0.4.0.md)。
 
 ## License
 

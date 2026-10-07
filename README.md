@@ -440,11 +440,15 @@ Selected source code is still sent to the LLM API you configure. Make sure that 
 
 ## Project Status
 
-LLM2MCP is currently at version `0.3.1`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
+This source tree is at version `0.4.0`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
 
 ### Quality fixes in 0.3.1
 
 The complete review response now shares one return budget, including coverage. Compaction prioritizes severe findings, runtime citations are checked against supplied logs/diffs, and documentation updates select relevant sections even late in a file. See [0.3.1 release notes](docs/RELEASE_NOTES-0.3.1.md).
+
+### Bounded retrieval and continuations in 0.4.0
+
+Analysis, debug and planning can request one supplemental retrieval round (`allow_supplement`). Use `result_page` to inspect a Job's complete validated result without another model call. Large repository documentation scans return a durable `scan_cursor`; `continue_scan` resumes the next file/segment and uses accumulated Map evidence. See [usage and JSON examples](docs/CONTINUATIONS.md) and [0.4.0 release notes](docs/RELEASE_NOTES-0.4.0.md).
 
 ## License
 

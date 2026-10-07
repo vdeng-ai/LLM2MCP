@@ -123,3 +123,7 @@ Return/source compression is not observed savings in the primary model's billing
 | 11. 可操作任务历史 | 自动刷新、筛选、查看/复制/导出、取消、重试 |
 
 Automated regression coverage is described in [DEVELOPMENT.md](DEVELOPMENT.md). Native desktop and individual coding-agent host verification still require those actual environments.
+
+## Retrieval and continuation tools (0.4.0)
+
+`result_page` reads complete successful Job artifacts without model usage and without creating another business Job. `continue_scan` uses the existing `document_repo` route/execution mode and creates the next bounded scan Job. Supplemental analysis passes contribute all actual provider attempts to existing usage/cost metrics. Job `return_tokens` measures the normal initial return; later pagination output is separate. See [CONTINUATIONS.md](CONTINUATIONS.md).

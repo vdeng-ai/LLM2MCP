@@ -155,3 +155,7 @@ Unit tests cover credential masking with quote/line preservation, AST multiline 
 For a native desktop check, run `cargo run`, start a slow model-list/inference operation and verify the window remains interactive and Cancel works. Verify all six tabs, profile rename/delete routing, history auto-refresh/result copy and client registration in the actual host. CI compilation does not establish host integration or desktop rendering.
 
 CLI usage and metric definitions are in [RUNTIME.md](RUNTIME.md).
+
+## 0.4.0 regression coverage
+
+Unit tests cover UTF-8 page reconstruction including JSON escaping, page budgets and cursor integrity, literal source matches beyond a file prefix, bounded read work, and source scans beyond 12 chunks without gaps. MCP end-to-end tests cover supplemental limits/disable/filtering/cancellation, full-result reconstruction after sync and async reconnection, invalid inputs, foreign workspaces, artifact mutation/expiry/cleanup, continuation replay without duplicate Maps, accumulated late evidence, and stale source/scope/profile rejection. Paired evaluation is run with `LLM2MCP_TEST_BINARY` set so both HTTP and actual stdio MCP paths execute.
