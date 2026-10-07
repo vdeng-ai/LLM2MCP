@@ -17,6 +17,7 @@ mod linux_desktop;
 mod llm;
 mod mcp;
 mod parallel;
+mod path_filters;
 mod primary_result;
 mod privacy;
 mod process;

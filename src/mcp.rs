@@ -1232,15 +1232,6 @@ fn task_keywords(task: &str) -> Vec<String> {
     crate::search::keywords(task)
 }
 
-fn lexical_score(keywords: &[String], text: &str, weight: u32) -> u32 {
-    let haystack = text.to_ascii_lowercase();
-    keywords
-        .iter()
-        .filter(|keyword| haystack.contains(keyword.as_str()))
-        .map(|_| weight)
-        .sum()
-}
-
 fn local_discovery_selection(
     task: &str,
     index: &workspace::DiscoveryIndex,
@@ -1263,12 +1254,12 @@ fn local_discovery_selection(
     if exact.len() == 1 {
         return Some((vec![exact[0].clone()], Vec::new()));
     }
+    let mut matcher = crate::search::KeywordMatcher::ascii(&keywords);
     let mut symbols = index
         .symbols
         .iter()
         .map(|symbol| {
-            let score = lexical_score(&keywords, &symbol.label, 8)
-                + lexical_score(&keywords, &symbol.path, 4);
+            let score = matcher.score(&symbol.label) * 8 + matcher.score(&symbol.path) * 4;
             (score, symbol.clone())
         })
         .filter(|(score, _)| *score > 0)
@@ -1295,7 +1286,7 @@ fn local_discovery_selection(
     let mut files = index
         .candidate_files
         .iter()
-        .map(|path| (lexical_score(&keywords, path, 5), path.clone()))
+        .map(|path| (matcher.score(path) * 5, path.clone()))
         .filter(|(score, _)| *score > 0)
         .collect::<Vec<_>>();
     files.sort_by_key(|item| std::cmp::Reverse(item.0));

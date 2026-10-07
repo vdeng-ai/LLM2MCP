@@ -28,15 +28,6 @@ fn changed_keywords(diff: &str) -> Vec<String> {
     keywords
 }
 
-fn score(line: &str, keywords: &[String]) -> usize {
-    let line = line.to_lowercase();
-    keywords
-        .iter()
-        .filter(|word| line.contains(word.as_str()))
-        .map(|word| if word.contains('_') { 4 } else { 1 })
-        .sum()
-}
-
 fn sections(lines: &[&str]) -> Vec<(usize, usize)> {
     let mut starts = vec![0];
     let mut fence: Option<(char, usize)> = None;
@@ -101,15 +92,20 @@ pub fn select(text: &str, diff: &str, budget: usize) -> (Vec<Fragment>, bool) {
     }
     let span_tokens = |start: usize, end: usize| prefix_tokens[end] - prefix_tokens[start];
     let keywords = changed_keywords(diff);
+    let mut matcher =
+        crate::search::KeywordMatcher::weighted(
+            &keywords,
+            |word| if word.contains('_') { 4 } else { 1 },
+        );
     let mut candidates = sections(&lines)
         .into_iter()
         .map(|(start, end)| {
             let (focus, body_score) = (start..end)
-                .map(|index| (index, score(lines[index], &keywords)))
+                .map(|index| (index, matcher.score(lines[index])))
                 .max_by_key(|(index, score)| (*score, std::cmp::Reverse(*index)))
                 .unwrap_or((start, 0));
             (
-                score(lines[start], &keywords) * 3 + body_score * 2,
+                matcher.score(lines[start]) * 3 + body_score * 2,
                 start,
                 end,
                 focus,

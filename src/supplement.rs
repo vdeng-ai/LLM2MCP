@@ -71,24 +71,26 @@ pub(super) fn analyze_with_supplement(
                 0,
             )?;
         }
-        let keywords = task_keywords(request.get("query").and_then(Value::as_str).unwrap_or(""));
+        let mut matcher = crate::search::KeywordMatcher::new(&task_keywords(
+            request.get("query").and_then(Value::as_str).unwrap_or(""),
+        ));
         let before = extra_selection.symbols.len();
         let mut symbols = index
             .symbols
             .iter()
-            .filter(|symbol| {
-                (paths.is_empty() || paths.contains(&symbol.path))
-                    && crate::search::score(&keywords, &symbol.label) > 0
+            .filter(|symbol| paths.is_empty() || paths.contains(&symbol.path))
+            .filter_map(|symbol| {
+                let score = matcher.score(&symbol.label);
+                (score > 0
                     && !supplied.accepts(&format!(
                         "{}:{}-{}",
                         symbol.path, symbol.start_line, symbol.end_line
-                    ))
+                    )))
+                .then_some((score, symbol))
             })
             .collect::<Vec<_>>();
-        symbols.sort_by_key(|symbol| {
-            std::cmp::Reverse(crate::search::score(&keywords, &symbol.label))
-        });
-        for symbol in symbols.into_iter().take(2) {
+        symbols.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        for (_, symbol) in symbols.into_iter().take(2) {
             if extra_selection.symbols.len() + extra_selection.files.len() + snippets.len() >= 6 {
                 break;
             }
@@ -148,10 +150,7 @@ pub(super) fn analyze_with_supplement(
         for path in index
             .candidate_files
             .iter()
-            .filter(|path| {
-                (paths.is_empty() || paths.contains(path))
-                    && crate::search::score(&keywords, path) > 0
-            })
+            .filter(|path| (paths.is_empty() || paths.contains(path)) && matcher.score(path) > 0)
             .take(2)
         {
             if extra_selection.symbols.len() + extra_selection.files.len() + snippets.len() >= 6 {

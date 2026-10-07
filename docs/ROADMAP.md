@@ -135,3 +135,11 @@ Implementation and regression tests are included. Native host/desktop verificati
 - [x] 跨进程缓存自动维护节流；显式清理立即执行。
 - [x] 进程内复用 HTTP 连接池与运行时，鉴权、超时及取消按请求独立处理。
 - [ ] 真实模型速度、质量与主/副模型 token、成本对照评测。
+
+## 0.4.2 — 编译匹配规则
+
+- [x] globset 与编译后的字节正则集合复用过滤规则，保留旧版递归通配符和 basename 语义。
+- [x] 大关键词集合使用 Aho-Corasick，小集合使用原生子串搜索，保留中文、重叠词和单词计分权重。
+- [x] 符号评分预计算，稳定排序和补充证据行号选择保持一致。
+- [x] 新旧实现兼容性回归与可复现的本地匹配基准。
+- [ ] 根据实际仓库端到端 profiling 再评估并行扫描与 Rayon。

@@ -36,6 +36,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 The GitHub Actions CI runs tests on Linux, Windows, and macOS, with format and Clippy checks on Linux.
 
+For a paired CPU-only comparison of the 0.4.1 matchers and current code, run
+`cargo run --release --locked --example matching_benchmark -- 7`. The example
+checks identical scores and filter decisions before reporting timings. See
+[matching benchmark](MATCHING_BENCHMARK.md) for workloads and limitations.
+
 ## GUI development notes
 
 The GUI uses `eframe`/`egui` and is organized as six module tabs:
