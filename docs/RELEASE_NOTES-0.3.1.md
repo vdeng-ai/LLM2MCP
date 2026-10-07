@@ -9,6 +9,8 @@ LLM2MCP 0.3.1 improves the quality of existing read-only tools.
 
 **Limits:** Return limits use conservative local token estimates. Citation validation checks supplied locations/excerpts, not whether model reasoning is true. Documentation selection is lexical and uses ATX Markdown headings; prose without matching identifiers falls back to a bounded prefix. Real private-model effectiveness and native-host verification remain separate operator checks; this patch makes no measured token-saving claim.
 
+**Validation:** 68 Rust unit tests, 16 MCP end-to-end tests and 2 paired-evaluation HTTP/MCP tests pass locally, together with format and Clippy (`-D warnings`). Linux, Windows and macOS CI gates apply before release publication.
+
 ---
 
 0.3.1 修复四项质量问题：覆盖说明计入完整回传预算；严重问题在压缩前排序并保留独立预算；源码、日志和 diff 引用按实际证据校验，缺少或部分不支持的 Debug 证据限制置信度；文档更新按变更标识符选择相关章节，并保持精确片段修改的哈希、唯一匹配和不重叠校验。

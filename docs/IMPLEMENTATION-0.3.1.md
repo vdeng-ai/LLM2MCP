@@ -14,3 +14,17 @@ not introduce additional model calls or change the document edit format.
 Each implementation stage is committed separately. Actual private-model and
 native-host benchmarks remain operator-run checks; this patch makes no claim of
 measured token savings.
+
+## Completed validation
+
+All five stages are implemented. Local checks pass on Linux with Rust 1.99.0:
+
+- `cargo fmt -- --check` and `git diff --check`.
+- `cargo test --locked --all-targets`: 68 unit tests and 16 MCP end-to-end tests.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`.
+- `LLM2MCP_TEST_BINARY=target/debug/llm2mcp python -m unittest discover -s scripts/evaluation -v`: both tests, including actual HTTP/stdio MCP execution.
+
+Final review also added protection against file-header-looking hunk text and Git
+C-quoted non-ASCII paths. Version metadata and release notes are ready for 0.3.1.
+Cross-platform CI and review precede merging; merging the matching `release.json`
+request into `main` starts the repository's gated release workflow.
