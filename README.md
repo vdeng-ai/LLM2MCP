@@ -440,12 +440,12 @@ Selected source code is still sent to the LLM API you configure. Make sure that 
 
 ## Project Status
 
-LLM2MCP is currently at version `0.2.1`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
-
-## License
-
-MIT
+LLM2MCP is currently at version `0.3.1`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
 
 ### Quality fixes in 0.3.1
 
 The complete review response now shares one return budget, including coverage. Compaction prioritizes severe findings, runtime citations are checked against supplied logs/diffs, and documentation updates select relevant sections even late in a file. See [0.3.1 release notes](docs/RELEASE_NOTES-0.3.1.md).
+
+## License
+
+MIT
