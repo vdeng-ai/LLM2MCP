@@ -136,10 +136,15 @@ pub fn compact(value: &Value, read_next: &[String], budget: usize) -> String {
             lines: read_next.to_vec(),
         }]
     };
-    let groups = [(30usize, summary), (45, findings), (15, reads), (10, details)]
-        .into_iter()
-        .filter(|(_, sections)| !sections.is_empty())
-        .collect::<Vec<_>>();
+    let groups = [
+        (30usize, summary),
+        (45, findings),
+        (15, reads),
+        (10, details),
+    ]
+    .into_iter()
+    .filter(|(_, sections)| !sections.is_empty())
+    .collect::<Vec<_>>();
     if groups.is_empty() {
         return truncate_tokens_strict(&value.to_string(), budget, TRUNCATED);
     }
@@ -178,9 +183,14 @@ mod tests {
         let mut findings = (0..12)
             .map(|_| json!({"severity":"info", "text":"Unimportant detail", "evidence":[]}))
             .collect::<Vec<_>>();
-        findings.push(json!({"severity":"critical", "text":"CRITICAL_REGRESSION", "evidence":["src/a.rs:1"]}));
+        findings.push(
+            json!({"severity":"critical", "text":"CRITICAL_REGRESSION", "evidence":["src/a.rs:1"]}),
+        );
         let value = json!({"conclusion":"Summary ".repeat(2000), "findings":findings});
-        let reads = vec![format!("- src/a.rs:1-2 — {}", "Verbose reason ".repeat(2000))];
+        let reads = vec![format!(
+            "- src/a.rs:1-2 — {}",
+            "Verbose reason ".repeat(2000)
+        )];
         let result = compact(&value, &reads, 128);
         assert!(result.contains("CRITICAL_REGRESSION"));
         assert!(result.contains("src/a.rs:1-2"));

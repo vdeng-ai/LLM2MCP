@@ -102,6 +102,17 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
         let system = payload["messages"][0]["content"].as_str().unwrap_or("");
         let user = payload["messages"][1]["content"].as_str().unwrap_or("");
         let mut content = json!({"conclusion":"Mock analysis","findings":[],"risks":[],"tests":[],"actions":[],"read_next":[]}).to_string();
+        if mode == "debug_evidence" && system.contains("software-debugging specialist") {
+            content = json!({
+                "diagnosis":"Worker connection fails", "confidence":"high",
+                "root_cause":"The inference service is unavailable", "intermittency":"unknown",
+                "evidence":[{"severity":"high", "text":"Observed worker failure", "evidence":[
+                    "log:worker failed: connection refused", "invented.rs:999"
+                ]}],
+                "execution_path":[], "alternatives":[], "verification":["Check service availability"],
+                "fix_area":[], "read_next":[]
+            }).to_string();
+        }
         if system.contains("synthesizing project documentation") {
             let targets = user
                 .split("TARGET DOCUMENTS\n")
@@ -300,6 +311,29 @@ fn retry_privacy_profile_routing_and_cost_metrics() {
     assert!(!record.to_string().contains("FAKE_CONFIG_SECRET"));
     assert!(!record.to_string().contains("FAKE_PROFILE_SECRET"));
 }
+#[test]
+fn debug_runtime_citations_survive_and_invented_evidence_limits_confidence() {
+    let http = Http::new("debug_evidence");
+    let fixture = Fixture::new(&http, "sync");
+    let mut mcp = Mcp::new(&fixture);
+    mcp.send(
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+            "name":"debug_issue", "arguments":{
+                "issue":"Worker cannot connect", "paths":["main.rs"],
+                "logs":"worker failed: connection refused"
+            }
+        }}),
+    );
+    let reply = mcp.receive();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("log:worker failed: connection refused"));
+    assert!(text.contains("CONFIDENCE\nmedium"));
+    assert!(text.contains("UNVERIFIED CITATIONS REMOVED"));
+    assert!(!text.contains("invented.rs"));
+    assert_eq!(fixture.records()[0]["llm_calls"], 1);
+}
+
 #[test]
 fn doctor_rejects_models_only_connectivity() {
     let http = Http::new("bad");

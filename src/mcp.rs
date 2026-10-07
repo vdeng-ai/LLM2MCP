@@ -43,7 +43,7 @@ Rules:
 - Suggest verification steps and likely fix areas, but do not claim you ran commands or modified files.
 - Do not reveal hidden chain-of-thought.
 Return JSON only, with no Markdown or code fences, in this shape:
-{"diagnosis":"...","confidence":"high|medium|low","root_cause":"...","evidence":[{"severity":"high|medium|low|info","text":"...","evidence":["path:line-range, symbol, log excerpt, or diff hunk"]}],"execution_path":["..."],"intermittency":"...","alternatives":["..."],"verification":["..."],"fix_area":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
+{"diagnosis":"...","confidence":"high|medium|low","root_cause":"...","evidence":[{"severity":"high|medium|low|info","text":"...","evidence":["path:start-end, log:exact supplied excerpt, or diff:path:exact supplied hunk/excerpt"]}],"execution_path":["..."],"intermittency":"...","alternatives":["..."],"verification":["..."],"fix_area":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
 Keep fields concise; the bridge will locally validate read_next and compact the result before returning it to the primary agent."#;
 
 const PLAN_SYSTEM: &str = r#"You are a local software-planning specialist assisting a primary coding agent.
@@ -941,11 +941,6 @@ fn chat_with_reporter(
         if let Some(content) = response.final_text() {
             match validate_model_output(system, user, content) {
                 Ok(()) => {
-                    if [ANALYZE_SYSTEM, DEBUG_SYSTEM, PLAN_SYSTEM, REVIEW_SYSTEM].contains(&system)
-                    {
-                        let value: Value = serde_json::from_str(content)?;
-                        return Ok(crate::evidence::verify(value, user).to_string());
-                    }
                     return Ok(content.trim().to_owned());
                 }
                 Err(error) => diagnostics = format!("{diagnostics}; {error}"),
@@ -1019,6 +1014,14 @@ fn validate_model_output(system: &str, user: &str, content: &str) -> Result<()> 
         if !value.get(key).is_some_and(Value::is_string) {
             bail!("missing string field {key}");
         }
+    }
+    if system == DEBUG_SYSTEM
+        && !value
+            .get("confidence")
+            .and_then(Value::as_str)
+            .is_some_and(|confidence| ["high", "medium", "low"].contains(&confidence))
+    {
+        bail!("invalid debug confidence");
     }
     for key in arrays {
         if !value.get(key).is_some_and(Value::is_array) {
@@ -1490,11 +1493,7 @@ fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSel
         );
     };
 
-    crate::primary_result::compact(
-        &value,
-        &validated_read_next(&value, selection),
-        budget,
-    )
+    crate::primary_result::compact(&value, &validated_read_next(&value, selection), budget)
 }
 
 fn analyze(
@@ -1548,6 +1547,11 @@ fn analyze(
         tool.max_output_tokens,
         reporter,
     )?;
+    let result = crate::evidence::verify(
+        serde_json::from_str(&result)?,
+        &crate::evidence::Catalog::new(&sources.body, "", ""),
+    )
+    .to_string();
     progress(reporter, "finishing", 3, 3)?;
     Ok(compact_primary_result(
         &result,
@@ -1665,6 +1669,11 @@ fn debug_issue(
         tool.max_output_tokens,
         reporter,
     )?;
+    let result = crate::evidence::verify(
+        serde_json::from_str(&result)?,
+        &crate::evidence::Catalog::new(&sources.body, &logs_for_prompt, &recent_change_evidence),
+    )
+    .to_string();
     progress(reporter, "finishing", 4, 4)?;
     Ok(compact_primary_result(
         &result,
@@ -1809,7 +1818,10 @@ fn review_diff(
             tool.max_output_tokens,
             reporter,
         )?;
-        let value: Value = serde_json::from_str(&result)?;
+        let value = crate::evidence::verify(
+            serde_json::from_str(&result)?,
+            &crate::evidence::Catalog::new(&batch.context, "", &batch.diff),
+        );
         for key in ["findings", "tests", "actions"] {
             for item in value[key].as_array().context("missing review array")? {
                 let output = combined[key]
