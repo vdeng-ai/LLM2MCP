@@ -144,7 +144,7 @@ Typical tool arguments:
 }
 ```
 
-The secondary model returns a structured analysis, and LLM2MCP compacts it locally to the configured Primary return budget without a second LLM call. Validated `READ_NEXT` entries are placed first, for example `src/jobs.rs:400-445 — fn spawn_worker(...)`, so the primary coding agent can open only the relevant range rather than ingesting the entire file.
+The secondary model returns a structured analysis, and LLM2MCP compacts it locally to the configured Primary return budget without a second LLM call. The return budget reserves space for the summary, severity-ranked findings and validated `READ_NEXT` entries, for example `src/jobs.rs:400-445 — fn spawn_worker(...)`, so the primary coding agent can open only the relevant range rather than ingesting the entire file.
 
 ### `debug_issue`
 
@@ -445,3 +445,7 @@ LLM2MCP is currently at version `0.2.1`. See [ROADMAP.md](docs/ROADMAP.md) and [
 ## License
 
 MIT
+
+### Quality fixes in 0.3.1
+
+The complete review response now shares one return budget, including coverage. Compaction prioritizes severe findings, runtime citations are checked against supplied logs/diffs, and documentation updates select relevant sections even late in a file. See [0.3.1 release notes](docs/RELEASE_NOTES-0.3.1.md).

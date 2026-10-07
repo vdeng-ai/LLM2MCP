@@ -30,7 +30,7 @@ Before committing changes:
 
 ```bash
 cargo fmt -- --check
-cargo test --all-targets
+cargo test --locked --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
@@ -104,7 +104,7 @@ stdio 模式下 stdout 仅用于 MCP JSON-RPC，运行诊断信息必须写入 s
 
 ```bash
 cargo fmt -- --check
-cargo test --all-targets
+cargo test --locked --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
@@ -147,6 +147,8 @@ Release 打包、Updater 签名、GitHub Actions tag 发布、Windows NSIS、mac
 ## Runtime regression tests
 
 `tests/mcp_e2e.rs` starts the actual executable with an isolated config/data directory and a loopback mock HTTP service. It checks that slow HTTP does not block ping, request cancellation terminates sync history, 429 retry preserves payload/privacy, profile routing and usage/cost metrics are recorded, `/models`-only connectivity fails doctor, worker crashes are recovered/retried, queued workers respect concurrency, Map/Reduce route and prefix changes invalidate Map checkpoints, oversized requests are rejected before HTTP, and cache age/size cleanup preserves history. No real API credentials or host installs are used.
+
+The 0.3.1 regressions cover review coverage inside the return budget, late critical findings during compaction, source/log/diff citation separation and confidence limits, Git quoted paths and header-like hunk text, relevant late Markdown sections, Unicode/CRLF previews, and rejection of edits crossing separate fragments. MCP tests exercise runtime evidence validation and exact document edits without writing workspace files.
 
 Unit tests cover credential masking with quote/line preservation, AST multiline and late-file ranges, Chinese intent matching, relevant/dependency files before budget exhaustion, tracked secret-file diff exclusion, source/evidence masking, cache prompt-key invalidation, profile migration and endpoint-bound credential restoration.
 
