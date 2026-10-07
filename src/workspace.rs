@@ -653,6 +653,7 @@ pub fn discovery_index(
     discovery_index_for_task(workspace, requested, config, include, exclude, "")
 }
 
+#[cfg(test)]
 pub fn discovery_index_for_task(
     workspace: &Path,
     requested: &[String],
@@ -661,140 +662,185 @@ pub fn discovery_index_for_task(
     exclude: &[String],
     task: &str,
 ) -> Result<DiscoveryIndex> {
-    let root = canonical_workspace(workspace)?;
-    let discovery_request = if requested.is_empty() {
-        vec![".".to_owned()]
-    } else {
-        requested.to_vec()
-    };
-    let files = requested_files(&root, &discovery_request, include, exclude)?;
-    let mut body = String::new();
-    let mut candidate_files = Vec::new();
-    let mut symbol_candidates = Vec::new();
-    let mut used_tokens = 0usize;
-    let mut truncated = false;
-    let symbol_index = repo_cache::load_symbol_index(&root).unwrap_or_else(|error| {
-        eprintln!("LLM2MCP symbol index cache read failed: {error:#}");
-        repo_cache::RepositorySymbolIndex {
-            version: repo_cache::SYMBOL_INDEX_VERSION.to_owned(),
-            workspace: root.to_string_lossy().into_owned(),
-            files: BTreeMap::new(),
-        }
-    });
-    let mut updates = BTreeMap::new();
-    let mut cache_hits = 0usize;
-    let mut cache_misses = 0usize;
+    DiscoverySession::new(workspace, include, exclude)?.index_for_task(requested, config, task)
+}
 
-    let keywords = crate::search::keywords(task);
-    let mut ranked = Vec::new();
-    for file in files {
-        crate::control::Control::current().check()?;
-        crate::control::Control::current().check()?;
-        let relative = normalized_relative(file.strip_prefix(&root).unwrap_or(&file));
-        let metadata = fs::metadata(&file).ok();
-        let stamp = repo_cache::file_stamp(&file).ok();
-        let cached = stamp.and_then(|stamp| {
-            symbol_index
-                .files
-                .get(&relative)
-                .filter(|entry| entry.stamp == stamp)
-                .cloned()
-        });
-        let indexed = if let Some(cached) = cached {
-            cache_hits += 1;
-            cached
-        } else {
-            cache_misses += 1;
-            let Ok(indexed) = index_file(&file, &relative) else {
-                continue;
-            };
-            updates.insert(relative.clone(), indexed.clone());
-            indexed
-        };
-        let mut symbols = indexed.symbols;
-        symbols.sort_by_key(|symbol| {
-            std::cmp::Reverse(crate::search::score(&keywords, &symbol.label))
-        });
-        let score = crate::search::score(&keywords, &relative) * 4
-            + symbols
-                .iter()
-                .map(|symbol| crate::search::score(&keywords, &symbol.label))
-                .max()
-                .unwrap_or(0)
-                * 8;
-        ranked.push((
-            score,
-            relative,
-            metadata.map(|value| value.len()).unwrap_or(0),
-            symbols,
-            indexed.imports,
-        ));
+/// Candidate ranking uses one task-local snapshot. Evidence reads still validate
+/// current file stamps and exact symbol ranges before any source is supplied.
+pub struct DiscoverySession {
+    root: PathBuf,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    scopes: BTreeMap<Vec<String>, BTreeSet<PathBuf>>,
+    index: Option<repo_cache::RepositorySymbolIndex>,
+    observed: BTreeSet<String>,
+}
+
+impl DiscoverySession {
+    pub fn new(workspace: &Path, include: &[String], exclude: &[String]) -> Result<Self> {
+        Ok(Self {
+            root: canonical_workspace(workspace)?,
+            include: include.to_vec(),
+            exclude: exclude.to_vec(),
+            scopes: BTreeMap::new(),
+            index: None,
+            observed: BTreeSet::new(),
+        })
     }
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    let seeds = ranked
-        .iter()
-        .take(3)
-        .filter(|entry| entry.0 > 0)
-        .map(|entry| (entry.0, entry.4.clone()))
-        .collect::<Vec<_>>();
-    for entry in &mut ranked {
-        for (score, imports) in &seeds {
-            if crate::syntax::imports_path(imports, &entry.1) {
-                entry.0 = entry.0.max((*score / 2).max(1));
+
+    pub fn index_for_task(
+        &mut self,
+        requested: &[String],
+        config: &AppConfig,
+        task: &str,
+    ) -> Result<DiscoveryIndex> {
+        let root = self.root.clone();
+        let discovery_request = if requested.is_empty() {
+            vec![".".to_owned()]
+        } else {
+            requested.to_vec()
+        };
+        if !self.scopes.contains_key(&discovery_request) {
+            let files = requested_files(&root, &discovery_request, &self.include, &self.exclude)?;
+            self.scopes.insert(discovery_request.clone(), files);
+        }
+        let files = self.scopes[&discovery_request].clone();
+        let mut body = String::new();
+        let mut candidate_files = Vec::new();
+        let mut symbol_candidates = Vec::new();
+        let mut used_tokens = 0usize;
+        let mut truncated = false;
+        let symbol_index = self.index.get_or_insert_with(|| {
+            repo_cache::load_symbol_index(&root).unwrap_or_else(|error| {
+                eprintln!("LLM2MCP symbol index cache read failed: {error:#}");
+                repo_cache::RepositorySymbolIndex {
+                    version: repo_cache::SYMBOL_INDEX_VERSION.to_owned(),
+                    workspace: root.to_string_lossy().into_owned(),
+                    files: BTreeMap::new(),
+                }
+            })
+        });
+        let mut updates = BTreeMap::new();
+        let mut cache_hits = 0usize;
+        let mut cache_misses = 0usize;
+
+        let keywords = crate::search::keywords(task);
+        let mut ranked = Vec::new();
+        for file in files {
+            crate::control::Control::current().check()?;
+            let relative = normalized_relative(file.strip_prefix(&root).unwrap_or(&file));
+            let indexed = if self.observed.contains(&relative) {
+                let Some(indexed) = symbol_index.files.get(&relative).cloned() else {
+                    continue;
+                };
+                cache_hits += 1;
+                indexed
+            } else {
+                let stamp = repo_cache::file_stamp(&file).ok();
+                let cached = stamp.and_then(|stamp| {
+                    symbol_index
+                        .files
+                        .get(&relative)
+                        .filter(|entry| entry.stamp == stamp)
+                        .cloned()
+                });
+                let indexed = if let Some(cached) = cached {
+                    cache_hits += 1;
+                    cached
+                } else {
+                    cache_misses += 1;
+                    let Ok(indexed) = index_file(&file, &relative) else {
+                        symbol_index.files.remove(&relative);
+                        self.observed.insert(relative);
+                        continue;
+                    };
+                    updates.insert(relative.clone(), indexed.clone());
+                    indexed
+                };
+                symbol_index.files.insert(relative.clone(), indexed.clone());
+                self.observed.insert(relative.clone());
+                indexed
+            };
+            let bytes = indexed.stamp.size;
+            let mut symbols = indexed.symbols;
+            symbols.sort_by_key(|symbol| {
+                std::cmp::Reverse(crate::search::score(&keywords, &symbol.label))
+            });
+            let score = crate::search::score(&keywords, &relative) * 4
+                + symbols
+                    .iter()
+                    .map(|symbol| crate::search::score(&keywords, &symbol.label))
+                    .max()
+                    .unwrap_or(0)
+                    * 8;
+            ranked.push((score, relative, bytes, symbols, indexed.imports));
+        }
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        let seeds = ranked
+            .iter()
+            .take(3)
+            .filter(|entry| entry.0 > 0)
+            .map(|entry| (entry.0, entry.4.clone()))
+            .collect::<Vec<_>>();
+        for entry in &mut ranked {
+            for (score, imports) in &seeds {
+                if crate::syntax::imports_path(imports, &entry.1) {
+                    entry.0 = entry.0.max((*score / 2).max(1));
+                }
             }
         }
-    }
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    for (_, relative, bytes, symbols, imports) in ranked {
-        if candidate_files.len() >= 512 {
-            truncated = true;
-            break;
-        }
-        let header = format!(
-            "FILE {relative} ({bytes} bytes)\nDEPENDENCY HINTS {}\n",
-            imports.join(", ")
-        );
-        let cost = estimate_tokens(&header);
-        if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
-            truncated = true;
-            continue;
-        }
-        body.push_str(&header);
-        used_tokens += cost;
-        candidate_files.push(relative);
-        for symbol in symbols.iter().take(32) {
-            let line = format!(
-                "  RANGE {}-{} {}\n",
-                symbol.start_line, symbol.end_line, symbol.label
-            );
-            let cost = estimate_tokens(&line);
-            if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        for (_, relative, bytes, symbols, imports) in ranked {
+            if candidate_files.len() >= 512 {
                 truncated = true;
                 break;
             }
-            body.push_str(&line);
+            let header = format!(
+                "FILE {relative} ({bytes} bytes)\nDEPENDENCY HINTS {}\n",
+                imports.join(", ")
+            );
+            let cost = estimate_tokens(&header);
+            if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
+                truncated = true;
+                continue;
+            }
+            body.push_str(&header);
             used_tokens += cost;
-            symbol_candidates.push(symbol.clone());
+            candidate_files.push(relative);
+            for symbol in symbols.iter().take(32) {
+                let line = format!(
+                    "  RANGE {}-{} {}\n",
+                    symbol.start_line, symbol.end_line, symbol.label
+                );
+                let cost = estimate_tokens(&line);
+                if used_tokens.saturating_add(cost) > config.discovery_index_tokens {
+                    truncated = true;
+                    break;
+                }
+                body.push_str(&line);
+                used_tokens += cost;
+                symbol_candidates.push(symbol.clone());
+            }
+            body.push('\n');
         }
-        body.push('\n');
-    }
 
-    if let Err(error) = repo_cache::merge_symbol_updates(&root, updates) {
-        eprintln!("LLM2MCP symbol index cache write failed: {error:#}");
-    }
-    eprintln!(
-        "LLM2MCP symbol index cache: hits={cache_hits} misses={cache_misses} candidates={}",
-        candidate_files.len()
-    );
+        if let Err(error) = repo_cache::merge_symbol_updates(&root, updates) {
+            eprintln!("LLM2MCP symbol index cache write failed: {error:#}");
+        }
+        eprintln!(
+            "LLM2MCP symbol index cache: hits={cache_hits} misses={cache_misses} candidates={}",
+            candidate_files.len()
+        );
 
-    Ok(DiscoveryIndex {
-        body,
-        candidate_files,
-        symbols: symbol_candidates,
-        truncated,
-        cache_hits,
-        cache_misses,
-    })
+        Ok(DiscoveryIndex {
+            body,
+            candidate_files,
+            symbols: symbol_candidates,
+            truncated,
+            cache_hits,
+            cache_misses,
+        })
+    }
 }
 
 fn read_source_lines(path: &Path) -> Result<Vec<String>> {
@@ -1430,6 +1476,51 @@ pub fn git_diff_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_snapshot_reuses_ranking_inputs_but_changed_symbol_evidence_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("alpha.rs"), "fn alpha_login() {}\n").unwrap();
+        fs::write(root.join("beta.rs"), "fn beta_cache() {}\n").unwrap();
+        fs::write(root.join("excluded.rs"), "fn beta_cache_secret() {}\n").unwrap();
+        let config = AppConfig::default();
+        let exclude = vec!["excluded.rs".to_owned()];
+        let mut session = DiscoverySession::new(root, &[], &exclude).unwrap();
+        let first = session.index_for_task(&[], &config, "alpha_login").unwrap();
+        assert_eq!(first.cache_misses, 2);
+        fs::write(
+            root.join("beta.rs"),
+            "fn replaced_symbol_with_changed_lines() {\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("later.rs"), "fn beta_cache_later() {}\n").unwrap();
+        let second = session.index_for_task(&[], &config, "beta_cache").unwrap();
+        assert_eq!(second.cache_misses, 0);
+        assert_eq!(second.cache_hits, 2);
+        assert_eq!(second.candidate_files[0], "beta.rs");
+        assert!(
+            !second
+                .candidate_files
+                .iter()
+                .any(|path| path == "excluded.rs" || path == "later.rs")
+        );
+        let stale = second
+            .symbols
+            .into_iter()
+            .filter(|symbol| symbol.path == "beta.rs")
+            .collect::<Vec<_>>();
+        let source = collect_symbol_context(root, &stale, &config).unwrap();
+        assert!(source.included_files.is_empty());
+        let refreshed =
+            discovery_index_for_task(root, &[], &config, &[], &exclude, "replaced_symbol").unwrap();
+        assert!(
+            refreshed
+                .body
+                .contains("replaced_symbol_with_changed_lines")
+        );
+        repo_cache::clear_workspace_cache(root).unwrap();
+    }
 
     #[test]
     fn supplemental_text_search_finds_late_non_symbol_evidence_and_obeys_read_limits() {

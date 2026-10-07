@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use crate::config::{AppConfig, ReasoningEffort, ReasoningTransport};
 
@@ -95,10 +98,8 @@ pub fn test_connection(config: &AppConfig) -> Result<String> {
 
 fn request_text(request: RequestBuilder, timeout_secs: u64) -> Result<String> {
     let control = crate::control::Control::current();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
+    let request = request.timeout(Duration::from_secs(timeout_secs.max(1)));
+    transport()?.runtime.block_on(async {
         let fetch = async {
             for attempt in 0..=2 {
                 control.check()?;
@@ -126,7 +127,7 @@ pub fn list_models(config: &AppConfig) -> Result<Vec<String>> {
         config.max_concurrent_requests,
         &crate::control::Control::current(),
     )?;
-    let client = client(config)?;
+    let client = transport()?.client.clone();
     let url = format!("{}/models", config.base_url.trim_end_matches('/'));
     let mut request = client.get(url);
     if !config.api_key.trim().is_empty() {
@@ -147,11 +148,30 @@ pub fn list_models(config: &AppConfig) -> Result<Vec<String>> {
     Ok(models)
 }
 
-fn client(config: &AppConfig) -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs.max(5)))
-        .build()
-        .context("failed to build HTTP client")
+struct Transport {
+    runtime: tokio::runtime::Runtime,
+    client: Client,
+}
+
+fn transport() -> Result<&'static Transport> {
+    static TRANSPORT: OnceLock<std::result::Result<Transport, String>> = OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| {
+            (|| -> Result<Transport> {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()?;
+                let client = {
+                    let _entered = runtime.enter();
+                    Client::builder().pool_max_idle_per_host(8).build()?
+                };
+                Ok(Transport { runtime, client })
+            })()
+            .map_err(|error| format!("failed to initialize HTTP transport: {error:#}"))
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 pub fn chat_detailed(
@@ -166,7 +186,7 @@ pub fn chat_detailed(
         config.max_concurrent_requests,
         &crate::control::Control::current(),
     )?;
-    let client = client(config)?;
+    let client = transport()?.client.clone();
     let effective_system = if config.system_prompt_prefix.trim().is_empty() {
         system.to_owned()
     } else {
@@ -280,6 +300,105 @@ fn apply_reasoning(payload: &mut Value, transport: ReasoningTransport, effort: R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separate_callers_reuse_a_live_http_connection_with_request_local_settings() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/probe", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            for expected_key in ["first", "second"] {
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("authorization: bearer {expected_key}"))
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        for (key, timeout) in [("first", 1), ("second", 3)] {
+            let url = url.clone();
+            assert_eq!(
+                thread::spawn(move || {
+                    request_text(
+                        transport().unwrap().client.get(url).bearer_auth(key),
+                        timeout,
+                    )
+                    .unwrap()
+                })
+                .join()
+                .unwrap(),
+                "OK"
+            );
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shared_transport_keeps_each_requests_timeout_independent() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/timeout", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                handles.push(thread::spawn(move || {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(1250));
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+                    );
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        assert!(request_text(transport().unwrap().client.get(&url), 1).is_err());
+        assert_eq!(
+            request_text(transport().unwrap().client.get(&url), 3).unwrap(),
+            "OK"
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn qwen_reasoning_is_embedded_per_request() {

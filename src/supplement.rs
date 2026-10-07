@@ -9,10 +9,11 @@ pub(super) struct AnalysisContext<'a> {
     pub(super) filters: (&'a [String], &'a [String]),
     pub(super) allow: bool,
     pub(super) reporter: Option<&'a Reporter>,
+    pub(super) discovery: &'a mut workspace::DiscoverySession,
 }
 
 pub(super) fn analyze_with_supplement(
-    context: &AnalysisContext<'_>,
+    context: &mut AnalysisContext<'_>,
     prompt: &str,
     selection: &mut DeepSelection,
     sources: &mut workspace::CollectedSource,
@@ -61,14 +62,7 @@ pub(super) fn analyze_with_supplement(
             continue;
         }
         let query = format!("{query} {}", paths.join(" "));
-        let index = workspace::discovery_index_for_task(
-            context.root,
-            &[],
-            config,
-            context.filters.0,
-            context.filters.1,
-            &query,
-        )?;
+        let index = context.discovery.index_for_task(&[], config, &query)?;
         if let Some(reporter) = context.reporter {
             reporter.record_cache_usage(
                 index.cache_hits as u64,
