@@ -1508,7 +1508,10 @@ fn render_value_list(value: &Value, key: &str, max_items: usize) -> Vec<String> 
 }
 
 fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSelection>) -> String {
-    let budget = max_tokens.max(128) as usize;
+    let budget = max_tokens as usize;
+    if budget == 0 {
+        return String::new();
+    }
     let Some(value) = json_object(raw) else {
         let mut fallback = String::new();
         let read_next = selection
@@ -1820,6 +1823,33 @@ fn plan(
     ))
 }
 
+fn compact_review_result(
+    value: &Value,
+    max_tokens: u32,
+    batches: usize,
+    include_untracked: bool,
+    omitted: &[String],
+) -> String {
+    let budget = max_tokens as usize;
+    let coverage = format!(
+        "REVIEW COVERAGE: {batches} batches reviewed; include_untracked={include_untracked}; omitted={}\n{}",
+        omitted.len(),
+        omitted.join("\n")
+    );
+    let prefix = workspace::truncate_tokens_strict(
+        coverage.trim(),
+        (budget / 3).min(256),
+        "\n[OMITTED DETAILS TRUNCATED]",
+    );
+    let remaining = budget.saturating_sub(workspace::estimate_tokens(&prefix) + 2);
+    let result = compact_primary_result(&value.to_string(), remaining as u32, None);
+    workspace::truncate_tokens_strict(
+        &format!("{prefix}\n\n{result}"),
+        budget,
+        "\n[PRIMARY RESULT TRUNCATED]\n",
+    )
+}
+
 fn review_diff(
     config: &AppConfig,
     root: &Path,
@@ -1892,12 +1922,6 @@ fn review_diff(
             "low" => 3,
             _ => 4,
         });
-    let coverage = format!(
-        "REVIEW COVERAGE: {} batches reviewed; include_untracked={include_untracked}; omitted={}\n{}",
-        batches.len(),
-        omitted.len(),
-        omitted.join("\n")
-    );
     if let Some(reporter) = reporter {
         reporter.record_context(
             batches
@@ -1916,9 +1940,12 @@ fn review_diff(
         batches.len() as u64,
         batches.len() as u64,
     )?;
-    Ok(format!(
-        "{coverage}\n\n{}",
-        compact_primary_result(&combined.to_string(), tool.primary_return_or(1000), None)
+    Ok(compact_review_result(
+        &combined,
+        tool.primary_return_or(1000),
+        batches.len(),
+        include_untracked,
+        &omitted,
     ))
 }
 
@@ -2524,6 +2551,23 @@ mod tests {
             root,
             &json!({"issue": "unknown failure with no path hints"})
         ));
+    }
+
+    #[test]
+    fn review_return_budget_includes_coverage_and_long_omission_lists() {
+        let value = json!({"conclusion":"Review finished", "findings":[{
+            "severity":"critical", "text":"Important regression", "evidence":[]
+        }]});
+        let omitted = (0..1000)
+            .map(|n| format!("src/long_module_{n}.rs: omitted at batch limit"))
+            .collect::<Vec<_>>();
+        for budget in [128, 256, 1000] {
+            let result = compact_review_result(&value, budget, 32, false, &omitted);
+            assert!(workspace::estimate_tokens(&result) <= budget as usize);
+            assert!(result.contains("omitted=1000"));
+            assert!(result.contains("Important regression"));
+        }
+        assert!(compact_primary_result(&value.to_string(), 0, None).is_empty());
     }
 
     #[test]
