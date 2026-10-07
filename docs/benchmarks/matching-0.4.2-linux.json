@@ -1,0 +1,71 @@
+{
+  "kind": "synthetic matching only; no disk I/O, model latency or token savings",
+  "repeats": 7,
+  "results": [
+    {
+      "case": "path_filters_8000_x8",
+      "new_ms": 17.022159,
+      "new_setup_ms": 0.317909,
+      "old_ms": 511.86915300000004,
+      "speedup": 30.070753833282847
+    },
+    {
+      "case": "keywords_3_width_48_unicode_4096_x8",
+      "new_ms": 2.1946969999999997,
+      "new_setup_ms": 0.001061,
+      "old_ms": 2.200586,
+      "speedup": 1.0026832861210455
+    },
+    {
+      "case": "keywords_12_width_48_unicode_4096_x8",
+      "new_ms": 4.30738,
+      "new_setup_ms": 0.001342,
+      "old_ms": 4.2228129999999995,
+      "speedup": 0.9803669516039911
+    },
+    {
+      "case": "keywords_12_width_320_unicode_4096_x8",
+      "new_ms": 7.073949000000001,
+      "new_setup_ms": 0.001763,
+      "old_ms": 7.053418,
+      "speedup": 0.9970976607267029
+    },
+    {
+      "case": "keywords_32_width_320_unicode_4096_x8",
+      "new_ms": 16.487404,
+      "new_setup_ms": 0.004065999999999999,
+      "old_ms": 16.771632,
+      "speedup": 1.0172390996181084
+    },
+    {
+      "case": "keywords_64_width_320_unicode_4096_x8",
+      "new_ms": 22.656198,
+      "new_setup_ms": 0.223126,
+      "old_ms": 32.999174,
+      "speedup": 1.4565186091682283
+    },
+    {
+      "case": "keywords_64_width_320_ascii_4096_x8",
+      "new_ms": 20.202862,
+      "new_setup_ms": 0.120101,
+      "old_ms": 32.785821999999996,
+      "speedup": 1.622830567273092
+    },
+    {
+      "case": "keywords_256_width_320_weighted_4096_x8",
+      "new_ms": 36.601521999999996,
+      "new_setup_ms": 0.219541,
+      "old_ms": 130.033266,
+      "speedup": 3.5526737385401628
+    }
+  ],
+  "statistic": "median milliseconds; setup excluded from matching",
+  "environment": {
+    "date": "2026-10-07",
+    "platform": "Linux x86_64",
+    "cpu": "AMD EPYC 9V74 (virtualized shared host)",
+    "rustc": "1.99.0 (b940084d7 2026-09-28)",
+    "version": "0.4.2",
+    "baseline": "0.4.1 matching algorithms"
+  }
+}

@@ -308,71 +308,17 @@ pub(crate) fn normalized_relative(path: &Path) -> String {
         .to_owned()
 }
 
+#[cfg(test)]
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.replace('\\', "/");
-    let pattern = pattern.trim_start_matches("./").as_bytes();
-    let text = text.as_bytes();
-    let mut memo = std::collections::HashMap::<(usize, usize), bool>::new();
-
-    fn matches(
-        pattern: &[u8],
-        text: &[u8],
-        pi: usize,
-        ti: usize,
-        memo: &mut std::collections::HashMap<(usize, usize), bool>,
-    ) -> bool {
-        if let Some(value) = memo.get(&(pi, ti)) {
-            return *value;
-        }
-        let result = if pi == pattern.len() {
-            ti == text.len()
-        } else if pattern[pi] == b'*' && pi + 1 < pattern.len() && pattern[pi + 1] == b'*' {
-            let mut next = pi + 2;
-            while next < pattern.len() && pattern[next] == b'*' {
-                next += 1;
-            }
-            if next < pattern.len() && pattern[next] == b'/' {
-                matches(pattern, text, next + 1, ti, memo)
-                    || (ti < text.len() && matches(pattern, text, pi, ti + 1, memo))
-            } else {
-                matches(pattern, text, next, ti, memo)
-                    || (ti < text.len() && matches(pattern, text, pi, ti + 1, memo))
-            }
-        } else if pattern[pi] == b'*' {
-            matches(pattern, text, pi + 1, ti, memo)
-                || (ti < text.len() && text[ti] != b'/' && matches(pattern, text, pi, ti + 1, memo))
-        } else if pattern[pi] == b'?' {
-            ti < text.len() && text[ti] != b'/' && matches(pattern, text, pi + 1, ti + 1, memo)
-        } else {
-            ti < text.len()
-                && pattern[pi] == text[ti]
-                && matches(pattern, text, pi + 1, ti + 1, memo)
-        };
-        memo.insert((pi, ti), result);
-        result
-    }
-
-    matches(pattern, text, 0, 0, &mut memo)
+    crate::path_filters::PathFilters::new(&[pattern.to_owned()], &[])
+        .unwrap()
+        .allows(text)
 }
-
-fn matches_pattern(pattern: &str, relative: &str) -> bool {
-    glob_match(pattern, relative)
-        || (!pattern.contains('/')
-            && relative
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| glob_match(pattern, name)))
-}
-
+#[cfg(test)]
 fn matches_filters(relative: &str, include: &[String], exclude: &[String]) -> bool {
-    let included = include.is_empty()
-        || include
-            .iter()
-            .any(|pattern| matches_pattern(pattern, relative));
-    let excluded = exclude
-        .iter()
-        .any(|pattern| matches_pattern(pattern, relative));
-    included && !excluded
+    crate::path_filters::PathFilters::new(include, exclude)
+        .unwrap()
+        .allows(relative)
 }
 
 fn overview_files(root: &Path) -> Vec<PathBuf> {
@@ -391,11 +337,20 @@ pub(crate) fn requested_files(
     include: &[String],
     exclude: &[String],
 ) -> Result<BTreeSet<PathBuf>> {
+    let filters = crate::path_filters::PathFilters::new(include, exclude)?;
+    requested_files_with_filters(root, requested, &filters)
+}
+
+fn requested_files_with_filters(
+    root: &Path,
+    requested: &[String],
+    filters: &crate::path_filters::PathFilters,
+) -> Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
     if requested.is_empty() {
         for path in overview_files(root) {
             let relative = normalized_relative(path.strip_prefix(root).unwrap_or(&path));
-            if matches_filters(&relative, include, exclude) {
+            if filters.allows(&relative) {
                 files.insert(path);
             }
         }
@@ -407,10 +362,7 @@ pub(crate) fn requested_files(
         let target = secure_path(root, &root.join(item))?;
         if target.is_file() {
             let relative = normalized_relative(target.strip_prefix(root).unwrap_or(&target));
-            if !is_secret(&target)
-                && looks_text(&target)
-                && matches_filters(&relative, include, exclude)
-            {
+            if !is_secret(&target) && looks_text(&target) && filters.allows(&relative) {
                 files.insert(target);
             }
             continue;
@@ -429,7 +381,7 @@ pub(crate) fn requested_files(
                 let resolved = secure_path(root, path)?;
                 let relative =
                     normalized_relative(resolved.strip_prefix(root).unwrap_or(&resolved));
-                if matches_filters(&relative, include, exclude) {
+                if filters.allows(&relative) {
                     files.insert(resolved);
                 }
             }
@@ -669,8 +621,7 @@ pub fn discovery_index_for_task(
 /// current file stamps and exact symbol ranges before any source is supplied.
 pub struct DiscoverySession {
     root: PathBuf,
-    include: Vec<String>,
-    exclude: Vec<String>,
+    filters: crate::path_filters::PathFilters,
     scopes: BTreeMap<Vec<String>, BTreeSet<PathBuf>>,
     index: Option<repo_cache::RepositorySymbolIndex>,
     observed: BTreeSet<String>,
@@ -680,8 +631,7 @@ impl DiscoverySession {
     pub fn new(workspace: &Path, include: &[String], exclude: &[String]) -> Result<Self> {
         Ok(Self {
             root: canonical_workspace(workspace)?,
-            include: include.to_vec(),
-            exclude: exclude.to_vec(),
+            filters: crate::path_filters::PathFilters::new(include, exclude)?,
             scopes: BTreeMap::new(),
             index: None,
             observed: BTreeSet::new(),
@@ -701,7 +651,7 @@ impl DiscoverySession {
             requested.to_vec()
         };
         if !self.scopes.contains_key(&discovery_request) {
-            let files = requested_files(&root, &discovery_request, &self.include, &self.exclude)?;
+            let files = requested_files_with_filters(&root, &discovery_request, &self.filters)?;
             self.scopes.insert(discovery_request.clone(), files);
         }
         let files = self.scopes[&discovery_request].clone();
@@ -724,7 +674,7 @@ impl DiscoverySession {
         let mut cache_hits = 0usize;
         let mut cache_misses = 0usize;
 
-        let keywords = crate::search::keywords(task);
+        let mut matcher = crate::search::KeywordMatcher::new(&crate::search::keywords(task));
         let mut ranked = Vec::new();
         for file in files {
             crate::control::Control::current().check()?;
@@ -762,17 +712,18 @@ impl DiscoverySession {
                 indexed
             };
             let bytes = indexed.stamp.size;
-            let mut symbols = indexed.symbols;
-            symbols.sort_by_key(|symbol| {
-                std::cmp::Reverse(crate::search::score(&keywords, &symbol.label))
-            });
-            let score = crate::search::score(&keywords, &relative) * 4
-                + symbols
-                    .iter()
-                    .map(|symbol| crate::search::score(&keywords, &symbol.label))
-                    .max()
-                    .unwrap_or(0)
-                    * 8;
+            let mut scored_symbols = indexed
+                .symbols
+                .into_iter()
+                .map(|symbol| (matcher.score(&symbol.label), symbol))
+                .collect::<Vec<_>>();
+            scored_symbols.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            let score = matcher.score(&relative) * 4
+                + scored_symbols.first().map(|(score, _)| *score).unwrap_or(0) * 8;
+            let symbols = scored_symbols
+                .into_iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
             ranked.push((score, relative, bytes, symbols, indexed.imports));
         }
         ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
@@ -1085,7 +1036,7 @@ pub fn supplemental_text_context(
     supplied: &crate::evidence::Catalog,
 ) -> Result<(CollectedSource, Vec<SymbolCandidate>)> {
     let root = canonical_workspace(workspace)?;
-    let keywords = crate::search::keywords(query);
+    let mut matcher = crate::search::KeywordMatcher::new(&crate::search::keywords(query));
     let mut body = String::new();
     let mut ranges = Vec::new();
     let mut included_files = Vec::new();
@@ -1112,7 +1063,7 @@ pub fn supplemental_text_context(
         let Some((focus, score)) = lines
             .iter()
             .enumerate()
-            .map(|(index, line)| (index, crate::search::score(&keywords, line)))
+            .map(|(index, line)| (index, matcher.score(line)))
             .max_by_key(|(index, score)| (*score, std::cmp::Reverse(*index)))
         else {
             continue;

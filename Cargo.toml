@@ -1,6 +1,6 @@
 [package]
 name = "llm2mcp"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Turn any OpenAI-compatible LLM into a local MCP sidecar for AI coding agents"
 license = "MIT"
@@ -9,6 +9,8 @@ keywords = ["mcp", "cursor", "llm", "openai", "code-analysis"]
 categories = ["development-tools"]
 
 [dependencies]
+aho-corasick = "1"
+globset = "0.4"
 regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros"] }
 tree-sitter = "0.27"
