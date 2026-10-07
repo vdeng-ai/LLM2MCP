@@ -1,3 +1,7 @@
+#[path = "supplement.rs"]
+mod supplement;
+use supplement::{AnalysisContext, analyze_with_supplement};
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -29,7 +33,8 @@ Rules:
 - Do not reveal hidden chain-of-thought.
 Return JSON only, with no Markdown or code fences, in this shape:
 {"conclusion":"...","findings":[{"severity":"high|medium|low|info","text":"...","evidence":["path:line-range or symbol"]}],"risks":["..."],"actions":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
-Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
+Keep fields concise; the bridge will locally compact this before returning it to the primary agent.
+When supplied evidence is insufficient, you may include optional "context_requests":[{"query":"exact identifier or question","paths":["existing relative/path"]}] alongside the required result fields. Request at most three targeted searches. The bridge permits one local supplemental round and one further analysis pass; do not invent paths or request commands."#;
 
 const DEBUG_SYSTEM: &str = r#"You are a local software-debugging specialist assisting a primary coding agent.
 Diagnose the reported malfunction from the supplied symptoms, logs, repository evidence, and optional recent Git changes.
@@ -44,7 +49,8 @@ Rules:
 - Do not reveal hidden chain-of-thought.
 Return JSON only, with no Markdown or code fences, in this shape:
 {"diagnosis":"...","confidence":"high|medium|low","root_cause":"...","evidence":[{"severity":"high|medium|low|info","text":"...","evidence":["path:start-end, log:exact supplied excerpt, or diff:path:exact supplied hunk/excerpt"]}],"execution_path":["..."],"intermittency":"...","alternatives":["..."],"verification":["..."],"fix_area":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
-Keep fields concise; the bridge will locally validate read_next and compact the result before returning it to the primary agent."#;
+Keep fields concise; the bridge will locally validate read_next and compact the result before returning it to the primary agent.
+When supplied evidence is insufficient, you may include optional "context_requests":[{"query":"exact identifier or question","paths":["existing relative/path"]}] alongside the required result fields. Request at most three targeted searches. The bridge permits one local supplemental round and one further analysis pass; do not invent paths or request commands."#;
 
 const PLAN_SYSTEM: &str = r#"You are a local software-planning specialist assisting a primary coding agent.
 Analyze the supplied repository information and produce an implementation plan.
@@ -58,7 +64,8 @@ Rules:
 - Do not reveal hidden chain-of-thought.
 Return JSON only, with no Markdown or code fences, in this shape:
 {"goal":"...","steps":["..."],"risks":["..."],"tests":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
-Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
+Keep fields concise; the bridge will locally compact this before returning it to the primary agent.
+When supplied evidence is insufficient, you may include optional "context_requests":[{"query":"exact identifier or question","paths":["existing relative/path"]}] alongside the required result fields. Request at most three targeted searches. The bridge permits one local supplemental round and one further analysis pass; do not invent paths or request commands."#;
 
 const DISCOVERY_SYSTEM: &str = r#"You are selecting repository symbols for a deeper second-pass analysis by another model call.
 Use only the supplied lightweight file/symbol index. Prefer the smallest exact symbol ranges that can answer the task; use whole files only when no suitable symbol range is available.
@@ -132,7 +139,7 @@ pub fn run(workspace_path: &Path) -> Result<()> {
             let business = method == "tools/call"
                 && !matches!(
                     request.pointer("/params/name").and_then(Value::as_str),
-                    Some("job_status" | "job_result" | "job_cancel")
+                    Some("job_status" | "job_result" | "job_cancel" | "result_page")
                 );
             if !business {
                 send_reply(&rpc_response(&workspace, &request))?;
@@ -255,7 +262,7 @@ fn run_job_worker_inner(job_id: &str) -> Result<()> {
             if jobs::load(job_id)?.cancel_requested {
                 jobs::mark_cancelled(job_id)?;
             } else {
-                jobs::complete(job_id, tool_result(text, false))?;
+                jobs::complete(job_id, business_result(text, job_id))?;
             }
         }
         Err(error) if error.to_string().contains("job cancelled") => {
@@ -359,6 +366,7 @@ fn tools_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "allow_supplement":{"type":"boolean","default":true,"description":"Allow at most one additional analysis pass after bounded supplemental retrieval"},
                         "task": {"type": "string", "description": "What to analyze and what questions to answer"},
                         "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files or directories. Empty triggers lightweight repository discovery before deep file reads."},
                         "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs such as src/**/*.rs"},
@@ -375,6 +383,7 @@ fn tools_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "allow_supplement":{"type":"boolean","default":true,"description":"Allow at most one additional analysis pass after bounded supplemental retrieval"},
                         "issue": {"type": "string", "description": "Required symptom or malfunction description"},
                         "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional workspace-relative files or directories to prioritize"},
                         "logs": {"type": "string", "description": "Optional logs, stack trace, compiler/runtime error, HTTP error, console output, or other observed evidence"},
@@ -395,6 +404,7 @@ fn tools_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "allow_supplement":{"type":"boolean","default":true,"description":"Allow at most one additional analysis pass after bounded supplemental retrieval"},
                         "task": {"type": "string"},
                         "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files or directories. Directories use lightweight file/symbol discovery before deep reads."},
                         "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs"},
@@ -429,6 +439,8 @@ fn tools_list() -> Value {
                         "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional workspace-relative files/directories to document. Empty scans the repository."},
                         "include": {"type": "array", "items": {"type": "string"}, "description": "Optional include globs"},
                         "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs"},
+                        "scan_cursor":{"type":"string","description":"Optional continuation from a previous scan"},
+                        "max_chunks":{"type":"integer","minimum":1,"maximum":12,"default":12},
                         "audience": {"type": "string", "default": "developer"},
                         "language": {"type": "string", "enum": ["auto", "english", "simplified_chinese"], "default": "auto"}
                     },
@@ -450,6 +462,21 @@ fn tools_list() -> Value {
                     "additionalProperties": false
                 },
                 "annotations": {"readOnlyHint": true, "destructiveHint": false}
+            },
+            {
+                "name": "result_page",
+                "description": "Read a bounded UTF-8 page of a completed job's validated complete result without model calls. Reassemble pages before parsing JSON or applying documents. Cursors are immutable and workspace-bound.",
+                "inputSchema": {"type":"object", "properties": {
+                    "job_id":{"type":"string"}, "cursor":{"type":"string"},
+                    "page_tokens":{"type":"integer","minimum":256,"maximum":8192,"default":1000}
+                }, "required":["job_id"], "additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name": "continue_scan",
+                "description": "Continue a document_repo scan from its persistent scan_cursor. Uses the original request and accumulated map evidence; changed repositories or layouts require a fresh scan. May return a background job.",
+                "inputSchema":{"type":"object", "properties":{"scan_cursor":{"type":"string"}},"required":["scan_cursor"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
             },
             {
                 "name": "job_status",
@@ -490,18 +517,53 @@ fn tools_list() -> Value {
 
 fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<Value> {
     let params = params.context("missing tools/call params")?;
-    let name = params
+    let requested_name = params
         .get("name")
         .and_then(Value::as_str)
         .context("missing tool name")?;
+    let name = if requested_name == "continue_scan" {
+        "document_repo"
+    } else {
+        requested_name
+    };
     let args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    if requested_name == "continue_scan" {
+        required_string_arg(&args, "scan_cursor")?;
+    }
+    if args.get("scan_cursor").is_some() {
+        required_string_arg(&args, "scan_cursor")?;
+    }
+    if args
+        .get("allow_supplement")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        bail!("allow_supplement must be a boolean");
+    }
     match name {
         "job_status" => return job_status(&args),
         "job_result" => return job_result(&args),
+        "result_page" => {
+            let job_id = job_id_arg(&args)?;
+            let text = jobs::read_full_result(job_id, root)?;
+            let budget = args
+                .get("page_tokens")
+                .map(|value| value.as_u64().context("page_tokens must be an integer"))
+                .transpose()?
+                .unwrap_or(1000);
+            let budget = usize::try_from(budget).context("page_tokens exceeds supported range")?;
+            let cursor = args
+                .get("cursor")
+                .map(|value| value.as_str().context("cursor must be a string"))
+                .transpose()?;
+            return Ok(tool_result(
+                crate::result_pages::page(job_id, &text, cursor, budget)?.to_string(),
+                false,
+            ));
+        }
         "job_cancel" => return job_cancel(&args),
         _ => {}
     }
@@ -538,7 +600,7 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
         .and_then(|_slot| execute_business_inner(config, root, name, &args, Some(&reporter)));
     match result {
         Ok(text) => {
-            let result = tool_result(text, false);
+            let result = business_result(text, &record.id);
             jobs::complete(&record.id, result.clone())?;
             Ok(result)
         }
@@ -727,6 +789,41 @@ fn tool_result(text: String, is_error: bool) -> Value {
     })
 }
 
+fn business_result(text: String, job_id: &str) -> Value {
+    let mut result = tool_result(text, false);
+    result["_meta"] = json!({"llm2mcp/job_id":job_id, "llm2mcp/full_result_tool":"result_page"});
+    result
+}
+
+fn full_primary_result(
+    raw: &str,
+    budget: u32,
+    selection: Option<&DeepSelection>,
+    reporter: Option<&Reporter>,
+) -> Result<String> {
+    let Some(reporter) = reporter else {
+        return Ok(compact_primary_result(raw, budget, selection));
+    };
+    let mut value: Value = serde_json::from_str(raw)?;
+    if value.get("read_next").is_some() {
+        value["read_next"] = json!(validated_read_next_with_limit(
+            &value,
+            selection,
+            usize::MAX,
+            usize::MAX
+        ));
+    }
+    reporter.store_full_result(&serde_json::to_string_pretty(&value)?)?;
+    let handle = format!("FULL_RESULT job_id={} (result_page)", reporter.job_id());
+    let remaining = (budget as usize).saturating_sub(workspace::estimate_tokens(&handle) + 2);
+    let compact = compact_primary_result(raw, remaining as u32, selection);
+    Ok(workspace::truncate_tokens_strict(
+        &format!("{compact}\n\n{handle}"),
+        budget as usize,
+        "",
+    ))
+}
+
 fn format_business_error(error: &anyhow::Error) -> String {
     let message = format!("LLM2MCP error: {error:#}");
     if let Some(hint) = jobs::diagnostic_hint(&message) {
@@ -766,9 +863,20 @@ fn execute_business_inner(
     ] {
         tool.max_output_tokens = tool.max_output_tokens.min(output);
     }
+    // Continuations reserve the same original request overhead as their first
+    // page. A shorter cursor-only call must not silently change Map segmentation.
+    let metadata_args = if name == "document_repo" {
+        args.get("scan_cursor")
+            .and_then(Value::as_str)
+            .map(|cursor| crate::scan::load(cursor, root).map(|checkpoint| checkpoint.args))
+            .transpose()?
+            .unwrap_or_else(|| args.clone())
+    } else {
+        args.clone()
+    };
     let metadata = format!(
         "{}\n{}",
-        args,
+        metadata_args,
         workspace::truncate_tokens_strict(
             &workspace::manifest(root)?,
             1024,
@@ -785,7 +893,7 @@ fn execute_business_inner(
     };
     let routed = budgeted_config(&routed, system, &metadata, requested_output)?;
     let config = &routed;
-    match name {
+    let text = match name {
         "analyze" => analyze(config, root, args, &config.tools.analyze, reporter),
         "debug_issue" => debug_issue(config, root, args, &config.tools.debug_issue, reporter),
         "plan" => plan(config, root, args, &config.tools.plan, reporter),
@@ -793,7 +901,13 @@ fn execute_business_inner(
         "document_repo" => document_repo(config, root, args, &config.tools.document_repo, reporter),
         "update_docs" => update_docs(config, root, args, &config.tools.update_docs, reporter),
         _ => bail!("unknown background tool: {name}"),
+    }?;
+    if let Some(reporter) = reporter
+        && jobs::load(reporter.job_id())?.full_result_sha256.is_none()
+    {
+        reporter.store_full_result(&text)?;
     }
+    Ok(text)
 }
 
 fn budgeted_config(
@@ -1401,6 +1515,15 @@ fn collect_deep_selection(
 }
 
 fn validated_read_next(value: &Value, selection: Option<&DeepSelection>) -> Vec<String> {
+    validated_read_next_with_limit(value, selection, 6, 4)
+}
+
+fn validated_read_next_with_limit(
+    value: &Value,
+    selection: Option<&DeepSelection>,
+    limit: usize,
+    file_limit: usize,
+) -> Vec<String> {
     let Some(selection) = selection else {
         return Vec::new();
     };
@@ -1441,14 +1564,14 @@ fn validated_read_next(value: &Value, selection: Option<&DeepSelection>) -> Vec<
                 "- {}:{}-{} — {}{}",
                 candidate.path, candidate.start_line, candidate.end_line, candidate.label, suffix
             ));
-            if output.len() >= 6 {
+            if output.len() >= limit {
                 break;
             }
         }
     }
 
     if output.is_empty() {
-        output.extend(selection.symbols.iter().take(6).map(|candidate| {
+        output.extend(selection.symbols.iter().take(limit).map(|candidate| {
             format!(
                 "- {}:{}-{} — {}",
                 candidate.path, candidate.start_line, candidate.end_line, candidate.label
@@ -1460,7 +1583,7 @@ fn validated_read_next(value: &Value, selection: Option<&DeepSelection>) -> Vec<
             selection
                 .files
                 .iter()
-                .take(4)
+                .take(file_limit)
                 .map(|path| format!("- {path}")),
         );
     }
@@ -1507,10 +1630,10 @@ fn analyze(
     let task = task_arg(args)?;
     let requested = paths_arg(args);
     let (include, exclude) = source_filters(args);
-    let selection =
+    let mut selection =
         discover_deep_context(config, root, task, &requested, &include, &exclude, reporter)?;
     progress(reporter, "collecting selected context", 1, 3)?;
-    let sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
+    let mut sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
         reporter.record_context(
             workspace::estimate_tokens(&sources.body),
@@ -1539,25 +1662,31 @@ fn analyze(
         sources.body,
         sources.truncated,
     );
-    let result = chat_with_reporter(
+    let context = AnalysisContext {
         config,
-        ANALYZE_SYSTEM,
-        &prompt,
-        tool.reasoning,
-        tool.max_output_tokens,
+        root,
+        system: ANALYZE_SYSTEM,
+        tool,
+        filters: (&include, &exclude),
+        allow: args
+            .get("allow_supplement")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         reporter,
-    )?;
+    };
+    let result = analyze_with_supplement(&context, &prompt, &mut selection, &mut sources)?;
     let result = crate::evidence::verify(
         serde_json::from_str(&result)?,
         &crate::evidence::Catalog::new(&sources.body, "", ""),
     )
     .to_string();
     progress(reporter, "finishing", 3, 3)?;
-    Ok(compact_primary_result(
+    full_primary_result(
         &result,
         tool.primary_return_or(800),
         Some(&selection),
-    ))
+        reporter,
+    )
 }
 
 fn debug_issue(
@@ -1620,7 +1749,7 @@ fn debug_issue(
     );
 
     progress(reporter, "building debug discovery index", 1, 4)?;
-    let selection = discover_deep_context(
+    let mut selection = discover_deep_context(
         &debug_context_config,
         root,
         &discovery_task,
@@ -1630,7 +1759,7 @@ fn debug_issue(
         reporter,
     )?;
     progress(reporter, "collecting debug context", 2, 4)?;
-    let sources =
+    let mut sources =
         collect_deep_selection(&debug_context_config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
         reporter.record_context(
@@ -1661,25 +1790,31 @@ fn debug_issue(
         sources.body,
         sources.truncated,
     );
-    let result = chat_with_reporter(
-        config,
-        DEBUG_SYSTEM,
-        &prompt,
-        tool.reasoning,
-        tool.max_output_tokens,
+    let context = AnalysisContext {
+        config: &debug_context_config,
+        root,
+        system: DEBUG_SYSTEM,
+        tool,
+        filters: (&include, &exclude),
+        allow: args
+            .get("allow_supplement")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         reporter,
-    )?;
+    };
+    let result = analyze_with_supplement(&context, &prompt, &mut selection, &mut sources)?;
     let result = crate::evidence::verify(
         serde_json::from_str(&result)?,
         &crate::evidence::Catalog::new(&sources.body, &logs_for_prompt, &recent_change_evidence),
     )
     .to_string();
     progress(reporter, "finishing", 4, 4)?;
-    Ok(compact_primary_result(
+    full_primary_result(
         &result,
         tool.primary_return_or(1_400),
         Some(&selection),
-    ))
+        reporter,
+    )
 }
 
 fn plan(
@@ -1693,10 +1828,10 @@ fn plan(
     let task = task_arg(args)?;
     let requested = paths_arg(args);
     let (include, exclude) = source_filters(args);
-    let selection =
+    let mut selection =
         discover_deep_context(config, root, task, &requested, &include, &exclude, reporter)?;
     progress(reporter, "collecting selected context", 1, 3)?;
-    let sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
+    let mut sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
         reporter.record_context(
             workspace::estimate_tokens(&sources.body),
@@ -1725,20 +1860,26 @@ fn plan(
         sources.body,
         sources.truncated,
     );
-    let result = chat_with_reporter(
+    let context = AnalysisContext {
         config,
-        PLAN_SYSTEM,
-        &prompt,
-        tool.reasoning,
-        tool.max_output_tokens,
+        root,
+        system: PLAN_SYSTEM,
+        tool,
+        filters: (&include, &exclude),
+        allow: args
+            .get("allow_supplement")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         reporter,
-    )?;
+    };
+    let result = analyze_with_supplement(&context, &prompt, &mut selection, &mut sources)?;
     progress(reporter, "finishing", 3, 3)?;
-    Ok(compact_primary_result(
+    full_primary_result(
         &result,
         tool.primary_return_or(1_200),
         Some(&selection),
-    ))
+        reporter,
+    )
 }
 
 fn compact_review_result(
@@ -1861,12 +2002,26 @@ fn review_diff(
         batches.len() as u64,
         batches.len() as u64,
     )?;
-    Ok(compact_review_result(
+    let budget = tool.primary_return_or(1000);
+    let handle = if let Some(reporter) = reporter {
+        let full = json!({"review":combined, "coverage":{"batches":batches.len(), "include_untracked":include_untracked, "omitted":omitted}});
+        reporter.store_full_result(&serde_json::to_string_pretty(&full)?)?;
+        format!("\n\nFULL_RESULT job_id={} (result_page)", reporter.job_id())
+    } else {
+        String::new()
+    };
+    let remaining = budget.saturating_sub(workspace::estimate_tokens(&handle) as u32);
+    let compact = compact_review_result(
         &combined,
-        tool.primary_return_or(1000),
+        remaining,
         batches.len(),
         include_untracked,
         &omitted,
+    );
+    Ok(workspace::truncate_tokens_strict(
+        &format!("{compact}{handle}"),
+        budget as usize,
+        "",
     ))
 }
 
@@ -1957,10 +2112,25 @@ fn document_repo(
     tool: &ToolConfig,
     reporter: Option<&Reporter>,
 ) -> Result<String> {
-    const MAX_CHUNKS: usize = 12;
     const MAX_CHUNK_TOKENS: usize = 40_000;
 
     progress(reporter, "scanning repository", 0, 1)?;
+    let previous = args
+        .get("scan_cursor")
+        .and_then(Value::as_str)
+        .map(|cursor| crate::scan::load(cursor, root))
+        .transpose()?;
+    if let Some(previous) = &previous {
+        for (key, value) in args.as_object().context("invalid scan arguments")? {
+            if key != "scan_cursor" && previous.args.get(key) != Some(value) {
+                bail!("continuation options changed; start a new scan");
+            }
+        }
+    }
+    let args = previous
+        .as_ref()
+        .map(|previous| &previous.args)
+        .unwrap_or(args);
     let document_type = enum_arg(
         args,
         "document_type",
@@ -1986,27 +2156,52 @@ fn document_repo(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("developer");
-    let paths = paths_arg(args);
-    let (include, exclude) = source_filters(args);
     let map_config = config.with_profile(config.map_profile.as_deref())?;
     let map_tokens = (tool.max_output_tokens / 10)
         .clamp(128, 1200)
         .min(map_config.model_output_limit)
         .min((map_config.model_input_limit / 4) as u32);
     let map_config = budgeted_config(&map_config, DOC_MAP_SYSTEM, &args.to_string(), map_tokens)?;
-    let (chunks, coverage) = workspace::collect_chunks_filtered(
+    let empty_chunk = workspace::CollectedSource {
+        manifest: String::new(),
+        body: String::new(),
+        included_files: Vec::new(),
+        truncated: false,
+        evidence_cache_hits: 0,
+        evidence_cache_misses: 0,
+    };
+    let layout = crate::result_pages::digest(&format!(
+        "{}:{}:{}:{}",
+        doc_cache::map_key(&map_config, map_tokens, &empty_chunk),
+        map_config.max_source_tokens,
+        map_config.max_file_tokens,
+        args
+    ));
+    if let Some(previous) = &previous
+        && previous.layout != layout
+    {
+        bail!("scan model/profile/budget layout changed; start a new scan");
+    }
+    let page = crate::scan::collect(
         root,
-        &paths,
+        args,
         &map_config,
         map_config.max_source_tokens.min(MAX_CHUNK_TOKENS),
-        MAX_CHUNKS,
-        &include,
-        &exclude,
+        previous.as_ref(),
     )?;
-    if chunks.is_empty() {
+    let chunks = &page.chunks;
+    if chunks.is_empty()
+        && previous
+            .as_ref()
+            .is_none_or(|previous| previous.summary_keys.is_empty())
+    {
         bail!("no readable source files found for documentation");
     }
-    let coverage_note = coverage.summary();
+    let coverage_note = format!(
+        "{}\nPending scan continuation: {}",
+        page.coverage.summary(),
+        page.next.is_some()
+    );
 
     // Repository-map summaries are evidence extraction, not final prose. Keeping
     // them compact dramatically reduces both map time and final Reduce context.
@@ -2022,13 +2217,16 @@ fn document_repo(
                 .flat_map(|chunk| chunk.included_files.iter())
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            chunks.iter().any(|chunk| chunk.truncated),
+            page.next.is_some() || !page.coverage.omissions.is_empty(),
         )?;
     }
     let total_chunks = chunks.len();
     let total_steps = total_chunks as u64 + 1;
-    let scan_truncated = chunks.iter().any(|chunk| chunk.truncated);
-    let manifest = chunks[0].manifest.clone();
+    let mut scan_truncated = page.next.is_some() || !page.coverage.omissions.is_empty();
+    let manifest = chunks
+        .first()
+        .map(|chunk| chunk.manifest.clone())
+        .unwrap_or(workspace::manifest(root)?);
     let concurrency = config
         .document_map_concurrency
         .clamp(1, 8)
@@ -2098,12 +2296,7 @@ fn document_repo(
                         map_tokens,
                         reporter,
                     )?;
-                    if let Err(error) = doc_cache::store_summary(&key, &summary) {
-                        eprintln!(
-                            "LLM2MCP map checkpoint write failed for chunk {}: {error:#}",
-                            index + 1
-                        );
-                    }
+                    doc_cache::store_summary(&key, &summary)?;
                     Ok((index, summary))
                 }));
             }
@@ -2130,38 +2323,59 @@ fn document_repo(
         }
     }
 
-    let summaries = summaries
-        .into_iter()
-        .enumerate()
-        .map(|(index, summary)| {
-            summary
-                .map(|summary| {
-                    format!(
-                        "===== MAP SUMMARY {}/{} =====\n{}\n===== END MAP SUMMARY =====",
-                        index + 1,
-                        total_chunks,
-                        summary
-                    )
-                })
-                .with_context(|| format!("missing repository map summary for chunk {}", index + 1))
+    crate::scan::validate_snapshot(root, args, &page.snapshot)?;
+    let mut summary_keys = previous
+        .as_ref()
+        .map(|previous| previous.summary_keys.clone())
+        .unwrap_or_default();
+    let mut accumulated = summary_keys
+        .iter()
+        .map(|key| {
+            doc_cache::load_summary(key)?.context("scan map cache expired; start a new scan")
         })
         .collect::<Result<Vec<_>>>()?;
-
+    for (index, summary) in summaries.into_iter().enumerate() {
+        accumulated.push(summary.with_context(|| format!("missing map summary {index}"))?);
+        summary_keys.push(doc_cache::map_key(&map_config, map_tokens, &chunks[index]));
+    }
     let summaries_budget = config.max_source_tokens;
-    let per_summary = summaries_budget.saturating_sub(workspace::estimate_tokens(&coverage_note))
-        / summaries.len().max(1);
-    let summaries_text = format!(
-        "{coverage_note}\n\n{}",
-        summaries
+    let prefix = workspace::truncate_tokens_strict(
+        &coverage_note,
+        1024.min(summaries_budget / 4),
+        "[COVERAGE TRUNCATED]",
+    );
+    let per_summary = summaries_budget
+        .saturating_sub(workspace::estimate_tokens(&prefix) + accumulated.len() * 2)
+        / accumulated.len().max(1);
+    let mut summaries_truncated = accumulated.iter().enumerate().any(|(index, summary)| {
+        workspace::estimate_tokens(&format!("MAP {}: {summary}", index + 1)) > per_summary
+    });
+    scan_truncated |= summaries_truncated;
+    let complete_summaries = format!(
+        "{prefix}\n\n{}",
+        accumulated
             .iter()
-            .map(|summary| workspace::truncate_tokens_strict(
-                summary,
-                per_summary,
-                "[MAP SUMMARY TRUNCATED FOR SYNTHESIS]"
-            ))
+            .enumerate()
+            .map(|(index, summary)| {
+                workspace::truncate_tokens_strict(
+                    &format!("MAP {}: {summary}", index + 1),
+                    per_summary,
+                    "[MAP SUMMARY TRUNCATED FOR SYNTHESIS]",
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n")
     );
+    let summaries_text = workspace::truncate_tokens_strict(
+        &complete_summaries,
+        summaries_budget,
+        "[MAP SUMMARIES TRUNCATED]",
+    );
+    summaries_truncated |= summaries_text != complete_summaries;
+    scan_truncated |= summaries_truncated;
+    if let Some(reporter) = reporter {
+        reporter.mark_context_truncated(scan_truncated)?;
+    }
     let base_prompt = format!(
         "DOCUMENT TYPE\n{document_type}\n\nTARGET DOCUMENTS\n{}\n\nAUDIENCE\n{audience}\n\nOUTPUT LANGUAGE\n{language}\n\nREPOSITORY MANIFEST\n{manifest}\n\nREPOSITORY MAP SUMMARIES\n{}\n\nSCAN_TRUNCATED\n{scan_truncated}\n\nSynthesize the requested documentation. For full mode, return every target document as a complete Markdown document. For a single document type, return exactly that target document. Ground claims in the repository evidence and mark unknowns instead of guessing. Emit the final Markdown directly; do not spend the output budget restating your analysis.",
         document_targets(document_type),
@@ -2182,8 +2396,13 @@ fn document_repo(
         tool.max_output_tokens,
         reporter,
     )?;
+    crate::scan::validate_snapshot(root, args, &page.snapshot)?;
+    let cursor = crate::scan::checkpoint(root, args.clone(), &page, layout, summary_keys)?;
+    let continuation = json!({"scan_cursor":cursor, "complete":page.next.is_none(), "files_complete":page.coverage.complete_files, "eligible_files":page.coverage.total_files, "segments":page.coverage.segments, "synthesis_truncated":summaries_truncated, "omitted_count":page.coverage.omissions.len()});
     progress(reporter, "finishing", total_steps, total_steps)?;
-    Ok(format!("{coverage_note}\n\n{content}"))
+    Ok(format!(
+        "{coverage_note}\nSCAN_CONTINUATION\n{continuation}\n\n{content}"
+    ))
 }
 
 fn update_docs(
@@ -2318,7 +2537,7 @@ mod tests {
     fn tools_list_includes_job_fallback_tools() {
         let listing = tools_list();
         let tools = listing["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         assert!(tools.iter().any(|tool| tool["name"] == "job_status"));
         assert!(tools.iter().any(|tool| tool["name"] == "document_repo"));
         let debug = tools

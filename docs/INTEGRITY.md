@@ -4,7 +4,7 @@
 
 `document_repo` reads eligible files completely and divides each file into numbered line segments before grouping segments into bounded Map requests. A file larger than the per-file budget is continued in later segments rather than dropping its tail. Very long lines are divided without losing UTF-8 characters.
 
-The returned result begins with deterministic scan coverage: complete/eligible files, segment count, and omitted evidence. The operation still has a bounded chunk count and skips binary files and files over 8 MiB. When the bound is reached, coverage identifies the omitted file/range. Narrow `paths`/`include` or run separate requests for omitted modules before relying on repository-wide conclusions.
+The returned result begins with deterministic scan coverage: complete/eligible files, segment count, and omitted evidence. Each call still has a bounded chunk count and skips binary files and files over 8 MiB. When the per-call bound is reached, `SCAN_CONTINUATION` identifies pending work and provides a persistent `scan_cursor`. `continue_scan` resumes the next exact file/segment and reuses accumulated Maps; it validates eligible path/stamp snapshots, in-progress content hashes, workspace and Map layout. Skipped binary/oversized/unreadable evidence remains explicit. Final Reduce still has a context budget and reports `synthesis_truncated`. Narrow `paths`/`include` when accumulated Maps cannot fit. See [continuation usage](CONTINUATIONS.md).
 
 The scanner remains read-only and applies the existing sensitive-path filters and credential masking before sending segments to a model.
 
@@ -24,9 +24,15 @@ A nonempty response with `finish_reason=length` or `content_filter` is never acc
 
 Each tool derives source limits from its routed model ceiling after reserving its system prefix, instructions, request metadata, manifest and final output. Discovery and Map derive their own limits before collecting evidence. Small models cap output reservations and source segment sizes; synthesis allocates space fairly across all Map summaries and marks shortened summaries. Provider preflight still rejects any request that exceeds the configured ceiling. Token counts are conservative local estimates, not a provider tokenizer guarantee.
 
+## Supplemental retrieval and complete results
+
+Analysis, debug and planning allow one local supplemental round on model request (up to three requests/six new candidates), with indexed symbols and bounded literal text matching. Existing source filters, masking, cancellation and budgets apply; new evidence shares the source budget with original evidence. Unresolved final requests do not loop. Provider/schema retries remain bounded and accounted.
+
+Successful Jobs retain a validated, masked complete-result artifact before primary compaction. `result_page` reads immutable Job/content-bound UTF-8 pages without model calls; it checks workspace, completion, TTL, offsets and artifact hash. Page envelopes/escaping count toward the page budget. Complete artifacts are limited to 16 MiB and cleaned with Job history. Reassemble pages before parsing JSON or applying documents. Existing `job_result` stays compatible.
+
 ## Primary return budget
 
-Analysis, debug, planning and review results are compacted locally without an extra model call. The complete review return, including coverage and omissions, fits the configured primary return budget. Long omission lists are explicitly shortened. Findings are ranked by severity before item limits; present summary, findings, READ_NEXT and detail groups reserve weighted shares instead of allowing one verbose field to consume the result. Short complete results are preserved, and shortened results carry a truncation marker. Limits use the local conservative estimator rather than exact provider tokenization.
+Analysis, debug, planning and review results are compacted locally without an extra model call. The complete review return, including coverage and omissions, fits the configured primary return budget. Long omission lists are explicitly shortened. Compacted analysis/debug/plan/review returns also reserve space for a complete-result Job handle. Findings are ranked by severity before item limits; present summary, findings, READ_NEXT and detail groups reserve weighted shares instead of allowing one verbose field to consume the result. Short complete results are preserved, and shortened results carry a truncation marker. Limits use the local conservative estimator rather than exact provider tokenization.
 
 ## Diff review coverage
 

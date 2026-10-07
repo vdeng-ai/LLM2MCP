@@ -247,3 +247,7 @@ stdout 只输出 MCP JSON-RPC；worker 日志和 MCP 运行日志都不会污染
 `syntax.rs` supplies Tree-sitter symbols and lexical import hints; `search.rs` supplies Chinese aliases and path/label scores. Discovery ranks files before emitting its token-bounded index. Evidence is masked before caching and again at the outbound HTTP boundary. `cache.rs` applies on-access age/size pruning across source/index and map caches.
 
 Tool routing selects a named profile first. Discovery/Map optionally override that profile, while Reduce uses the tool profile. `doctor.rs` separates inference/stdio probes from host registration. Both sync and async requests record durable metrics, and the GUI consumes background events for operations and history refresh. Detailed guarantees and limits are documented in [RUNTIME.md](RUNTIME.md).
+
+## 0.4.0 continuations
+
+`src/supplement.rs` implements one optional supplemental retrieval round for analysis/debug/planning; indexed candidates and bounded text matches are combined with original evidence under the routed source budget. `src/result_pages.rs` creates exact UTF-8 result pages with Job/content cursors; `src/jobs.rs` retains immutable full-result artifacts with existing Job TTL. `src/scan.rs` owns file/segment positions, path/stamp snapshots and immutable scan checkpoints; documentation synthesis loads cumulative content-addressed Maps. `continue_scan` shares the document_repo profile/execution settings. See [CONTINUATIONS.md](CONTINUATIONS.md) for limits and compatibility.

@@ -108,6 +108,7 @@ pub fn compact(value: &Value, read_next: &[String], budget: usize) -> String {
     for (key, heading, limit, important) in [
         ("evidence", "EVIDENCE", 8, true),
         ("findings", "FINDINGS", 8, true),
+        ("retrieval", "CONTEXT RETRIEVAL", 4, false),
         ("verification", "HOW TO VERIFY", 6, false),
         ("steps", "STEPS", 10, false),
         ("actions", "ACTIONS", 6, false),

@@ -48,7 +48,11 @@ pub fn maintain(max_mib: u64, ttl_days: u64, clear: bool) -> Result<CacheStats> 
         .open(dir.join("cache-maintenance.lock"))?;
     lock.lock_exclusive()?;
     let mut files = Vec::new();
-    for root in [dir.join("repository-cache"), dir.join("repo-map-cache")] {
+    for root in [
+        dir.join("repository-cache"),
+        dir.join("repo-map-cache"),
+        dir.join("repo-scan-cache"),
+    ] {
         entries(&root, &mut files)?;
     }
     files.sort_by_key(|entry| entry.2);

@@ -43,6 +43,10 @@ pub struct JobRecord {
     pub ttl_ms: u64,
     pub poll_interval_ms: u64,
     pub result: Option<Value>,
+    #[serde(default)]
+    pub full_result_sha256: Option<String>,
+    #[serde(default)]
+    pub full_result_bytes: usize,
     pub error: Option<String>,
     #[serde(default)]
     pub duration_ms: Option<u64>,
@@ -103,6 +107,11 @@ impl Reporter {
             record.source_truncated |= truncated;
         })
     }
+    pub fn mark_context_truncated(&self, truncated: bool) -> Result<()> {
+        update_record(&self.job_id, |record| {
+            record.source_truncated |= truncated;
+        })
+    }
     pub fn record_wait(&self, ms: u64, model: &str) -> Result<()> {
         update_record(&self.job_id, |record| {
             record.llm_wait_ms += ms;
@@ -136,6 +145,39 @@ impl Reporter {
             })?;
         }
         Ok(())
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn store_full_result(&self, text: &str) -> Result<()> {
+        self.check_cancelled()?;
+        let text = crate::privacy::redact(text);
+        if text.len() > 16 * 1024 * 1024 {
+            bail!("complete result exceeds 16 MiB storage limit");
+        }
+        let path = job_path(&self.job_id)?.with_extension("full.txt");
+        let temp = path.with_extension("tmp");
+        fs::write(&temp, text.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+        }
+        if path.exists() {
+            let same = fs::read_to_string(&path)? == text;
+            let _ = fs::remove_file(&temp);
+            if !same {
+                bail!("complete result is already immutable");
+            }
+        } else {
+            fs::rename(&temp, &path)?;
+        }
+        update_record(&self.job_id, |record| {
+            record.full_result_sha256 = Some(crate::result_pages::digest(&text));
+            record.full_result_bytes = text.len();
+        })
     }
 
     pub fn new(job_id: impl Into<String>) -> Self {
@@ -272,6 +314,8 @@ fn create_record(
         ttl_ms: ttl_hours.clamp(1, 24 * 365).saturating_mul(60 * 60 * 1_000),
         poll_interval_ms: poll_interval_ms.clamp(1_000, 60_000),
         result: None,
+        full_result_sha256: None,
+        full_result_bytes: 0,
         error: None,
         duration_ms: None,
         llm_calls: 0,
@@ -474,6 +518,8 @@ pub fn fallback_status_result(record: &JobRecord) -> Value {
         "structuredContent": {
             "job_id": record.id,
             "tool": record.tool,
+            "full_result_available": record.state == JobState::Completed && record.full_result_sha256.is_some(),
+            "full_result_bytes": record.full_result_bytes,
             "status": status,
             "stage": record.stage,
             "progress": record.progress,
@@ -638,6 +684,8 @@ pub fn cleanup_expired() -> Result<usize> {
         if record.state != JobState::Working && now_ms.saturating_sub(created_ms) > record.ttl_ms {
             let _ = fs::remove_file(&path);
             let _ = fs::remove_file(log_path(&record.id)?);
+            let _ = fs::remove_file(job_path(&record.id)?.with_extension("full.txt"));
+            let _ = fs::remove_file(job_path(&record.id)?.with_extension("full.tmp"));
             // Retain lock files so readers cannot lock a different inode during cleanup.
             removed += 1;
         }
@@ -960,6 +1008,32 @@ pub fn retry(job_id: &str) -> Result<JobRecord> {
     )
 }
 
+pub fn read_full_result(job_id: &str, workspace: &Path) -> Result<String> {
+    let record = load(job_id)?;
+    if record.workspace != workspace.canonicalize()? {
+        bail!("result belongs to a different workspace");
+    }
+    if record.state != JobState::Completed {
+        bail!("complete result is unavailable until job completion");
+    }
+    let created = parse_rfc3339_millis(&record.created_at).context("invalid job creation time")?;
+    if unix_millis().saturating_sub(created) > record.ttl_ms {
+        bail!("complete result expired; run a new job");
+    }
+    let expected = record
+        .full_result_sha256
+        .context("job has no complete-result artifact; run a new job")?;
+    let path = job_path(job_id)?.with_extension("full.txt");
+    if fs::metadata(&path)?.len() > 16 * 1024 * 1024 {
+        bail!("complete-result artifact exceeds limit");
+    }
+    let text = fs::read_to_string(path).context("complete-result artifact is missing")?;
+    if crate::result_pages::digest(&text) != expected {
+        bail!("complete-result artifact changed");
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1055,8 @@ mod tests {
             ttl_ms: DEFAULT_TTL_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             result: None,
+            full_result_sha256: None,
+            full_result_bytes: 0,
             error: None,
             duration_ms: None,
             llm_calls: 2,
