@@ -863,9 +863,20 @@ fn execute_business_inner(
     ] {
         tool.max_output_tokens = tool.max_output_tokens.min(output);
     }
+    // Continuations reserve the same original request overhead as their first
+    // page. A shorter cursor-only call must not silently change Map segmentation.
+    let metadata_args = if name == "document_repo" {
+        args.get("scan_cursor")
+            .and_then(Value::as_str)
+            .map(|cursor| crate::scan::load(cursor, root).map(|checkpoint| checkpoint.args))
+            .transpose()?
+            .unwrap_or_else(|| args.clone())
+    } else {
+        args.clone()
+    };
     let metadata = format!(
         "{}\n{}",
-        args,
+        metadata_args,
         workspace::truncate_tokens_strict(
             &workspace::manifest(root)?,
             1024,

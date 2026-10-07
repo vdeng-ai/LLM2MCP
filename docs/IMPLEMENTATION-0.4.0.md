@@ -17,7 +17,7 @@ Tests must cover one-pass retrieval limits and denial/filtering, Unicode page re
 All three features are implemented. Linux local checks pass with Rust 1.99.0:
 
 - `cargo fmt -- --check` and `git diff --check`.
-- `cargo test --locked --all-targets`: 72 unit tests and 23 actual-binary MCP end-to-end tests.
+- `cargo test --locked --all-targets`: 72 unit tests and 24 actual-binary MCP end-to-end tests.
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`.
 - `LLM2MCP_TEST_BINARY=target/debug/llm2mcp python -m unittest discover -s scripts/evaluation -v`: both tests execute, including real HTTP/stdio MCP.
 
@@ -26,7 +26,8 @@ limits and active cancellation, complete Unicode page reconstruction after sync
 and async reconnection, stale/foreign/expired result rejection and temporary
 artifact cleanup, source scanning beyond 12 chunks without gaps, cursor replay
 without duplicate Maps, cumulative late evidence, and source/options/profile
-change rejection. Cross-platform CI gates the development PR.
+change rejection, and stable original-request budgets across small-model
+continuations. Cross-platform CI gates the development PR.
 
 Version metadata is 0.4.0. The matching `release.json` request starts the repository's
 gated release workflow only when merged into `main`; development does not merge

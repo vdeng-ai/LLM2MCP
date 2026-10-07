@@ -116,7 +116,8 @@ Continue using the `continue_scan` tool:
 ```
 
 It uses the original paths/filters/document settings and existing
-`document_repo` profile/execution configuration. Async mode returns another
+`document_repo` profile/execution configuration. Context budgeting uses the
+original request on every page, including with small routed models. Async mode returns another
 Job/Task; poll normally. The next result contains the next cursor. You can also
 pass `scan_cursor` to `document_repo`; supplied options must match the original
 request. The cursor persists across MCP processes and carries the next exact

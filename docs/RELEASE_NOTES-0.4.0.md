@@ -8,7 +8,7 @@ LLM2MCP 0.4.0 adds bounded follow-up retrieval and durable continuations.
 
 **Limits:** One supplemental logical pass can still use the existing bounded provider/schema recovery; all attempts are counted. Literal fallback reads at most 32 filtered index candidates per request and 64 MiB per retrieval round. Job artifacts and scan checkpoints each have a 16 MiB limit. Continuations require unchanged eligible path/stamp snapshots and in-progress content hashes, and compatible Map profiles/segment layouts. Cache eviction/expiry requires restarting. Accumulated Map evidence is still bounded for Reduce, so a completed scan does not guarantee untruncated synthesis. No measured token-saving or private-model-quality claim is made.
 
-**Validation:** 72 Rust unit tests, 23 MCP end-to-end tests, 2 paired-evaluation tests, format and Clippy pass locally. Linux, Windows and macOS CI gate the development PR. Details are documented in [IMPLEMENTATION-0.4.0.md](IMPLEMENTATION-0.4.0.md). Usage and JSON examples are in [CONTINUATIONS.md](CONTINUATIONS.md).
+**Validation:** 72 Rust unit tests, 24 MCP end-to-end tests, 2 paired-evaluation tests, format and Clippy pass locally. Linux, Windows and macOS CI gate the development PR. Details are documented in [IMPLEMENTATION-0.4.0.md](IMPLEMENTATION-0.4.0.md). Usage and JSON examples are in [CONTINUATIONS.md](CONTINUATIONS.md).
 
 ---
 

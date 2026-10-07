@@ -1245,3 +1245,44 @@ fn supplemental_literal_search_reaches_evidence_beyond_the_file_prefix() {
     assert!(full.contains("data.rs:202"));
     assert!(!full.contains("UNVERIFIED"));
 }
+
+#[test]
+fn small_routed_model_continuations_keep_the_original_request_budget() {
+    let http = Http::new("scan_tail");
+    let fixture = scan_fixture(&http);
+    let text = (0..300)
+        .map(|index| format!("fn scan_item_{index}() {{}}\n"))
+        .collect::<String>();
+    fs::write(fixture.workspace.join("large.rs"), text).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["max_source_tokens"] = json!(40000);
+    config["max_file_tokens"] = json!(300);
+    config["profiles"] = json!([{"name":"small","base_url":http.url,"model":"small","max_input_tokens":4096,"max_output_tokens":512}]);
+    config["tools"]["document_repo"]["model_profile"] = json!("small");
+    config["map_profile"] = json!("small");
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    let mut mcp = Mcp::new(&fixture);
+    let first = call(
+        &mut mcp,
+        1,
+        "document_repo",
+        json!({"paths":["large.rs"],"max_chunks":1,"audience":"developer ".repeat(80)}),
+    );
+    let mut metadata = continuation(&first);
+    assert_eq!(metadata["complete"], false);
+    let mut pages = 1;
+    while !metadata["complete"].as_bool().unwrap() {
+        let reply = call(
+            &mut mcp,
+            2,
+            "continue_scan",
+            json!({"scan_cursor":metadata["scan_cursor"]}),
+        );
+        metadata = continuation(&reply);
+        pages += 1;
+        assert!(pages < 30);
+    }
+    assert_eq!(metadata["files_complete"], 1);
+    assert!(pages > 1);
+}
