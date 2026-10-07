@@ -134,7 +134,7 @@ Discovery 的文件/symbol 解析结果不会每个 Job 从零开始。LLM2MCP �
 
 源码、单文件、Discovery Index 和 Git diff 的主要上下文限制现在使用 token 估算，而不是仅比较字符数。估算器对 ASCII 标识符按近似子词长度计数，对 CJK 和标点按更细粒度计数；它不是 Provider tokenizer 的逐 token 精确复刻，但对中英文混合代码比固定字符上限更接近真实模型上下文占用。旧 `max_source_chars` / `max_file_chars` 配置字段仅用于旧配置迁移，新 GUI 使用 source/file/discovery token budget。
 
-`analyze`、`debug_issue`、`plan`、`review_diff` 还将“副模型可以生成多少”和“主模型最终收到多少”拆成两个预算。副模型默认输出预算分别约为 4K / 6K / 6K / 4K；LLM2MCP 在 Rust 本地解析结构化 JSON，不再调用第二次 LLM 总结，然后按默认 800 / 1400 / 1200 / 1000 token 的 Primary return budget 做硬上限裁剪。`debug_issue` 的结构额外包含 diagnosis、confidence、root cause、execution path、intermittency、alternative hypotheses、verification 和 likely fix area。`read_next` 放在返回最前面，并且 `analyze/debug_issue/plan` 的 `path + line range` 必须能映射回本地选中的 symbol range；因此主编码智能体可以直接读取几十到几百行，而不是再次打开完整文件。文档生成工具属于最终内容产物，不做这一层压缩。
+`analyze`、`debug_issue`、`plan`、`review_diff` 还将“副模型可以生成多少”和“主模型最终收到多少”拆成两个预算。副模型默认输出预算分别约为 4K / 6K / 6K / 4K；LLM2MCP 在 Rust 本地解析结构化 JSON，不再调用第二次 LLM 总结，然后按默认 800 / 1400 / 1200 / 1000 token 的 Primary return budget 做硬上限裁剪。`debug_issue` 的结构额外包含 diagnosis、confidence、root cause、execution path、intermittency、alternative hypotheses、verification 和 likely fix area。摘要、按严重性排序的发现、`read_next` 和其它细节分别保留预算；review 的覆盖说明也计入整个回传上限。`analyze/debug_issue/plan` 的 `path + line range` 必须能映射回本地选中的 symbol range；因此主编码智能体可以直接读取几十到几百行，而不是再次打开完整文件。文档生成工具属于最终内容产物，不做这一层压缩。
 
 ## Reasoning 适配
 

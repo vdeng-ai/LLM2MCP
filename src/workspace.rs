@@ -1189,6 +1189,7 @@ pub fn document_snapshot(
     workspace: &Path,
     relative: &str,
     budget: usize,
+    diff: &str,
 ) -> Result<crate::doc_edits::Snapshot> {
     let root = canonical_workspace(workspace)?;
     let path = secure_path(&root, &root.join(relative))?;
@@ -1200,12 +1201,13 @@ pub fn document_snapshot(
     }
     let original = fs::read_to_string(&path)?;
     let masked = crate::privacy::redact(&original);
-    let visible = truncate_tokens_strict(&masked, budget, "\n[DOCUMENT PREVIEW TRUNCATED]\n");
+    let (fragments, preview_truncated) = crate::document_preview::select(&masked, diff, budget);
     Ok(crate::doc_edits::Snapshot {
         path: normalized_relative(path.strip_prefix(&root)?),
         hash: repo_cache::hash_bytes(original.as_bytes()),
         original,
-        visible,
+        fragments,
+        preview_truncated,
     })
 }
 

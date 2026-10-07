@@ -43,7 +43,7 @@ Rules:
 - Suggest verification steps and likely fix areas, but do not claim you ran commands or modified files.
 - Do not reveal hidden chain-of-thought.
 Return JSON only, with no Markdown or code fences, in this shape:
-{"diagnosis":"...","confidence":"high|medium|low","root_cause":"...","evidence":[{"severity":"high|medium|low|info","text":"...","evidence":["path:line-range, symbol, log excerpt, or diff hunk"]}],"execution_path":["..."],"intermittency":"...","alternatives":["..."],"verification":["..."],"fix_area":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
+{"diagnosis":"...","confidence":"high|medium|low","root_cause":"...","evidence":[{"severity":"high|medium|low|info","text":"...","evidence":["path:start-end, log:exact supplied excerpt, or diff:path:exact supplied hunk/excerpt"]}],"execution_path":["..."],"intermittency":"...","alternatives":["..."],"verification":["..."],"fix_area":["..."],"read_next":[{"path":"relative/path","symbol":"exact symbol label if known","lines":"start-end","reason":"..."}]}.
 Keep fields concise; the bridge will locally validate read_next and compact the result before returning it to the primary agent."#;
 
 const PLAN_SYSTEM: &str = r#"You are a local software-planning specialist assisting a primary coding agent.
@@ -67,9 +67,9 @@ Choose at most 12 symbol ranges/files total. Copy candidate paths and line range
 
 const REVIEW_SYSTEM: &str = r#"You are a local code-review specialist assisting a primary coding agent.
 Review the supplied git diff for correctness bugs, regressions, concurrency issues, resource leaks, security problems, API compatibility, and missing tests.
-Do not nitpick formatting unless it affects correctness. Do not reproduce the entire diff. Rank findings by severity and cite files/symbols when possible.
+Do not nitpick formatting unless it affects correctness. Do not reproduce the entire diff. Rank findings by severity. Cite supplied numbered source as path:start-end or actual patch text as diff:path:exact hunk/excerpt; copy the excerpt exactly.
 Return JSON only, with no Markdown or code fences, in this shape:
-{"conclusion":"...","findings":[{"severity":"critical|high|medium|low","text":"...","evidence":["path or diff hunk"]}],"tests":["..."],"actions":["..."]}.
+{"conclusion":"...","findings":[{"severity":"critical|high|medium|low","text":"...","evidence":["path:start-end or diff:path:exact hunk/excerpt"]}],"tests":["..."],"actions":["..."]}.
 Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
 
 pub(crate) const DOC_MAP_SYSTEM: &str = r#"You are mapping one chunk of a software repository for a later documentation synthesis step.
@@ -87,7 +87,7 @@ Do not claim files were written; the MCP is read-only."#;
 const UPDATE_DOCS_SYSTEM: &str = r#"You are updating software project documentation from a Git diff and the current documentation snapshot.
 Identify only documentation affected by the code changes. Preserve valid existing information, change stale sections, add genuinely new behavior, and avoid speculative statements.
 Return JSON only: {"edits":[{"path":"README.md","original_sha256":"copy supplied hash","old_text":"exact unique supplied fragment","new_text":"replacement fragment"}],"new_documents":[{"path":"docs/new.md","content":"complete new Markdown"}]}.
-Prefer small nonoverlapping exact edits; never replace an entire document from a truncated preview. Preserve unseen sections. Old text must come from the supplied preview and match the original exactly once. Use an empty edits array when unchanged. New documents are optional and must not already exist. Do not claim files were written; the MCP is read-only."#;
+Prefer small nonoverlapping exact edits; never replace an entire document from a truncated preview. Preserve unseen sections. Old text must occur entirely within one supplied preview_fragments item's text and match the original exactly once; never combine separate fragments. Use an empty edits array when unchanged. New documents are optional and must not already exist. Do not claim files were written; the MCP is read-only."#;
 
 pub fn run(workspace_path: &Path) -> Result<()> {
     let workspace = workspace_path
@@ -941,11 +941,6 @@ fn chat_with_reporter(
         if let Some(content) = response.final_text() {
             match validate_model_output(system, user, content) {
                 Ok(()) => {
-                    if [ANALYZE_SYSTEM, DEBUG_SYSTEM, PLAN_SYSTEM, REVIEW_SYSTEM].contains(&system)
-                    {
-                        let value: Value = serde_json::from_str(content)?;
-                        return Ok(crate::evidence::verify(value, user).to_string());
-                    }
                     return Ok(content.trim().to_owned());
                 }
                 Err(error) => diagnostics = format!("{diagnostics}; {error}"),
@@ -1019,6 +1014,14 @@ fn validate_model_output(system: &str, user: &str, content: &str) -> Result<()> 
         if !value.get(key).is_some_and(Value::is_string) {
             bail!("missing string field {key}");
         }
+    }
+    if system == DEBUG_SYSTEM
+        && !value
+            .get("confidence")
+            .and_then(Value::as_str)
+            .is_some_and(|confidence| ["high", "medium", "low"].contains(&confidence))
+    {
+        bail!("invalid debug confidence");
     }
     for key in arrays {
         if !value.get(key).is_some_and(Value::is_array) {
@@ -1464,51 +1467,11 @@ fn validated_read_next(value: &Value, selection: Option<&DeepSelection>) -> Vec<
     output
 }
 
-fn render_value_list(value: &Value, key: &str, max_items: usize) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .take(max_items)
-                .filter_map(|item| match item {
-                    Value::String(text) => Some(format!("- {}", text.trim())),
-                    Value::Object(object) => {
-                        let text = object
-                            .get("text")
-                            .or_else(|| object.get("description"))
-                            .and_then(Value::as_str)?;
-                        let severity = object
-                            .get("severity")
-                            .and_then(Value::as_str)
-                            .map(|value| format!("[{value}] "))
-                            .unwrap_or_default();
-                        let evidence = object
-                            .get("evidence")
-                            .and_then(Value::as_array)
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .take(3)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            })
-                            .filter(|value| !value.is_empty())
-                            .map(|value| format!(" ({value})"))
-                            .unwrap_or_default();
-                        Some(format!("- {severity}{}{evidence}", text.trim()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSelection>) -> String {
-    let budget = max_tokens.max(128) as usize;
+    let budget = max_tokens as usize;
+    if budget == 0 {
+        return String::new();
+    }
     let Some(value) = json_object(raw) else {
         let mut fallback = String::new();
         let read_next = selection
@@ -1530,59 +1493,7 @@ fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSel
         );
     };
 
-    let mut output = String::new();
-    let read_next = validated_read_next(&value, selection);
-    if !read_next.is_empty() {
-        output.push_str("READ_NEXT\n");
-        output.push_str(&read_next.join("\n"));
-        output.push_str("\n\n");
-    }
-
-    for (key, heading) in [
-        ("diagnosis", "DIAGNOSIS"),
-        ("confidence", "CONFIDENCE"),
-        ("root_cause", "ROOT CAUSE"),
-        ("intermittency", "INTERMITTENCY"),
-        ("conclusion", "CONCLUSION"),
-        ("goal", "GOAL"),
-    ] {
-        if let Some(text) = value
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            output.push_str(heading);
-            output.push('\n');
-            output.push_str(text.trim());
-            output.push_str("\n\n");
-        }
-    }
-
-    for (key, heading, max_items) in [
-        ("evidence", "EVIDENCE", 8usize),
-        ("execution_path", "EXECUTION PATH", 8),
-        ("alternatives", "ALTERNATIVE HYPOTHESES", 5),
-        ("verification", "HOW TO VERIFY", 6),
-        ("fix_area", "LIKELY FIX AREA", 6),
-        ("findings", "FINDINGS", 8),
-        ("steps", "STEPS", 10),
-        ("actions", "ACTIONS", 6),
-        ("risks", "RISKS", 5),
-        ("tests", "TESTS", 6),
-    ] {
-        let lines = render_value_list(&value, key, max_items);
-        if !lines.is_empty() {
-            output.push_str(heading);
-            output.push('\n');
-            output.push_str(&lines.join("\n"));
-            output.push_str("\n\n");
-        }
-    }
-
-    if output.trim().is_empty() {
-        output.push_str(raw.trim());
-    }
-    workspace::truncate_tokens_strict(&output, budget, "\n[PRIMARY RESULT TRUNCATED]\n")
+    crate::primary_result::compact(&value, &validated_read_next(&value, selection), budget)
 }
 
 fn analyze(
@@ -1636,6 +1547,11 @@ fn analyze(
         tool.max_output_tokens,
         reporter,
     )?;
+    let result = crate::evidence::verify(
+        serde_json::from_str(&result)?,
+        &crate::evidence::Catalog::new(&sources.body, "", ""),
+    )
+    .to_string();
     progress(reporter, "finishing", 3, 3)?;
     Ok(compact_primary_result(
         &result,
@@ -1753,6 +1669,11 @@ fn debug_issue(
         tool.max_output_tokens,
         reporter,
     )?;
+    let result = crate::evidence::verify(
+        serde_json::from_str(&result)?,
+        &crate::evidence::Catalog::new(&sources.body, &logs_for_prompt, &recent_change_evidence),
+    )
+    .to_string();
     progress(reporter, "finishing", 4, 4)?;
     Ok(compact_primary_result(
         &result,
@@ -1820,6 +1741,33 @@ fn plan(
     ))
 }
 
+fn compact_review_result(
+    value: &Value,
+    max_tokens: u32,
+    batches: usize,
+    include_untracked: bool,
+    omitted: &[String],
+) -> String {
+    let budget = max_tokens as usize;
+    let coverage = format!(
+        "REVIEW COVERAGE: {batches} batches reviewed; include_untracked={include_untracked}; omitted={}\n{}",
+        omitted.len(),
+        omitted.join("\n")
+    );
+    let prefix = workspace::truncate_tokens_strict(
+        coverage.trim(),
+        (budget / 3).min(256),
+        "\n[OMITTED DETAILS TRUNCATED]",
+    );
+    let remaining = budget.saturating_sub(workspace::estimate_tokens(&prefix) + 2);
+    let result = compact_primary_result(&value.to_string(), remaining as u32, None);
+    workspace::truncate_tokens_strict(
+        &format!("{prefix}\n\n{result}"),
+        budget,
+        "\n[PRIMARY RESULT TRUNCATED]\n",
+    )
+}
+
 fn review_diff(
     config: &AppConfig,
     root: &Path,
@@ -1870,7 +1818,10 @@ fn review_diff(
             tool.max_output_tokens,
             reporter,
         )?;
-        let value: Value = serde_json::from_str(&result)?;
+        let value = crate::evidence::verify(
+            serde_json::from_str(&result)?,
+            &crate::evidence::Catalog::new(&batch.context, "", &batch.diff),
+        );
         for key in ["findings", "tests", "actions"] {
             for item in value[key].as_array().context("missing review array")? {
                 let output = combined[key]
@@ -1892,12 +1843,6 @@ fn review_diff(
             "low" => 3,
             _ => 4,
         });
-    let coverage = format!(
-        "REVIEW COVERAGE: {} batches reviewed; include_untracked={include_untracked}; omitted={}\n{}",
-        batches.len(),
-        omitted.len(),
-        omitted.join("\n")
-    );
     if let Some(reporter) = reporter {
         reporter.record_context(
             batches
@@ -1916,9 +1861,12 @@ fn review_diff(
         batches.len() as u64,
         batches.len() as u64,
     )?;
-    Ok(format!(
-        "{coverage}\n\n{}",
-        compact_primary_result(&combined.to_string(), tool.primary_return_or(1000), None)
+    Ok(compact_review_result(
+        &combined,
+        tool.primary_return_or(1000),
+        batches.len(),
+        include_untracked,
+        &omitted,
     ))
 }
 
@@ -2292,7 +2240,7 @@ fn update_docs(
     let snapshots = doc_paths
         .iter()
         .take(64)
-        .map(|path| workspace::document_snapshot(root, path, preview_budget))
+        .map(|path| workspace::document_snapshot(root, path, preview_budget, &diff))
         .collect::<Result<Vec<_>>>()?;
     let doc_list = snapshots
         .iter()
@@ -2303,15 +2251,14 @@ fn update_docs(
         .iter()
         .map(|doc| {
             serde_json::to_string(&json!({
-                "path":doc.path,"original_sha256":doc.hash,"preview":doc.visible
+                "path":doc.path,"original_sha256":doc.hash,
+                "preview_fragments":doc.fragments,"preview_truncated":doc.preview_truncated
             }))
         })
         .collect::<std::result::Result<Vec<_>, _>>()?
         .join("\n\n");
-    let docs_truncated = snapshots.len() < doc_paths.len()
-        || snapshots
-            .iter()
-            .any(|doc| doc.visible.contains("[DOCUMENT PREVIEW TRUNCATED]"));
+    let docs_truncated =
+        snapshots.len() < doc_paths.len() || snapshots.iter().any(|doc| doc.preview_truncated);
 
     if let Some(reporter) = reporter {
         reporter.record_context(
@@ -2524,6 +2471,23 @@ mod tests {
             root,
             &json!({"issue": "unknown failure with no path hints"})
         ));
+    }
+
+    #[test]
+    fn review_return_budget_includes_coverage_and_long_omission_lists() {
+        let value = json!({"conclusion":"Review finished", "findings":[{
+            "severity":"critical", "text":"Important regression", "evidence":[]
+        }]});
+        let omitted = (0..1000)
+            .map(|n| format!("src/long_module_{n}.rs: omitted at batch limit"))
+            .collect::<Vec<_>>();
+        for budget in [128, 256, 1000] {
+            let result = compact_review_result(&value, budget, 32, false, &omitted);
+            assert!(workspace::estimate_tokens(&result) <= budget as usize);
+            assert!(result.contains("omitted=1000"));
+            assert!(result.contains("Important regression"));
+        }
+        assert!(compact_primary_result(&value.to_string(), 0, None).is_empty());
     }
 
     #[test]

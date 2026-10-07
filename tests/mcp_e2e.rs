@@ -102,6 +102,44 @@ fn serve(mut stream: TcpStream, mode: &str, sender: &mpsc::Sender<Value>, count:
         let system = payload["messages"][0]["content"].as_str().unwrap_or("");
         let user = payload["messages"][1]["content"].as_str().unwrap_or("");
         let mut content = json!({"conclusion":"Mock analysis","findings":[],"risks":[],"tests":[],"actions":[],"read_next":[]}).to_string();
+        if mode == "debug_evidence" && system.contains("software-debugging specialist") {
+            content = json!({
+                "diagnosis":"Worker connection fails", "confidence":"high",
+                "root_cause":"The inference service is unavailable", "intermittency":"unknown",
+                "evidence":[{"severity":"high", "text":"Observed worker failure", "evidence":[
+                    "log:worker failed: connection refused", "invented.rs:999"
+                ]}],
+                "execution_path":[], "alternatives":[], "verification":["Check service availability"],
+                "fix_area":[], "read_next":[]
+            }).to_string();
+        }
+        if mode == "document_fragments"
+            && system.contains("updating software project documentation")
+        {
+            let snapshots = user
+                .split("DOCUMENT SNAPSHOTS\n")
+                .nth(1)
+                .unwrap()
+                .split("\n\nDOCS_TRUNCATED\n")
+                .next()
+                .unwrap();
+            let snapshot: Value = serde_json::from_str(snapshots.trim()).unwrap();
+            assert!(
+                snapshot["preview_fragments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|fragment| fragment["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("worker_timeout_secs = 30"))
+            );
+            content = json!({"edits":[{
+                "path":snapshot["path"], "original_sha256":snapshot["original_sha256"],
+                "old_text":"worker_timeout_secs = 30", "new_text":"worker_timeout_secs = 60"
+            }], "new_documents":[]})
+            .to_string();
+        }
         if system.contains("synthesizing project documentation") {
             let targets = user
                 .split("TARGET DOCUMENTS\n")
@@ -300,6 +338,92 @@ fn retry_privacy_profile_routing_and_cost_metrics() {
     assert!(!record.to_string().contains("FAKE_CONFIG_SECRET"));
     assert!(!record.to_string().contains("FAKE_PROFILE_SECRET"));
 }
+#[test]
+fn debug_runtime_citations_survive_and_invented_evidence_limits_confidence() {
+    let http = Http::new("debug_evidence");
+    let fixture = Fixture::new(&http, "sync");
+    let mut mcp = Mcp::new(&fixture);
+    mcp.send(
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+            "name":"debug_issue", "arguments":{
+                "issue":"Worker cannot connect", "paths":["main.rs"],
+                "logs":"worker failed: connection refused"
+            }
+        }}),
+    );
+    let reply = mcp.receive();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("log:worker failed: connection refused"));
+    assert!(text.contains("CONFIDENCE\nmedium"));
+    assert!(text.contains("UNVERIFIED CITATIONS REMOVED"));
+    assert!(!text.contains("invented.rs"));
+    assert_eq!(fixture.records()[0]["llm_calls"], 1);
+}
+
+#[test]
+fn document_updates_select_late_related_fragments_and_preserve_the_original() {
+    let http = Http::new("document_fragments");
+    let fixture = Fixture::new(&http, "sync");
+    let original = format!(
+        "# Introduction\n{}\n## Worker settings\nworker_timeout_secs = 30\n\n## Appendix\nKEEP APPENDIX\n",
+        "Unrelated description.\n".repeat(400)
+    );
+    fs::write(fixture.workspace.join("README.md"), &original).unwrap();
+    fs::write(
+        fixture.workspace.join("settings.rs"),
+        "const WORKER_TIMEOUT_SECS: u64 = 30;\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&fixture.workspace)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    fs::write(
+        fixture.workspace.join("settings.rs"),
+        "const WORKER_TIMEOUT_SECS: u64 = 60;\n",
+    )
+    .unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["max_source_tokens"] = json!(1000);
+    config["max_file_tokens"] = json!(96);
+    config["tools"]["update_docs"] =
+        json!({"reasoning":"off", "max_output_tokens":1000, "execution":"sync"});
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    let mut mcp = Mcp::new(&fixture);
+    mcp.send(
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+            "name":"update_docs", "arguments":{"docs":["README.md"]}
+        }}),
+    );
+    let reply = mcp.receive();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let updates: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(updates["format"], "llm2mcp-document-edits-v1");
+    assert_eq!(updates["source_preview_truncated"], true);
+    assert_eq!(updates["edits"][0]["old_text"], "worker_timeout_secs = 30");
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("README.md")).unwrap(),
+        original
+    );
+    assert_eq!(fixture.records()[0]["llm_calls"], 1);
+}
+
 #[test]
 fn doctor_rejects_models_only_connectivity() {
     let http = Http::new("bad");
