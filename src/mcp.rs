@@ -1464,49 +1464,6 @@ fn validated_read_next(value: &Value, selection: Option<&DeepSelection>) -> Vec<
     output
 }
 
-fn render_value_list(value: &Value, key: &str, max_items: usize) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .take(max_items)
-                .filter_map(|item| match item {
-                    Value::String(text) => Some(format!("- {}", text.trim())),
-                    Value::Object(object) => {
-                        let text = object
-                            .get("text")
-                            .or_else(|| object.get("description"))
-                            .and_then(Value::as_str)?;
-                        let severity = object
-                            .get("severity")
-                            .and_then(Value::as_str)
-                            .map(|value| format!("[{value}] "))
-                            .unwrap_or_default();
-                        let evidence = object
-                            .get("evidence")
-                            .and_then(Value::as_array)
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .take(3)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            })
-                            .filter(|value| !value.is_empty())
-                            .map(|value| format!(" ({value})"))
-                            .unwrap_or_default();
-                        Some(format!("- {severity}{}{evidence}", text.trim()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSelection>) -> String {
     let budget = max_tokens as usize;
     if budget == 0 {
@@ -1533,59 +1490,11 @@ fn compact_primary_result(raw: &str, max_tokens: u32, selection: Option<&DeepSel
         );
     };
 
-    let mut output = String::new();
-    let read_next = validated_read_next(&value, selection);
-    if !read_next.is_empty() {
-        output.push_str("READ_NEXT\n");
-        output.push_str(&read_next.join("\n"));
-        output.push_str("\n\n");
-    }
-
-    for (key, heading) in [
-        ("diagnosis", "DIAGNOSIS"),
-        ("confidence", "CONFIDENCE"),
-        ("root_cause", "ROOT CAUSE"),
-        ("intermittency", "INTERMITTENCY"),
-        ("conclusion", "CONCLUSION"),
-        ("goal", "GOAL"),
-    ] {
-        if let Some(text) = value
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            output.push_str(heading);
-            output.push('\n');
-            output.push_str(text.trim());
-            output.push_str("\n\n");
-        }
-    }
-
-    for (key, heading, max_items) in [
-        ("evidence", "EVIDENCE", 8usize),
-        ("execution_path", "EXECUTION PATH", 8),
-        ("alternatives", "ALTERNATIVE HYPOTHESES", 5),
-        ("verification", "HOW TO VERIFY", 6),
-        ("fix_area", "LIKELY FIX AREA", 6),
-        ("findings", "FINDINGS", 8),
-        ("steps", "STEPS", 10),
-        ("actions", "ACTIONS", 6),
-        ("risks", "RISKS", 5),
-        ("tests", "TESTS", 6),
-    ] {
-        let lines = render_value_list(&value, key, max_items);
-        if !lines.is_empty() {
-            output.push_str(heading);
-            output.push('\n');
-            output.push_str(&lines.join("\n"));
-            output.push_str("\n\n");
-        }
-    }
-
-    if output.trim().is_empty() {
-        output.push_str(raw.trim());
-    }
-    workspace::truncate_tokens_strict(&output, budget, "\n[PRIMARY RESULT TRUNCATED]\n")
+    crate::primary_result::compact(
+        &value,
+        &validated_read_next(&value, selection),
+        budget,
+    )
 }
 
 fn analyze(

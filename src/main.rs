@@ -16,6 +16,7 @@ mod linux_desktop;
 mod llm;
 mod mcp;
 mod privacy;
+mod primary_result;
 mod process;
 mod repo_cache;
 mod safe_fs;
