@@ -1072,6 +1072,193 @@ fn scan_fixture(http: &Http) -> Fixture {
     fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
     fixture
 }
+
+#[test]
+fn cancellation_reaches_map_workers_and_waiting_http_slots() {
+    let http = Http::new("slow");
+    let fixture = scan_fixture(&http);
+    let mut mcp = Mcp::new(&fixture);
+    mcp.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":"document_repo","arguments":{"paths":["large.rs"],"max_chunks":2,"synthesis":"final"}
+    }}));
+    http.requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}));
+    let cancelled = mcp.replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(cancelled["result"]["isError"], true);
+    assert_eq!(fixture.records()[0]["state"], "cancelled");
+    assert!(http.requests.try_recv().is_err());
+}
+
+#[test]
+fn final_synthesis_survives_reconnect_and_replay_without_intermediate_reduce_calls() {
+    let http = Http::new("scan_tail");
+    let fixture = scan_fixture(&http);
+    let mut mcp = Mcp::new(&fixture);
+    let first = call(
+        &mut mcp,
+        1,
+        "document_repo",
+        json!({
+            "paths":["large.rs"], "max_chunks":1, "synthesis":"final"
+        }),
+    );
+    let mut metadata = continuation(&first);
+    assert_eq!(metadata["synthesis_deferred"], true);
+    let first_cursor = metadata["scan_cursor"].as_str().unwrap().to_owned();
+    drop(mcp);
+    let mut mcp = Mcp::new(&fixture);
+    let changed = call(
+        &mut mcp,
+        2,
+        "document_repo",
+        json!({
+            "scan_cursor":first_cursor, "synthesis":"each_page"
+        }),
+    );
+    assert_eq!(changed["result"]["isError"], true);
+    let second = call(
+        &mut mcp,
+        3,
+        "continue_scan",
+        json!({"scan_cursor":first_cursor}),
+    );
+    metadata = continuation(&second);
+    let replay = call(
+        &mut mcp,
+        4,
+        "continue_scan",
+        json!({"scan_cursor":first_cursor}),
+    );
+    assert_eq!(continuation(&replay), metadata);
+    let mut final_reply = second;
+    for id in 5..35 {
+        if metadata["complete"] == true {
+            break;
+        }
+        assert_eq!(metadata["synthesis_deferred"], true);
+        final_reply = call(
+            &mut mcp,
+            id,
+            "continue_scan",
+            json!({"scan_cursor":metadata["scan_cursor"]}),
+        );
+        metadata = continuation(&final_reply);
+    }
+    assert_eq!(metadata["complete"], true);
+    assert_eq!(metadata["synthesis_deferred"], false);
+    assert!(
+        final_reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("LATE_TAIL_EVIDENCE")
+    );
+    let requests = http.requests.try_iter().collect::<Vec<_>>();
+    let reductions = requests
+        .iter()
+        .filter(|request| {
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("synthesizing project documentation")
+        })
+        .count();
+    assert_eq!(reductions, 1);
+    assert_eq!(
+        fixture
+            .records()
+            .iter()
+            .map(|record| record["llm_calls"].as_u64().unwrap())
+            .sum::<u64>(),
+        requests.len() as u64
+    );
+}
+
+#[test]
+fn final_synthesis_works_for_async_jobs_and_rejects_invalid_modes_before_http() {
+    let http = Http::new("scan_tail");
+    let fixture = scan_fixture(&http);
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(fixture.config.join("config.json")).unwrap()).unwrap();
+    config["tools"]["document_repo"]["execution"] = json!("async");
+    fs::write(fixture.config.join("config.json"), config.to_string()).unwrap();
+    let mut mcp = Mcp::new(&fixture);
+    for (id, synthesis) in [(1, json!("invalid")), (2, json!(false))] {
+        let started = call(
+            &mut mcp,
+            id,
+            "document_repo",
+            json!({"paths":["large.rs"], "synthesis":synthesis}),
+        );
+        let job = started["result"]["structuredContent"]["job_id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(fixture.terminal(job)["state"], "failed");
+    }
+    assert!(http.requests.try_recv().is_err());
+    let started = call(
+        &mut mcp,
+        3,
+        "document_repo",
+        json!({"paths":["large.rs"], "synthesis":"final"}),
+    );
+    let job = started["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(fixture.terminal(job)["state"], "completed");
+    let result = call(&mut mcp, 4, "job_result", json!({"job_id":job}));
+    assert_eq!(continuation(&result)["complete"], true);
+}
+
+#[test]
+fn automatic_cache_maintenance_is_shared_across_processes_and_explicit_pruning_is_immediate() {
+    let http = Http::new("ok");
+    let fixture = Fixture::new(&http, "sync");
+    assert!(
+        fixture
+            .command()
+            .arg("cache")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let cache = fixture.data.join("repo-map-cache/old");
+    fs::create_dir_all(&cache).unwrap();
+    let aged = cache.join("summary.md");
+    fs::write(&aged, "expired summary").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&aged)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    let stamp = fs::read(fixture.data.join("cache-maintenance.lock")).unwrap();
+    for id in 1..=2 {
+        let mut mcp = Mcp::new(&fixture);
+        let reply = call(
+            &mut mcp,
+            id,
+            "analyze",
+            json!({"task":"Inspect main", "paths":["main.rs"]}),
+        );
+        assert_eq!(reply["result"]["isError"], false);
+        assert!(aged.exists());
+        assert_eq!(
+            fs::read(fixture.data.join("cache-maintenance.lock")).unwrap(),
+            stamp
+        );
+    }
+    assert!(
+        fixture
+            .command()
+            .arg("cache")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!aged.exists());
+}
 #[test]
 fn repository_scan_continues_after_reconnect_and_synthesizes_accumulated_evidence() {
     let http = Http::new("scan_tail");

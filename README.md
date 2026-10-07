@@ -440,7 +440,7 @@ Selected source code is still sent to the LLM API you configure. Make sure that 
 
 ## Project Status
 
-This source tree is at version `0.4.0`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
+This source tree is at version `0.4.1`. See [ROADMAP.md](docs/ROADMAP.md) and [ARCHITECTURE.md](docs/ARCHITECTURE.md). Development and release documentation is kept in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [RELEASE.md](docs/RELEASE.md).
 
 ### Quality fixes in 0.3.1
 
@@ -449,6 +449,12 @@ The complete review response now shares one return budget, including coverage. C
 ### Bounded retrieval and continuations in 0.4.0
 
 Analysis, debug and planning can request one supplemental retrieval round (`allow_supplement`). Use `result_page` to inspect a Job's complete validated result without another model call. Large repository documentation scans return a durable `scan_cursor`; `continue_scan` resumes the next file/segment and uses accumulated Map evidence. See [usage and JSON examples](docs/CONTINUATIONS.md) and [0.4.0 release notes](docs/RELEASE_NOTES-0.4.0.md).
+
+### Runtime efficiency in 0.4.1
+
+Map workers immediately take the next pending chunk when one finishes, keeping the existing concurrency limits and ordered evidence. Analysis and supplemental queries share a task-local candidate snapshot; evidence is still checked against current source. Automatic cache pruning runs at most once per five minutes across processes for an unchanged policy; the `cache` command remains immediate. HTTP requests share a process-local runtime and connection pool, with per-request authentication, timeouts and cancellation.
+
+For a large documentation scan, set `"synthesis":"final"` on the initial `document_repo` request. Continue every returned `scan_cursor`; intermediate pages save Maps without generating documentation, and the last page synthesizes the accumulated evidence once. Default `"each_page"` preserves intermediate documentation. See [usage](docs/CONTINUATIONS.md) and [0.4.1 release notes](docs/RELEASE_NOTES-0.4.1.md). These changes reduce avoidable work; real-model latency, quality and token savings still require [paired evaluation](docs/EVALUATION.md).
 
 ## License
 

@@ -1,6 +1,6 @@
 [package]
 name = "llm2mcp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Turn any OpenAI-compatible LLM into a local MCP sidecar for AI coding agents"
 license = "MIT"
@@ -10,7 +10,7 @@ categories = ["development-tools"]
 
 [dependencies]
 regex = "1"
-tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros"] }
 tree-sitter = "0.27"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"

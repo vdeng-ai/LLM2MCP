@@ -441,6 +441,7 @@ fn tools_list() -> Value {
                         "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional exclude globs"},
                         "scan_cursor":{"type":"string","description":"Optional continuation from a previous scan"},
                         "max_chunks":{"type":"integer","minimum":1,"maximum":12,"default":12},
+                        "synthesis":{"type":"string","enum":["each_page","final"],"default":"each_page","description":"Use final to synthesize only after all source pages have been mapped; each_page returns intermediate documentation."},
                         "audience": {"type": "string", "default": "developer"},
                         "language": {"type": "string", "enum": ["auto", "english", "simplified_chinese"], "default": "auto"}
                     },
@@ -569,7 +570,7 @@ fn call_tool(config: &AppConfig, root: &Path, params: Option<&Value>) -> Result<
     }
 
     let tool = tool_config(config, name)?;
-    let _ = crate::cache::maintain(config.cache_max_mib, config.cache_ttl_days, false);
+    let _ = crate::cache::maintain_if_due(config.cache_max_mib, config.cache_ttl_days);
     let execution = effective_execution(name, tool, root, &args);
     if execution == ExecutionMode::Async {
         let record = jobs::create(
@@ -1389,9 +1390,8 @@ fn discover_deep_context(
     root: &Path,
     task: &str,
     requested: &[String],
-    include: &[String],
-    exclude: &[String],
     reporter: Option<&Reporter>,
+    discovery: &mut workspace::DiscoverySession,
 ) -> Result<DeepSelection> {
     if !should_discover(root, requested) {
         return Ok(DeepSelection {
@@ -1408,14 +1408,7 @@ fn discover_deep_context(
         .min((discovery_config.model_input_limit / 4) as u32);
     let discovery_config =
         budgeted_config(&discovery_config, DISCOVERY_SYSTEM, task, discovery_output)?;
-    let index = workspace::discovery_index_for_task(
-        root,
-        requested,
-        &discovery_config,
-        include,
-        exclude,
-        task,
-    )?;
+    let index = discovery.index_for_task(requested, &discovery_config, task)?;
     if let Some(reporter) = reporter {
         reporter.record_cache_usage(index.cache_hits as u64, index.cache_misses as u64, 0, 0)?;
     }
@@ -1630,8 +1623,9 @@ fn analyze(
     let task = task_arg(args)?;
     let requested = paths_arg(args);
     let (include, exclude) = source_filters(args);
+    let mut discovery = workspace::DiscoverySession::new(root, &include, &exclude)?;
     let mut selection =
-        discover_deep_context(config, root, task, &requested, &include, &exclude, reporter)?;
+        discover_deep_context(config, root, task, &requested, reporter, &mut discovery)?;
     progress(reporter, "collecting selected context", 1, 3)?;
     let mut sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
@@ -1662,19 +1656,20 @@ fn analyze(
         sources.body,
         sources.truncated,
     );
-    let context = AnalysisContext {
+    let mut context = AnalysisContext {
         config,
         root,
         system: ANALYZE_SYSTEM,
         tool,
         filters: (&include, &exclude),
+        discovery: &mut discovery,
         allow: args
             .get("allow_supplement")
             .and_then(Value::as_bool)
             .unwrap_or(true),
         reporter,
     };
-    let result = analyze_with_supplement(&context, &prompt, &mut selection, &mut sources)?;
+    let result = analyze_with_supplement(&mut context, &prompt, &mut selection, &mut sources)?;
     let result = crate::evidence::verify(
         serde_json::from_str(&result)?,
         &crate::evidence::Catalog::new(&sources.body, "", ""),
@@ -1749,14 +1744,14 @@ fn debug_issue(
     );
 
     progress(reporter, "building debug discovery index", 1, 4)?;
+    let mut discovery = workspace::DiscoverySession::new(root, &include, &exclude)?;
     let mut selection = discover_deep_context(
         &debug_context_config,
         root,
         &discovery_task,
         &requested,
-        &include,
-        &exclude,
         reporter,
+        &mut discovery,
     )?;
     progress(reporter, "collecting debug context", 2, 4)?;
     let mut sources =
@@ -1790,19 +1785,20 @@ fn debug_issue(
         sources.body,
         sources.truncated,
     );
-    let context = AnalysisContext {
+    let mut context = AnalysisContext {
         config: &debug_context_config,
         root,
         system: DEBUG_SYSTEM,
         tool,
         filters: (&include, &exclude),
+        discovery: &mut discovery,
         allow: args
             .get("allow_supplement")
             .and_then(Value::as_bool)
             .unwrap_or(true),
         reporter,
     };
-    let result = analyze_with_supplement(&context, &prompt, &mut selection, &mut sources)?;
+    let result = analyze_with_supplement(&mut context, &prompt, &mut selection, &mut sources)?;
     let result = crate::evidence::verify(
         serde_json::from_str(&result)?,
         &crate::evidence::Catalog::new(&sources.body, &logs_for_prompt, &recent_change_evidence),
@@ -1828,8 +1824,9 @@ fn plan(
     let task = task_arg(args)?;
     let requested = paths_arg(args);
     let (include, exclude) = source_filters(args);
+    let mut discovery = workspace::DiscoverySession::new(root, &include, &exclude)?;
     let mut selection =
-        discover_deep_context(config, root, task, &requested, &include, &exclude, reporter)?;
+        discover_deep_context(config, root, task, &requested, reporter, &mut discovery)?;
     progress(reporter, "collecting selected context", 1, 3)?;
     let mut sources = collect_deep_selection(config, root, &selection, &include, &exclude)?;
     if let Some(reporter) = reporter {
@@ -1860,19 +1857,20 @@ fn plan(
         sources.body,
         sources.truncated,
     );
-    let context = AnalysisContext {
+    let mut context = AnalysisContext {
         config,
         root,
         system: PLAN_SYSTEM,
         tool,
         filters: (&include, &exclude),
+        discovery: &mut discovery,
         allow: args
             .get("allow_supplement")
             .and_then(Value::as_bool)
             .unwrap_or(true),
         reporter,
     };
-    let result = analyze_with_supplement(&context, &prompt, &mut selection, &mut sources)?;
+    let result = analyze_with_supplement(&mut context, &prompt, &mut selection, &mut sources)?;
     progress(reporter, "finishing", 3, 3)?;
     full_primary_result(
         &result,
@@ -2131,6 +2129,13 @@ fn document_repo(
         .as_ref()
         .map(|previous| &previous.args)
         .unwrap_or(args);
+    if args
+        .get("synthesis")
+        .is_some_and(|value| !value.is_string())
+    {
+        bail!("synthesis must be a string");
+    }
+    let synthesis = enum_arg(args, "synthesis", "each_page", &["each_page", "final"])?;
     let document_type = enum_arg(
         args,
         "document_type",
@@ -2271,64 +2276,61 @@ fn document_repo(
         total_steps,
     )?;
 
-    for batch in pending.chunks(concurrency) {
-        let batch_results: Result<Vec<(usize, String)>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(batch.len());
-            for (index, key) in batch {
-                let index = *index;
-                let key = key.clone();
-                let chunk = &chunks[index];
-                let map_config = &map_config;
-                let control = crate::control::Control::current();
-                handles.push(scope.spawn(move || -> Result<(usize, String)> {
-                    control.set_current();
-                    eprintln!(
-                        "LLM2MCP document_repo mapping chunk {}/{} ({} files)",
-                        index + 1,
-                        total_chunks,
-                        chunk.included_files.len()
-                    );
-                    let summary = map_repository_chunk(
-                        map_config,
-                        chunk,
-                        index,
-                        total_chunks,
-                        map_tokens,
-                        reporter,
-                    )?;
-                    doc_cache::store_summary(&key, &summary)?;
-                    Ok((index, summary))
-                }));
-            }
-
-            let mut results = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let result = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("repository map worker thread panicked"))??;
-                results.push(result);
-            }
-            Ok(results)
-        });
-
-        for (index, summary) in batch_results? {
-            summaries[index] = Some(summary);
+    crate::parallel::ordered(
+        pending.len(),
+        concurrency,
+        |pending_index| {
+            let (index, key) = &pending[pending_index];
+            let summary = map_repository_chunk(
+                &map_config,
+                &chunks[*index],
+                *index,
+                total_chunks,
+                map_tokens,
+                reporter,
+            )?;
+            doc_cache::store_summary(key, &summary)?;
+            Ok((*index, summary))
+        },
+        |_, (index, summary)| {
+            summaries[*index] = Some(summary.clone());
             completed += 1;
             progress(
                 reporter,
                 "mapping repository",
                 completed as u64,
                 total_steps,
-            )?;
-        }
-    }
+            )
+        },
+    )?;
 
     crate::scan::validate_snapshot(root, args, &page.snapshot)?;
     let mut summary_keys = previous
         .as_ref()
         .map(|previous| previous.summary_keys.clone())
         .unwrap_or_default();
-    let mut accumulated = summary_keys
+    for chunk in chunks {
+        summary_keys.push(doc_cache::map_key(&map_config, map_tokens, chunk));
+    }
+    if synthesis == "final" && page.next.is_some() {
+        // Persist progress without generating a document that will be replaced
+        // on the next page. The final page still loads every accumulated Map.
+        let cursor = crate::scan::checkpoint(root, args.clone(), &page, layout, summary_keys)?;
+        let continuation = json!({"scan_cursor":cursor, "complete":false,
+            "files_complete":page.coverage.complete_files, "eligible_files":page.coverage.total_files,
+            "segments":page.coverage.segments, "synthesis_truncated":false,
+            "synthesis_deferred":true, "omitted_count":page.coverage.omissions.len()});
+        progress(
+            reporter,
+            "awaiting scan continuation",
+            total_steps,
+            total_steps,
+        )?;
+        return Ok(format!(
+            "{coverage_note}\nSCAN_CONTINUATION\n{continuation}\n\nDocumentation synthesis deferred until the scan is complete. Call continue_scan with scan_cursor."
+        ));
+    }
+    let mut accumulated = summary_keys[..summary_keys.len() - chunks.len()]
         .iter()
         .map(|key| {
             doc_cache::load_summary(key)?.context("scan map cache expired; start a new scan")
@@ -2336,7 +2338,6 @@ fn document_repo(
         .collect::<Result<Vec<_>>>()?;
     for (index, summary) in summaries.into_iter().enumerate() {
         accumulated.push(summary.with_context(|| format!("missing map summary {index}"))?);
-        summary_keys.push(doc_cache::map_key(&map_config, map_tokens, &chunks[index]));
     }
     let summaries_budget = config.max_source_tokens;
     let prefix = workspace::truncate_tokens_strict(
@@ -2398,7 +2399,7 @@ fn document_repo(
     )?;
     crate::scan::validate_snapshot(root, args, &page.snapshot)?;
     let cursor = crate::scan::checkpoint(root, args.clone(), &page, layout, summary_keys)?;
-    let continuation = json!({"scan_cursor":cursor, "complete":page.next.is_none(), "files_complete":page.coverage.complete_files, "eligible_files":page.coverage.total_files, "segments":page.coverage.segments, "synthesis_truncated":summaries_truncated, "omitted_count":page.coverage.omissions.len()});
+    let continuation = json!({"scan_cursor":cursor, "complete":page.next.is_none(), "files_complete":page.coverage.complete_files, "eligible_files":page.coverage.total_files, "segments":page.coverage.segments, "synthesis_truncated":summaries_truncated, "synthesis_deferred":false, "omitted_count":page.coverage.omissions.len()});
     progress(reporter, "finishing", total_steps, total_steps)?;
     Ok(format!(
         "{coverage_note}\nSCAN_CONTINUATION\n{continuation}\n\n{content}"

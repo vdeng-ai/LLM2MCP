@@ -442,7 +442,7 @@ LLM2MCP 0.1 默认只读，不提供任意 shell、写文件、Git commit 或 pu
 
 ## 项目状态
 
-本源码版本为 `0.4.0`。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
+本源码版本为 `0.4.1`。详细计划见 [ROADMAP.md](docs/ROADMAP.md)，架构见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。开发与发布相关说明统一放在 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 和 [RELEASE.md](docs/RELEASE.md)。
 
 ### 0.3.1 质量修复
 
@@ -451,6 +451,12 @@ LLM2MCP 0.1 默认只读，不提供任意 shell、写文件、Git commit 或 pu
 ### 0.4.0 补充检索与续传
 
 分析、Debug 和规划支持一次有界补充检索，可用 `allow_supplement` 关闭。`result_page` 分页读取 Job 的完整校验结果，不增加模型调用。大仓库文档扫描返回持久化 `scan_cursor`，`continue_scan` 从下一文件/分段继续，并使用累计 Map 证据。详见 [用法与 JSON 示例](docs/CONTINUATIONS.md) 和 [0.4.0 发布说明](docs/RELEASE_NOTES-0.4.0.md)。
+
+### 0.4.1 运行效率优化
+
+Map worker 完成一个 chunk 后立即领取下一个，保留现有并发上限及证据顺序。分析与补充检索共用单次任务的候选快照，读取证据时仍校验当前源码。缓存策略不变时，跨进程自动清理最多每五分钟执行一次；`cache` 命令仍立即执行。HTTP 请求共用进程内运行时与连接池，鉴权、超时和取消按请求独立处理。
+
+大仓库生成文档时，在首次 `document_repo` 请求中加入 `"synthesis":"final"`，然后持续调用 `continue_scan`。中间页保存 Map 与游标，不生成文档；最后一页使用累计证据合成一次。默认 `"each_page"` 保留每轮文档预览。详见 [用法](docs/CONTINUATIONS.md) 与 [0.4.1 发布说明](docs/RELEASE_NOTES-0.4.1.md)。优化减少了重复工作，真实模型的速度、质量和 token 收益仍需通过 [对照评测](docs/EVALUATION.md) 验证。
 
 ## License
 

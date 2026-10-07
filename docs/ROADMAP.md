@@ -126,3 +126,12 @@ Implementation and regression tests are included. Native host/desktop verificati
 - [ ] 真实模型补充检索质量评测与实际 Host 使用验证。
 
 使用方法见 [CONTINUATIONS.md](CONTINUATIONS.md)。
+
+## 0.4.1 — 运行效率
+
+- [x] Map worker 完成后立即补充任务，保持并发上限、取消与结果顺序。
+- [x] 可选 `synthesis: final`，扫描完成后统一合成；默认保留逐页预览。
+- [x] Analyze/Debug/Plan 与补充检索共用任务内候选快照，读取证据仍校验源码。
+- [x] 跨进程缓存自动维护节流；显式清理立即执行。
+- [x] 进程内复用 HTTP 连接池与运行时，鉴权、超时及取消按请求独立处理。
+- [ ] 真实模型速度、质量与主/副模型 token、成本对照评测。
