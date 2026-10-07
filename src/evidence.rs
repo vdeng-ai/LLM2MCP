@@ -24,7 +24,47 @@ fn range(text: &str) -> Option<(usize, usize)> {
 
 fn diff_path(text: &str) -> Option<String> {
     let decoded = if text.starts_with('"') {
-        serde_json::from_str::<String>(text).ok()?
+        // Git quotes non-ASCII path bytes using C-style octal escapes.
+        let encoded = text.strip_prefix('"')?.strip_suffix('"')?.as_bytes();
+        let mut bytes = Vec::new();
+        let mut index = 0;
+        while index < encoded.len() {
+            let byte = encoded[index];
+            index += 1;
+            if byte != b'\\' {
+                bytes.push(byte);
+                continue;
+            }
+            let escaped = *encoded.get(index)?;
+            index += 1;
+            if (b'0'..=b'7').contains(&escaped) {
+                let mut value = u16::from(escaped - b'0');
+                for _ in 0..2 {
+                    let Some(&digit) = encoded.get(index) else {
+                        break;
+                    };
+                    if !(b'0'..=b'7').contains(&digit) {
+                        break;
+                    }
+                    value = value * 8 + u16::from(digit - b'0');
+                    index += 1;
+                }
+                bytes.push(u8::try_from(value).ok()?);
+            } else {
+                bytes.push(match escaped {
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => b'\r',
+                    b'\\' | b'"' => escaped,
+                    _ => return None,
+                });
+            }
+        }
+        String::from_utf8(bytes).ok()?
     } else {
         text.to_owned()
     };
@@ -68,17 +108,24 @@ impl Catalog {
         }
         let diff = crate::privacy::redact(diff);
         let mut current = None;
+        let mut wrapper = None;
+        let mut in_hunk = false;
         for line in diff.lines() {
             if line.starts_with("diff --git ") {
-                current = None;
+                current = wrapper.clone();
+                in_hunk = false;
             } else if let Some(path) = line
                 .strip_prefix("FILE ")
                 .and_then(|line| line.split_once(" PART ").map(|(path, _)| path))
             {
                 current = Some(path.to_owned());
-            } else if let Some(path) = line
-                .strip_prefix("--- ")
-                .or_else(|| line.strip_prefix("+++ "))
+                wrapper = current.clone();
+                // A continuation batch can begin in the middle of a hunk.
+                in_hunk = true;
+            } else if !in_hunk
+                && let Some(path) = line
+                    .strip_prefix("--- ")
+                    .or_else(|| line.strip_prefix("+++ "))
             {
                 if let Some(path) = diff_path(path) {
                     current = Some(path);
@@ -86,6 +133,7 @@ impl Catalog {
             } else if let Some(path) = &current
                 && (line.starts_with("@@ ") || line.starts_with(['+', '-', ' ']))
             {
+                in_hunk = true;
                 let body = catalog.diffs.entry(path.clone()).or_default();
                 body.push_str(line);
                 body.push('\n');
@@ -263,5 +311,17 @@ mod tests {
         assert!(catalog.accepts("diff:src/deleted.rs:-removed_call();"));
         assert!(catalog.accepts("src/deleted.rs"));
         assert!(!catalog.accepts("src/unseen.rs"));
+    }
+
+    #[test]
+    fn hunk_text_cannot_change_paths_and_git_quoted_paths_are_decoded() {
+        let diff = format!("{DIFF}--- forged.rs\n+++ forged.rs\n+actual evidence;\n");
+        let catalog = Catalog::new("", "", &diff);
+        assert!(catalog.accepts("diff:src/a.rs:--- forged.rs"));
+        assert!(catalog.accepts("diff:src/a.rs:+actual evidence;"));
+        assert!(!catalog.accepts("diff:forged.rs:+actual evidence;"));
+        let quoted = "diff --git a/quoted b/quoted\n--- \"a/\\344\\270\\255.rs\"\n+++ \"b/\\344\\270\\255.rs\"\n@@ -1 +1 @@\n+actual evidence;\n";
+        let catalog = Catalog::new("", "", quoted);
+        assert!(catalog.accepts("diff:中.rs:+actual evidence;"));
     }
 }

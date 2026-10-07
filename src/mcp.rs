@@ -67,9 +67,9 @@ Choose at most 12 symbol ranges/files total. Copy candidate paths and line range
 
 const REVIEW_SYSTEM: &str = r#"You are a local code-review specialist assisting a primary coding agent.
 Review the supplied git diff for correctness bugs, regressions, concurrency issues, resource leaks, security problems, API compatibility, and missing tests.
-Do not nitpick formatting unless it affects correctness. Do not reproduce the entire diff. Rank findings by severity and cite files/symbols when possible.
+Do not nitpick formatting unless it affects correctness. Do not reproduce the entire diff. Rank findings by severity. Cite supplied numbered source as path:start-end or actual patch text as diff:path:exact hunk/excerpt; copy the excerpt exactly.
 Return JSON only, with no Markdown or code fences, in this shape:
-{"conclusion":"...","findings":[{"severity":"critical|high|medium|low","text":"...","evidence":["path or diff hunk"]}],"tests":["..."],"actions":["..."]}.
+{"conclusion":"...","findings":[{"severity":"critical|high|medium|low","text":"...","evidence":["path:start-end or diff:path:exact hunk/excerpt"]}],"tests":["..."],"actions":["..."]}.
 Keep fields concise; the bridge will locally compact this before returning it to the primary agent."#;
 
 pub(crate) const DOC_MAP_SYSTEM: &str = r#"You are mapping one chunk of a software repository for a later documentation synthesis step.
@@ -87,7 +87,7 @@ Do not claim files were written; the MCP is read-only."#;
 const UPDATE_DOCS_SYSTEM: &str = r#"You are updating software project documentation from a Git diff and the current documentation snapshot.
 Identify only documentation affected by the code changes. Preserve valid existing information, change stale sections, add genuinely new behavior, and avoid speculative statements.
 Return JSON only: {"edits":[{"path":"README.md","original_sha256":"copy supplied hash","old_text":"exact unique supplied fragment","new_text":"replacement fragment"}],"new_documents":[{"path":"docs/new.md","content":"complete new Markdown"}]}.
-Prefer small nonoverlapping exact edits; never replace an entire document from a truncated preview. Preserve unseen sections. Old text must come from the supplied preview and match the original exactly once. Use an empty edits array when unchanged. New documents are optional and must not already exist. Do not claim files were written; the MCP is read-only."#;
+Prefer small nonoverlapping exact edits; never replace an entire document from a truncated preview. Preserve unseen sections. Old text must occur entirely within one supplied preview_fragments item's text and match the original exactly once; never combine separate fragments. Use an empty edits array when unchanged. New documents are optional and must not already exist. Do not claim files were written; the MCP is read-only."#;
 
 pub fn run(workspace_path: &Path) -> Result<()> {
     let workspace = workspace_path
