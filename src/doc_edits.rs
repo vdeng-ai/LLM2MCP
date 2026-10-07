@@ -7,7 +7,15 @@ pub struct Snapshot {
     pub path: String,
     pub original: String,
     pub hash: String,
-    pub visible: String,
+    pub fragments: Vec<Fragment>,
+    pub preview_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Fragment {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -53,7 +61,12 @@ pub fn validate(
         if edit.original_sha256 != document.hash {
             bail!("document edit has an incorrect source hash: {}", edit.path);
         }
-        if edit.old_text.is_empty() || !document.visible.contains(&edit.old_text) {
+        if edit.old_text.is_empty()
+            || !document
+                .fragments
+                .iter()
+                .any(|fragment| fragment.text.contains(&edit.old_text))
+        {
             bail!(
                 "document edit must reference a nonempty supplied source fragment: {}",
                 edit.path
@@ -124,7 +137,12 @@ mod tests {
             hash: crate::repo_cache::hash_bytes(original.as_bytes()),
             path: "README.md".into(),
             original,
-            visible: "# Intro\nOld behavior\n".into(),
+            fragments: vec![Fragment {
+                start_line: 1,
+                end_line: 2,
+                text: "# Intro\nOld behavior\n".into(),
+            }],
+            preview_truncated: true,
         }
     }
     fn update(snapshot: &Snapshot, old: &str) -> serde_json::Value {
@@ -147,6 +165,36 @@ mod tests {
         assert!(changed.contains("# Unseen appendix\nKEEP THIS SECTION"));
         assert!(changed.contains("New behavior"));
     }
+    #[test]
+    fn edits_cannot_cross_separate_supplied_fragments() {
+        let mut snapshot = snapshot();
+        snapshot.fragments.push(Fragment {
+            start_line: 5,
+            end_line: 5,
+            text: "KEEP THIS SECTION\n".into(),
+        });
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            validate(
+                update(
+                    &snapshot,
+                    "Old behavior\n\n# Unseen appendix\nKEEP THIS SECTION"
+                ),
+                std::slice::from_ref(&snapshot),
+                root.path()
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                update(&snapshot, "KEEP THIS SECTION"),
+                std::slice::from_ref(&snapshot),
+                root.path()
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn rejects_unseen_ambiguous_stale_and_overlapping_edits() {
         let mut snapshot = snapshot();

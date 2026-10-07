@@ -6,6 +6,7 @@ mod cursor;
 mod doc_cache;
 mod doc_edits;
 mod doctor;
+mod document_preview;
 mod evidence;
 mod gui;
 mod i18n;

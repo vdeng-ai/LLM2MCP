@@ -2240,7 +2240,7 @@ fn update_docs(
     let snapshots = doc_paths
         .iter()
         .take(64)
-        .map(|path| workspace::document_snapshot(root, path, preview_budget))
+        .map(|path| workspace::document_snapshot(root, path, preview_budget, &diff))
         .collect::<Result<Vec<_>>>()?;
     let doc_list = snapshots
         .iter()
@@ -2251,15 +2251,14 @@ fn update_docs(
         .iter()
         .map(|doc| {
             serde_json::to_string(&json!({
-                "path":doc.path,"original_sha256":doc.hash,"preview":doc.visible
+                "path":doc.path,"original_sha256":doc.hash,
+                "preview_fragments":doc.fragments,"preview_truncated":doc.preview_truncated
             }))
         })
         .collect::<std::result::Result<Vec<_>, _>>()?
         .join("\n\n");
-    let docs_truncated = snapshots.len() < doc_paths.len()
-        || snapshots
-            .iter()
-            .any(|doc| doc.visible.contains("[DOCUMENT PREVIEW TRUNCATED]"));
+    let docs_truncated =
+        snapshots.len() < doc_paths.len() || snapshots.iter().any(|doc| doc.preview_truncated);
 
     if let Some(reporter) = reporter {
         reporter.record_context(
