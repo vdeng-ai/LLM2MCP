@@ -2,11 +2,24 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-LLM2MCP is a cross-platform, single-binary local MCP bridge that turns any OpenAI-compatible LLM API into a secondary coding model for AI coding agents.
+**Give Cursor a second LLM through MCP—without replacing Cursor's primary model.**
 
-It is designed for context offloading: instead of making the primary coding agent read large directories, large files, or large diffs itself, LLM2MCP reads the selected code locally, sends that context to your configured LLM, and returns only a compact analysis, implementation plan, or review result.
+LLM2MCP is a cross-platform, single-binary local MCP bridge that makes a self-hosted or third-party OpenAI-compatible LLM available to Cursor as a **secondary coding model**. Cursor remains the main agent and executes edits; LLM2MCP reads selected workspace evidence locally and returns focused analysis, debugging, plans, reviews, or generated documentation.
 
-LLM2MCP uses local stdio MCP. It does not require a local HTTP server and does not override the model configuration of Cursor, Codex, Claude Code, Grok Build, or other coding agents.
+**Why this exists:** Some AI coding tools restrict which models or custom API endpoints can power their built-in agent. Cursor does support bring-your-own API keys and some custom OpenAI-compatible endpoint setups, but those capabilities are not universal across models and features (for example, Cursor Tab continues to use its own models). LLM2MCP takes a different route: the primary agent invokes your separate LLM **as an MCP tool**, without requiring it to become the primary chat or autocomplete model.
+
+This also enables **context offloading**: instead of having Cursor ingest entire directories, huge files, or large diffs, LLM2MCP sends bounded source evidence directly to your configured model and returns only the parts the primary agent needs. It uses local stdio MCP—no local HTTP listener, model proxy, or Cursor model override is required.
+
+## Start with Cursor
+
+1. [Install LLM2MCP](https://github.com/vdeng-ai/LLM2MCP/releases) for your operating system.
+2. In the **LLM API** tab, enter your OpenAI-compatible endpoint, model, and API key (if required); run **Test connection**.
+3. In **AI coding agents**, select **Cursor** and click **Install / Update**. Reload Cursor and check that the `llm2mcp` MCP server/tools are enabled.
+4. In Cursor Agent, try: *"Before modifying code, call LLM2MCP analyze on src/ and identify the relevant modules. Open only the files it recommends, then implement the fix."*
+
+**[Cursor setup, example prompts, boundaries, and troubleshooting →](docs/CURSOR.md)** · [简体中文指南](docs/CURSOR.zh-CN.md)
+
+**Other hosts:** Existing Codex, Claude Code, Grok Build, and Pi integrations remain available, as does generic stdio MCP. Their value is the **independent second opinion and context offload**, even if they already support direct custom LLM APIs. MCP-capable hosts with restricted model choices may also benefit, but a host-specific installation must be verified.
 
 ## Features
 
@@ -52,9 +65,9 @@ AppImage builds can install signed updates in place from the GUI. Debian-package
 
 **Install / Update** first refreshes a stable per-user LLM2MCP executable, then registers that stable path with the selected coding agent. This prevents MCP entries from pointing at transient development/build locations that can disappear after a rebuild or upgrade. When LLM2MCP directly edits JSON/TOML client configuration, it keeps the previous file as `*.llm2mcp.bak` and replaces the config through an atomic temp-file write.
 
-### Cursor
+### Cursor (recommended starting point)
 
-LLM2MCP merges a user-level MCP entry into `~/.cursor/mcp.json`. Cursor passes the current workspace through `${workspaceFolder}`.
+LLM2MCP merges a user-level MCP entry into `~/.cursor/mcp.json`. Cursor passes the current workspace through `${workspaceFolder}`. Follow the [dedicated Cursor guide](docs/CURSOR.md) for registration, tool use, and limitations. This does **not** change Cursor's primary model or Tab completion.
 
 ### Claude Code
 
