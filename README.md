@@ -2,18 +2,18 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**Give Cursor a second LLM through MCP—without replacing Cursor's primary model.**
+**Use a self-hosted or LAN-only LLM in Cursor through MCP—without publishing your inference API or replacing Cursor's primary model.**
 
-LLM2MCP is a cross-platform, single-binary local MCP bridge that makes a self-hosted or third-party OpenAI-compatible LLM available to Cursor as a **secondary coding model**. Cursor remains the main agent and executes edits; LLM2MCP reads selected workspace evidence locally and returns focused analysis, debugging, plans, reviews, or generated documentation.
+LLM2MCP is a cross-platform, single-binary local MCP bridge that lets Cursor call a separately configured **OpenAI-compatible coding model**, including a model accessible only at `localhost` or a private LAN address. Cursor remains the primary agent and handles edits; LLM2MCP performs read-only workspace analysis and returns targeted findings, debug diagnoses, plans, code reviews, or documentation.
 
-**Why this exists:** Some AI coding tools restrict which models or custom API endpoints can power their built-in agent. Cursor does support bring-your-own API keys and some custom OpenAI-compatible endpoint setups, but those capabilities are not universal across models and features (for example, Cursor Tab continues to use its own models). LLM2MCP takes a different route: the primary agent invokes your separate LLM **as an MCP tool**, without requiring it to become the primary chat or autocomplete model.
+**Why an MCP bridge if Cursor supports BYOK?** Recent Cursor versions support adding a custom model ID and configuring an OpenAI API key / overridden Base URL. However, [Cursor's BYOK requests pass through its backend](https://forum.cursor.com/t/using-local-model-with-cursor/149366/3), so Cursor cannot directly reach `127.0.0.1` or private LAN endpoints through that path. Model IDs and provider routing can also have compatibility restrictions. With LLM2MCP, **Cursor starts a local stdio MCP process**, and *that process* calls your local or LAN inference server using your exact configured model ID. **No public tunnel to your LLM endpoint is needed.**
 
-This also enables **context offloading**: instead of having Cursor ingest entire directories, huge files, or large diffs, LLM2MCP sends bounded source evidence directly to your configured model and returns only the parts the primary agent needs. It uses local stdio MCP—no local HTTP listener, model proxy, or Cursor model override is required.
+This also enables **context offloading**: instead of loading huge files, directories, or diffs into Cursor's main model, LLM2MCP selects bounded source evidence, queries the secondary model, and returns a compact result. It does **not** replace Cursor's Agent/Chat/Tab models, proxy Cursor's built-in model requests, or remove Cursor's own account/usage requirements.
 
 ## Start with Cursor
 
 1. [Install LLM2MCP](https://github.com/vdeng-ai/LLM2MCP/releases) for your operating system.
-2. In the **LLM API** tab, enter your OpenAI-compatible endpoint, model, and API key (if required); run **Test connection**.
+2. In the **LLM API** tab, set your local or LAN endpoint (for example `http://192.168.1.100:8000/v1`), exact model ID, and API key if required; run **Test connection**. The endpoint must be reachable by the computer running LLM2MCP—not by Cursor's cloud backend.
 3. In **AI coding agents**, select **Cursor** and click **Install / Update**. Reload Cursor and check that the `llm2mcp` MCP server/tools are enabled.
 4. In Cursor Agent, try: *"Before modifying code, call LLM2MCP analyze on src/ and identify the relevant modules. Open only the files it recommends, then implement the fix."*
 
