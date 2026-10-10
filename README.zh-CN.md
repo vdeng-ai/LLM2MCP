@@ -2,18 +2,18 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**给 Cursor 增加一个可自定义的 AI 编码副模型，不替换 Cursor 主模型。**
+**让 Cursor 通过 MCP 调用本地或局域网自部署 LLM：无需将模型 API 暴露到公网，也不替换 Cursor 主模型。**
 
-LLM2MCP 是跨平台、单二进制的本地 MCP Bridge：将自托管或第三方 **OpenAI-compatible LLM API** 变成 Cursor 可以调用的代码分析工具。Cursor 继续负责主对话、决策和代码修改；LLM2MCP 在本地读取限定范围的项目代码，交给你配置的副模型分析，只返回精炼的结论、Debug 建议、实施计划、代码复审或文档。
+LLM2MCP 是跨平台、单二进制的本地 MCP Bridge：将你在 `localhost`、局域网服务器或第三方平台部署的 **OpenAI-compatible LLM API**，变成 Cursor 可调用的独立编码副模型。你可以在 LLM2MCP 中填写 API 地址和**真实模型 ID**。Cursor 继续负责主对话、决策与修改；LLM2MCP 负责受限范围的只读源码分析、Debug、实施规划、代码复审和文档生成。
 
-**为什么需要它？** 一些 AI 编码工具不开放任意模型或自定义 API 端点，或只允许在有限功能中使用。**Cursor 并非完全不支持自定义 API**：它支持自带 API Key，部分版本/配置也能设置 OpenAI-compatible Base URL，但模型与功能仍有限制（例如 Cursor Tab 补全继续使用 Cursor 自身模型）。LLM2MCP 走的是另一条路：**通过 MCP 工具调用独立副模型**，无需让该模型接管 Cursor 的主对话或补全。
+**Cursor 自带 API Key 为什么还需要它？** 2026 年的 Cursor 已支持添加自定义模型名称（Model ID）、OpenAI API Key 和覆盖 Base URL，因此不应宣传为“完全不能指定自定义模型”。真正的关键限制是：[Cursor 的 BYOK 请求经过其服务端](https://forum.cursor.com/t/using-local-model-with-cursor/149366/3)，**不能直接访问用户电脑上的 `127.0.0.1` 或内网服务器地址**；自定义模型名称、模型路由和请求格式还可能存在兼容性限制。LLM2MCP 由 Cursor 以本地 stdio MCP 进程启动，**由本机进程直接访问本地/局域网推理服务**，不需要将模型 API 通过公网隧道开放。
 
-同时解决 **Context Offload（上下文卸载）**：主模型不必先阅读整个目录、大文件或大 diff；LLM2MCP 在本机选取有预算上限的源码证据，交给副模型，再把关键发现回传给 Cursor。采用本地 stdio MCP，不需要开放本地 HTTP 服务、反代 Cursor 请求或覆盖其模型配置。
+另一个价值是 **Context Offload（上下文卸载）**：Cursor 主模型不必先阅读整个目录、大文件或大 diff；LLM2MCP 在本机选取有预算上限的源码证据，发送给副模型，再回传关键结果。它**不是** Cursor 主模型、Agent 或 Tab 补全的替代品，也不会绕过 Cursor 自身的账号与计费要求。
 
 ## 从 Cursor 开始
 
 1. 从 [Releases](https://github.com/vdeng-ai/LLM2MCP/releases) 下载并安装对应系统版本。
-2. 在 **LLM API** 标签页配置 OpenAI-compatible API 地址、模型及必要的 API Key，点击 **测试连接**。
+2. 在 **LLM API** 标签页填写本地/局域网 API 地址（如 `http://192.168.1.100:8000/v1`）、真实模型 ID 和必要的 API Key，点击 **测试连接**；只要求运行 LLM2MCP 的电脑能访问该服务，不需要让 Cursor 云端能访问。
 3. 在 **AI 编码智能体** 标签页选择 **Cursor**，点击 **安装 / 更新**，重新加载 Cursor 并确认 `llm2mcp` MCP 工具可用。
 4. 在 Cursor Agent 中输入：*“修改代码前先调用 LLM2MCP analyze 分析 src/，找出相关模块；只打开建议的关键文件，再完成修复。”*
 
