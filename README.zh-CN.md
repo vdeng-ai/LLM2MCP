@@ -2,11 +2,24 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-LLM2MCP 是一个跨平台、单二进制的本地 MCP Bridge：把任意 OpenAI-compatible LLM API 变成 AI 编码智能体可调用的“本地代码智能副模型”。
+**给 Cursor 增加一个可自定义的 AI 编码副模型，不替换 Cursor 主模型。**
 
-它的核心用途是 Context Offload：当大目录、大文件或大 diff 不值得全部塞进主编码智能体上下文时，LLM2MCP 在开发机本地读取选中的代码，把上下文直接发送给你配置的 LLM，只把压缩后的分析、实现计划或代码复审结果返回主编码智能体。
+LLM2MCP 是跨平台、单二进制的本地 MCP Bridge：将自托管或第三方 **OpenAI-compatible LLM API** 变成 Cursor 可以调用的代码分析工具。Cursor 继续负责主对话、决策和代码修改；LLM2MCP 在本地读取限定范围的项目代码，交给你配置的副模型分析，只返回精炼的结论、Debug 建议、实施计划、代码复审或文档。
 
-LLM2MCP 使用本地 stdio MCP，不需要额外开放本地 HTTP 端口，也不会覆盖 Cursor、Codex、Claude Code、Grok Build 等工具原有的模型配置。
+**为什么需要它？** 一些 AI 编码工具不开放任意模型或自定义 API 端点，或只允许在有限功能中使用。**Cursor 并非完全不支持自定义 API**：它支持自带 API Key，部分版本/配置也能设置 OpenAI-compatible Base URL，但模型与功能仍有限制（例如 Cursor Tab 补全继续使用 Cursor 自身模型）。LLM2MCP 走的是另一条路：**通过 MCP 工具调用独立副模型**，无需让该模型接管 Cursor 的主对话或补全。
+
+同时解决 **Context Offload（上下文卸载）**：主模型不必先阅读整个目录、大文件或大 diff；LLM2MCP 在本机选取有预算上限的源码证据，交给副模型，再把关键发现回传给 Cursor。采用本地 stdio MCP，不需要开放本地 HTTP 服务、反代 Cursor 请求或覆盖其模型配置。
+
+## 从 Cursor 开始
+
+1. 从 [Releases](https://github.com/vdeng-ai/LLM2MCP/releases) 下载并安装对应系统版本。
+2. 在 **LLM API** 标签页配置 OpenAI-compatible API 地址、模型及必要的 API Key，点击 **测试连接**。
+3. 在 **AI 编码智能体** 标签页选择 **Cursor**，点击 **安装 / 更新**，重新加载 Cursor 并确认 `llm2mcp` MCP 工具可用。
+4. 在 Cursor Agent 中输入：*“修改代码前先调用 LLM2MCP analyze 分析 src/，找出相关模块；只打开建议的关键文件，再完成修复。”*
+
+**[Cursor 中文完整接入教程、提示词与故障排查 →](docs/CURSOR.zh-CN.md)** · [English guide](docs/CURSOR.md)
+
+**其他工具：** 保留 Codex、Claude Code、Grok Build、Pi 以及通用 stdio MCP 接入。即使这些工具可以直连自定义 API，LLM2MCP 仍可作为独立的**第二意见 / 大上下文卸载**工具；其他限制模型选择但支持 MCP 的 Host 也可能受益，但必须分别验证实际接入方式。
 
 ## 主要能力
 
@@ -52,9 +65,9 @@ AppImage 可以在 GUI 内原地安装签名更新；`.deb` 安装版仍会检�
 
 点击 **“安装 / 更新”** 时，LLM2MCP 会先把当前程序刷新到稳定的用户级可执行文件路径，再让目标编码智能体注册这个稳定路径。这样 MCP 配置不会继续指向 `target/debug/...` 等可能在重新构建或升级后消失的开发路径。对于 LLM2MCP 直接修改的 JSON/TOML 客户端配置，写入前会保留 `*.llm2mcp.bak` 备份，并通过临时文件 + 原子替换更新配置。
 
-### Cursor
+### Cursor（推荐优先使用）
 
-LLM2MCP 会合并用户级 `~/.cursor/mcp.json`，Cursor 通过 `${workspaceFolder}` 把当前工作区传给 LLM2MCP。
+LLM2MCP 会合并用户级 `~/.cursor/mcp.json`，Cursor 通过 `${workspaceFolder}` 把当前工作区传给 LLM2MCP。详细安装、使用和限制见 [Cursor 中文教程](docs/CURSOR.zh-CN.md)。该方式**不会替换** Cursor 主模型或 Tab 补全。
 
 ### Claude Code
 
